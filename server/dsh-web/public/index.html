@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DSH 通知插件 · 网页端</title>
+<meta name="description" content="DSH 通知插件的网页端：登录后可以查看服务器上保留的完整回答，每天 100 次免费。">
+<link rel="stylesheet" href="/style.css">
+<!-- 教程文档的样式单独一个文件：它要三栏 + 大量插图，塞进 style.css 会把主样式表撑肿。
+     必须在 style.css **之后**加载（要覆盖 .view 的 720px 内容宽）。 -->
+<link rel="stylesheet" href="/docs.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234176e6'/%3E%3Cpath d='M9 21V11h4.2c2.4 0 3.9 1.3 3.9 3.4 0 1.5-.8 2.6-2 3.1L18.4 21h-2.3l-2.9-3.2h-2V21H9Zm2.2-5h1.9c1.2 0 1.9-.6 1.9-1.6s-.7-1.5-1.9-1.5h-1.9V16Z' fill='white'/%3E%3C/svg%3E">
+</head>
+<body>
+<div class="app">
+  <aside class="side" id="side">
+    <div class="side-head">
+      <span class="mark" aria-hidden="true"></span>
+      <span class="brand"><b>DSH 通知插件</b><i>网页端</i></span>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button class="nav-item is-on" data-view="overview"><span>首页</span></button>
+      <button class="nav-item" data-view="docs"><span>教程文档</span></button>
+      <button class="nav-item" data-view="records"><span>我的记录</span><em id="recCount"></em></button>
+      <button class="nav-item" data-view="account"><span>账号</span></button>
+      <button class="nav-item" data-view="about"><span>使用说明</span></button>
+    </nav>
+
+    <div class="side-foot">
+      <div class="mini" id="quotaMini">未登录</div>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim" hidden></div>
+
+  <main class="main">
+    <header class="top">
+      <button class="hamb" id="hamb" aria-label="打开菜单"><i></i><i></i><i></i></button>
+      <!-- 页头标题是「当前视图名」，不是页面标题 —— 用 p，整站只保留一个 h1（品牌标题）。 -->
+      <p class="top-title" id="viewTitle">首页</p>
+      <div class="top-right" id="topRight"></div>
+    </header>
+
+    <div class="scroll" id="scroll">
+      <!-- ── 首页：官网落地页 ───────────────────────────────────────────
+           刻意**全静态**：不依赖 JS 就能读全（第一屏讲清"这是什么"）。
+           额度/模式/兑换这些"要看状态"的东西放在「账号」页里。
+           文案口径（2026-10-04 定）：中性说明体，不用第一人称自述，
+           不写玩笑话，少用引号与加粗，一句只讲一件事。 -->
+      <section class="view" data-view="overview">
+        <div class="hero">
+          <h1>DSH 通知插件 · 网页端</h1>
+          <p>把 DSH 接到 QQ。每轮结果会发到手机，回答太长就存在这台服务器上，
+            点开链接可以读完整原文。</p>
+          <div class="row" style="margin-top:22px">
+            <button class="btn primary" data-go="account">登录 / 注册</button>
+            <button class="btn" data-go="records">我的记录</button>
+            <span class="hint">免费每天 100 次 · 记录保留 5 小时</span>
+          </div>
+        </div>
+
+        <!-- 三步示意图：把"它是怎么工作的"一眼说清。三个图标是内联 SVG。 -->
+        <div class="steps">
+          <div class="step">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.5 9 9 0 0 1-3.9-.9L3 21l1.9-5.6A8.5 8.5 0 1 1 21 11.5Z"/></svg>
+            <b>QQ 收到摘要</b>
+            <span>一轮结束后，机器人把结果和需要你决定的事发到 QQ。</span>
+            <em>1</em>
+          </div>
+          <div class="step">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4l-8.5 8.5"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>
+            <b>点开通知里的链接</b>
+            <span>通知带一条链接，点开回到这页。登录一次即可。</span>
+            <em>2</em>
+          </div>
+          <div class="step">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"/><path d="M14 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/></svg>
+            <b>读完整原文</b>
+            <span>标题、表格、代码块按原样排版，手机上可以一直往下读。</span>
+            <em>3</em>
+          </div>
+        </div>
+
+        <div class="card prose">
+          <h2>正文的三种去向</h2>
+          <ul>
+            <li><b>直接发到 QQ</b>（默认）：正文切成几条消息发进聊天框，不经过服务器，不占次数。</li>
+            <li><b>只存服务器</b>：正文存在本站，QQ 里只有一句摘要。</li>
+            <li><b>存服务器 + 链接</b>：与上一档相同，通知里多一条查看完整回答的链接。</li>
+          </ul>
+          <p class="hint">后两种需要先在 DSH 设置里打开「允许上传正文」开关，它默认关闭。</p>
+        </div>
+
+        <div class="card prose">
+          <h2>额度与保留期</h2>
+          <ul>
+            <li><b>免费版</b>：登录后每天 <b>100 次</b>完整查看，记录保留 <b>5 小时</b>，按北京时间 0 点重置。</li>
+            <li><b>付费版</b>：<b>¥2.99</b> / 30 天，每天 <b>1000 次</b>，记录保留 <b>48 小时</b>。再次兑换时在原到期时间上累加。</li>
+            <li>记录到期后从磁盘删除；也可以在账号页提前清空记录，或连账号一起注销。</li>
+            <li>保留期短是因为服务器只有 1.6G 内存、40G 硬盘，还要同时运行网站和机器人。</li>
+          </ul>
+        </div>
+
+        <div class="card prose">
+          <h2>怎么装</h2>
+          <p>插件没有发布到 npm。安装命令见<a href="#docs/install">教程第 2 章</a>，那一章也写了两个容易出错的地方。</p>
+          <p>装完重启 DSH，在设置里填好 QQ 机器人的 AppID 和密钥即可使用，不需要在本站注册。
+          只有想把完整回答存在自己账号下、并拿到可点的链接时，才需要绑定一次。</p>
+        </div>
+
+        <div class="card prose">
+          <h2>常见问题</h2>
+          <dl>
+            <dt>为什么免费版只保留 5 小时？</dt>
+            <dd>服务器容量有限：1.6G 内存、40G 硬盘，还要同时运行网站和机器人。需要更长的保留期可以用付费版；长期存档建议存在自己电脑上。</dd>
+            <dt>QQ 里那条链接点开是空白？</dt>
+            <dd>QQ 只接受 <code>http://大写域名/路径</code> 这种形式，端口会被丢弃，因此链接都按这个规则改写。如果仍然打不开，通常是这条记录已经过期。</dd>
+            <dt>我的密码安全吗？</dt>
+            <dd>密码用 scrypt 加盐存储，服务端不保存明文；登录状态是 HMAC 签名的 HttpOnly cookie。插件的发布令牌只保存 sha256，绑定用的 8 位短码单独泄露也换不到任何权限，必须登录后确认。</dd>
+            <dt>会上传我的聊天内容吗？</dt>
+            <dd>默认不会。默认方式把正文直接发到 QQ，不经过服务器。上传只发生在打开上传开关、并选择后两种方式之后。</dd>
+          </dl>
+        </div>
+      </section>
+
+      <!-- ── 记录 ───────────────────────────────────────────────── -->
+      <section class="view" data-view="records" hidden>
+        <div class="card" id="recordsCard"></div>
+      </section>
+
+      <!-- ── 账号（额度 / 模式 / 兑换 都在这里，首页只做介绍）─────────── -->
+      <section class="view" data-view="account" hidden>
+        <div class="card" id="accountCard"></div>
+        <div class="grid2" style="margin-top:16px">
+          <div class="card" id="quotaCard"></div>
+          <div class="card" id="modesCard"></div>
+        </div>
+        <div class="card" id="payCard"></div>
+      </section>
+
+      <!-- ── 说明 ───────────────────────────────────────────────── -->
+      <section class="view" data-view="about" hidden>
+        <div class="card prose">
+          <h2>这个页面是干什么的</h2>
+          <p>本站存放 DSH 插件产生的完整回答。QQ 里只有一句摘要，读全文时回到这页点开。</p>
+
+          <h2>三档全文模式</h2>
+          <ol id="aboutModes"></ol>
+
+          <h2>额度与保留期</h2>
+          <ul>
+            <li><b>免费版</b>：登录后每天 <b>100 次</b>完整查看，记录保留 <b>5 小时</b>，按北京时间 0 点重置。</li>
+            <li><b>付费版</b>（<b>¥2.99</b> / 30 天）：每天 <b>1000 次</b>，记录保留 <b>48 小时</b>。再次兑换时在原到期时间上累加。</li>
+            <li>直接发到 QQ 那一档不占次数，它不经过服务器。</li>
+            <li>记录从产生时开始计时，到期后从磁盘删除。</li>
+            <li>想提前清也行：账号页能清空全部记录，也能把账号一起注销。</li>
+          </ul>
+
+          <h2>常见问题</h2>
+          <dl>
+            <dt>为什么免费版记录只有 5 小时？</dt>
+            <dd>服务器容量有限，保留期太长存不下。需要更长保留期可以用付费版（48 小时）；长期存档建议存在自己电脑上。</dd>
+            <dt>次数用完了怎么办？</dt>
+            <dd>等北京时间第二天 0 点重置，也可以用兑换码转为付费版，每天 1000 次。</dd>
+            <dt>我的密码安全吗？</dt>
+            <dd>密码用 scrypt 加盐存储，服务端不保存明文；登录状态是 HMAC 签名的 HttpOnly cookie。插件侧的发布令牌只保存 sha256，绑定用的 8 位短码单独泄露也换不到权限，必须登录后确认。</dd>
+          </dl>
+
+          <h2>联系方式</h2>
+          <ul>
+            <li><b>QQ 1103416608</b>：安装卡住了、额度或兑换码有问题、发现 bug、想要新功能，都可以在 QQ 找我。</li>
+            <li><b>GitHub <a href="https://github.com/cyanovo" target="_blank" rel="noopener noreferrer">@cyanovo</a></b>：源码、部署脚本、教程都在这里，也可以在那边提 issue。</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- ── 教程文档（自建，不依赖任何外链）─────────────────────────────
+           三栏：左「章节」/ 中「正文」/ 右「本页目录」；窄屏自动折成一栏。
+           正文与插图由本地的 /docs-figs.js + /docs.js 渲染，图片是 /docs-img/*.png，
+           **没有 CDN、没有外链字体、没有第三方脚本**。
+           这里放一句静态兜底文字：脚本没跑起来也读得到一句说明，不至于白屏。
+           路由：#docs 或 #docs/<章节 id>（可分享、可刷新）。 -->
+      <section class="view" data-view="docs" hidden>
+        <div class="docs">
+          <nav class="docs-nav" id="docsNav" aria-label="教程章节">
+            <div class="docs-nav-title">教程文档</div>
+            <p class="docs-nav-fallback">章节列表加载中……</p>
+          </nav>
+          <article class="docs-body" id="docsBody">
+            <div class="docs-lead">教程文档：从安装插件、接上 QQ 到手机上收通知，逐步说明。</div>
+            <p>这一页的正文与插图由本地脚本渲染。如果一直停在这句话上，说明
+              <code>/docs.js</code> 没有加载成功，刷新一次（桌面按 Ctrl+F5）再试。</p>
+          </article>
+          <aside class="docs-toc" id="docsToc" aria-label="本页目录"></aside>
+        </div>
+      </section>
+
+      <!-- 备案号从侧栏挪到这里：窄屏下侧栏是抽屉，底部页脚才是各个视口都看得见的地方。 -->
+      <footer class="foot">
+        <span>DSH 通知插件 · 网页端</span>
+        <span>联系作者：QQ <b>1103416608</b> ｜
+          <a href="https://github.com/cyanovo" target="_blank" rel="noopener noreferrer">GitHub @cyanovo</a></span>
+        <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">豫ICP备2026030622号</a>
+      </footer>
+    </div>
+  </main>
+</div>
+
+<!-- 全文阅读器 -->
+<div class="reader" id="reader" hidden>
+  <header class="top">
+    <button class="back" id="readerClose" aria-label="返回">←</button>
+    <h2 class="top-title" id="readerTitle">完整回答</h2>
+    <div class="top-right" id="readerMeta"></div>
+  </header>
+  <div class="scroll"><div class="reader-body" id="readerBody"></div></div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<script src="/app.js"></script>
+<!-- 教程文档：图在 docs-figs.js，文与渲染在 docs.js。
+     顺序不能反（docs.js 读 window.DOCS_FIGS），都必须排在 app.js 之后
+     —— docs.js 只负责内容，切视图仍由 app.js 的 goto() 负责。 -->
+<script src="/docs-figs.js"></script>
+<script src="/docs.js"></script>
+</body>
+</html>

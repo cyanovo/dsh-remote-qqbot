@@ -1,0 +1,267 @@
+/* DSH 通知插件 · 网页端 —— 教程文档页的样式
+   ─────────────────────────────────────────────────────────────────────────────
+   加载顺序：style.css → docs.css（必须在其后，要覆盖 .view 的 720px 内容宽）。
+
+   为什么单独一个文件、以及为什么这样写：
+     · 教程页要「三栏 + 大量插图」，把这一坨塞进 style.css 会把主样式表撑肿；
+     · 颜色全部沿用 style.css 的 token（--bg/--surface/--soft/--line/--line-2/
+       --text/--muted/--brand/--brand-ink/--brand-soft/--warn），所以**深色模式
+       自动跟随**，不需要在这里再写一份暗色规则；
+     · 全文件 **0 个 box-shadow**（与全站一致：靠底色差 + 1px 描边分层）；
+     · 所有正文 ≥4.5:1；触摸目标 ≥44px；
+     · 宽表格用 table-layout:fixed + overflow-wrap:anywhere，窄屏**不产生横向滚动**
+       （手机端横向滚动是本项目的老毛病，见 dsh-notes-render 那一轮）。
+   ───────────────────────────────────────────────────────────────────────────── */
+
+/* 教程页比别的视图宽：三栏要放得下。其余视图仍是 720px。 */
+.view[data-view='docs'] { max-width: 1180px; }
+
+.docs {
+  display: grid;
+  grid-template-columns: 188px minmax(0, 1fr) 180px;
+  gap: var(--sp-5);
+  align-items: start;
+}
+
+/* ── 左栏：章节 ─────────────────────────────────────────────────────────── */
+.docs-nav { position: sticky; top: 0; max-height: calc(100vh - 140px); overflow-y: auto; }
+.docs-nav-title, .docs-toc-title {
+  font-size: 12px; color: var(--muted); letter-spacing: .08em;
+  margin: 0 0 var(--sp-3); font-weight: 500;
+}
+.docs-nav-item {
+  display: flex; align-items: center; gap: 10px;
+  min-height: 44px; padding: 0 10px; border-radius: var(--r-sm);
+  color: var(--muted); text-decoration: none; font-size: 14px;
+}
+.docs-nav-item .n {
+  flex: none; width: 20px; text-align: center;
+  font-family: var(--font-mono); font-size: 12px; color: var(--muted);
+}
+.docs-nav-item:hover { background: var(--soft); color: var(--text); }
+.docs-nav-item.on { background: var(--brand-soft); color: var(--brand-ink); }
+.docs-nav-item.on .n { color: var(--brand-ink); }
+.docs-nav-foot { font-size: 12px; color: var(--muted); padding: var(--sp-4) 10px 0; }
+.docs-nav-fallback { font-size: 12.5px; color: var(--muted); padding: 0 10px; }
+
+/* ── 中栏：正文 ─────────────────────────────────────────────────────────── */
+.docs-body { min-width: 0; font-size: 15.5px; line-height: 1.78; color: var(--muted); }
+.docs-body p { margin: 0 0 var(--sp-4); }
+.docs-body b, .docs-body strong { color: var(--text); font-weight: 500; }
+.docs-body a { color: var(--brand-ink); text-decoration: none; border-bottom: 1px solid var(--line); }
+.docs-body a:hover { border-bottom-color: var(--brand-ink); }
+.docs-lead {
+  font-size: 17px; line-height: 1.75; color: var(--text);
+  margin: 0 0 var(--sp-6); padding-bottom: var(--sp-5); border-bottom: 1px solid var(--line-2);
+}
+.docs-body h2 {
+  font-size: 22px; font-weight: 600; color: var(--text); letter-spacing: -.3px;
+  margin: var(--sp-7) 0 var(--sp-3);
+}
+.docs-body h3 {
+  font-size: 17px; font-weight: 600; color: var(--text);
+  margin: var(--sp-5) 0 var(--sp-2);
+}
+.docs-body h2:first-child, .docs-body h3:first-child { margin-top: 0; }
+.docs-body ul, .docs-body ol { margin: 0 0 var(--sp-4); padding-left: var(--sp-5); }
+.docs-body li { margin-bottom: var(--sp-2); }
+.docs-body code {
+  background: var(--soft); border: 1px solid var(--line-2); border-radius: 6px;
+  padding: 1px 5px; font-size: .88em; word-break: break-word;
+}
+/* 行内 code 也要能断行：长路径 / 长命令在 390px 下会把布局视口撑宽
+   （笔记页踩过同一个坑）。`pre` 里的 code 不算 —— 那里靠 pre 自己横向滚。 */
+.docs-body :not(pre) > code { overflow-wrap: anywhere; }
+
+/* 代码块 */
+.doc-code {
+  margin: 0 0 var(--sp-5); padding: var(--sp-4) var(--sp-4);
+  background: var(--soft); border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  overflow-x: auto; font-family: var(--font-mono); font-size: 13px; line-height: 1.65;
+  color: var(--text);
+}
+.doc-code code { background: none; border: 0; padding: 0; font-size: 13px; word-break: normal; }
+
+/* 表格：窄屏也不横向滚动 */
+.doc-table {
+  width: 100%; border-collapse: collapse; margin: 0 0 var(--sp-5);
+  font-size: 14px; table-layout: fixed; overflow-wrap: anywhere;
+}
+.doc-table th, .doc-table td {
+  text-align: left; vertical-align: top;
+  padding: 9px 10px; border-bottom: 1px solid var(--line-2);
+}
+.doc-table th { color: var(--muted); font-weight: 500; font-size: 13px; }
+.doc-table td { color: var(--text); }
+.doc-table tr:last-child td { border-bottom: 0; }
+
+/* 提示块 */
+.doc-callout, .doc-warn {
+  margin: 0 0 var(--sp-5); padding: var(--sp-3) var(--sp-4);
+  background: var(--soft); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  font-size: 14px; line-height: 1.72;
+}
+.doc-callout { border-left: 3px solid var(--brand); }
+.doc-warn { border-left: 3px solid var(--warn); }
+.doc-callout p:last-child, .doc-warn p:last-child, .doc-warn ul:last-child { margin-bottom: 0; }
+.doc-warn ul { padding-left: var(--sp-5); margin: var(--sp-2) 0 0; }
+
+/* 步骤条 */
+.doc-steps { display: grid; gap: var(--sp-2); margin: 0 0 var(--sp-5); }
+.doc-step {
+  display: flex; gap: var(--sp-3); align-items: flex-start;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: var(--sp-3) var(--sp-4);
+}
+.doc-step > b {
+  flex: none; width: 24px; height: 24px; border-radius: 50%;
+  background: var(--brand-soft); color: var(--brand-ink);
+  font-size: 12px; font-weight: 500; display: flex; align-items: center; justify-content: center;
+}
+.doc-step > div > b { display: block; font-size: 14px; color: var(--text); font-weight: 500; }
+.doc-step span { display: block; font-size: 13px; color: var(--muted); line-height: 1.7; margin-top: 2px; }
+
+/* 问答列表 */
+.doc-faq { margin: 0 0 var(--sp-5); }
+.doc-faq dt { font-size: 15px; font-weight: 500; color: var(--text); margin-top: var(--sp-4); }
+.doc-faq dd { margin: var(--sp-1) 0 0; font-size: 14px; }
+
+/* ── 插图 ───────────────────────────────────────────────────────────────── */
+.doc-fig { margin: var(--sp-5) 0 var(--sp-6); }
+.doc-fig figcaption {
+  font-size: 12.5px; line-height: 1.7; color: var(--muted);
+  margin-top: var(--sp-2); padding-left: 2px;
+}
+.doc-fig figcaption b { color: var(--text); font-weight: 500; }
+.doc-fig svg { width: 100%; height: auto; display: block; }
+.doc-fig svg text { font-family: var(--font); }
+
+/* SVG 图元（跟着主题变色） */
+.df-box { fill: var(--surface); stroke: var(--line); }
+.df-box2 { fill: var(--soft); stroke: var(--line); }
+.df-accent { fill: var(--brand-soft); stroke: var(--brand-ink); }
+.df-t { fill: var(--text); font-size: 13px; }
+.df-s { fill: var(--muted); font-size: 11.5px; }
+.df-l { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+.df-la { stroke: var(--brand-ink); stroke-width: 1.5; fill: none; }
+.df-grid { stroke: var(--line-2); stroke-width: 1; }
+.df-bar { fill: var(--line-2); }
+.df-bar2 { fill: var(--brand-soft); stroke: var(--brand-ink); stroke-width: 1; }
+.df-warn { fill: var(--warn); }
+.doc-defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+
+/* 真截图 */
+.doc-shot img {
+  width: 100%; height: auto; display: block; background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--r);
+}
+
+/* ── DOM 模拟图（QQ 气泡 / 输入框开关 / 菜单）───────────────────────────── */
+.mock {
+  border: 1px solid var(--line); border-radius: var(--r);
+  background: var(--bg); overflow: hidden;
+}
+.mock-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3);
+  padding: 8px 12px; background: var(--soft); border-bottom: 1px solid var(--line-2);
+  font-size: 12.5px; color: var(--muted);
+}
+.mock-bar em { font-style: normal; color: var(--brand-ink); font-size: 12px; }
+.mock-phone { max-width: 420px; }
+.mock-body { padding: var(--sp-4); display: grid; gap: var(--sp-3); }
+.bubble {
+  max-width: 88%; padding: 10px 12px; border-radius: 12px;
+  border: 1px solid var(--line); background: var(--surface);
+  font-size: 13.5px; line-height: 1.65; color: var(--muted);
+}
+.bubble.bot { justify-self: start; }
+.bubble.me { justify-self: end; background: var(--brand-soft); border-color: transparent; color: var(--text); }
+.bubble b { display: block; color: var(--text); font-weight: 500; margin-bottom: 2px; }
+/* 气泡里每个 span 独占一行：它们代表 QQ 消息里的换行 */
+.bubble span { display: block; }
+.bubble .link { display: inline-block; margin-top: 6px; color: var(--brand-ink); text-decoration: underline; }
+.bubble.sm { font-size: 12.5px; }
+.mock-dock { padding: var(--sp-4); }
+.mock-note { font-size: 12px; color: var(--muted); margin-bottom: var(--sp-3); }
+.mock-input {
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+  padding: 11px 12px; font-size: 13.5px; color: var(--muted);
+}
+.mock-dockrow {
+  display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap;
+  margin-top: 10px; font-size: 12px; color: var(--muted);
+}
+.mini { display: inline-flex; align-items: center; gap: 6px; }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+.dot.on { background: var(--brand); }
+.mock-tail { margin-left: auto; }
+.menu-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); padding: var(--sp-4); }
+.mbtn {
+  border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  padding: 9px 15px; font-size: 13px; color: var(--text);
+}
+.menu-tip { padding: 0 var(--sp-4) var(--sp-4); font-size: 12.5px; color: var(--muted); }
+.menu-tip code { font-size: 12px; }
+
+/* ── 右栏：本页目录 ─────────────────────────────────────────────────────── */
+.docs-toc { position: sticky; top: 0; max-height: calc(100vh - 140px); overflow-y: auto; }
+.docs-toc-link {
+  display: block; width: 100%; min-height: 44px; text-align: left;
+  padding: 6px 10px; border: 0; background: none; border-radius: var(--r-sm);
+  color: var(--muted); font: inherit; font-size: 13px; line-height: 1.5; cursor: pointer;
+}
+.docs-toc-link.lv2 { padding-left: 22px; font-size: 12.5px; }
+.docs-toc-link:hover { background: var(--soft); color: var(--text); }
+.docs-toc-link.on { color: var(--brand-ink); background: var(--brand-soft); }
+
+/* ── 章节前后翻页 ───────────────────────────────────────────────────────── */
+.docs-pager {
+  display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3);
+  margin: var(--sp-7) 0 0; padding-top: var(--sp-5); border-top: 1px solid var(--line-2);
+}
+.docs-pager-btn {
+  display: flex; flex-direction: column; gap: 4px; min-height: 44px;
+  padding: var(--sp-3) var(--sp-4); border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--text); text-decoration: none; font-size: 14px;
+}
+.docs-pager-btn span { font-size: 12px; color: var(--muted); }
+.docs-pager-btn:hover { border-color: var(--brand); }
+.docs-pager-btn.next { text-align: right; }
+.docs-pager-btn.is-off { color: var(--muted); background: var(--soft); }
+
+/* ── 中等宽度：藏掉右栏目录（正文优先）───────────────────────────────────
+   ⚠️ 阈值 1340 是被算出来的，不是拍的：本站自己的左侧栏就占 264px，
+   三栏全开要 188 + 712 + 180 + 48(gap) + 48(padding) + 264 = 1440px 才舒服。
+   窄于 1340 就把右栏收掉，正文拿回 ~756px —— 若把阈值设成 1080，
+   1280 的屏幕上正文只剩 ~552px，一行放不了几个字。 */
+@media (max-width: 1340px) {
+  .docs { grid-template-columns: 180px minmax(0, 1fr); }
+  .docs-toc { display: none; }
+}
+
+/* ── 窄屏：一栏。章节列表变成顶部横向滑动的胶囊条 ──────────────────────── */
+@media (max-width: 860px) {
+  .docs { display: block; }
+  /* 章节列表变成顶部一条横向滑动的胶囊条：不换行堆成一大坨，也不产生纵向滚动 */
+  .docs-nav {
+    position: static; max-height: none; margin: 0 0 var(--sp-5);
+    padding-bottom: var(--sp-3); border-bottom: 1px solid var(--line-2);
+    display: flex; gap: var(--sp-2); overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  .docs-nav-title, .docs-nav-foot { display: none; }
+  .docs-nav-fallback { padding: 0; }
+  .docs-nav-item {
+    flex: none; min-height: 44px; padding: 0 var(--sp-4);
+    border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  }
+  .docs-nav-item.on { border-color: var(--brand); }
+  .docs-body { font-size: 15px; }
+  .docs-lead { font-size: 16px; }
+  .docs-body h2 { font-size: 19px; margin-top: var(--sp-6); }
+  .docs-body h3 { font-size: 16px; }
+  .doc-table { font-size: 13px; }
+  .doc-table th, .doc-table td { padding: 8px 8px; }
+  .doc-code { font-size: 12.5px; }
+  .docs-pager { grid-template-columns: 1fr; }
+  .docs-pager-btn.next { text-align: left; }
+}

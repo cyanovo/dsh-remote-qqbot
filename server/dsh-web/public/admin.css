@@ -1,0 +1,126 @@
+/* 后台管理页专用样式。
+   刻意只做「布局与表格」，颜色全部复用 style.css 里的 token —— 不引入新色、
+   不用阴影/渐变（这个项目一贯的克制要求）。style.css 仍是被复用的一方，本文件不覆盖它。 */
+
+.admin { --side-w: 208px; }
+
+/* ── 口令闸门 ───────────────────────────────────────────────────────────── */
+.gate { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.gate .card { width: 100%; max-width: 380px; }
+.gate h1 { font-size: 17px; margin: 0 0 6px; }
+.gate p { margin: 0 0 14px; }
+
+/* 两条并列的进法：账号登录 / 后台口令。刻意做得很轻——两个无底色的小字按钮，
+   当前那条用一条 2px 品牌色下划线表示，不引入新色、不加阴影。 */
+.gate-tabs { display: flex; gap: 4px; margin: 0 0 14px; border-bottom: 1px solid var(--line); }
+.gate-tabs button {
+  all: unset; cursor: pointer; padding: 6px 10px 8px; font-size: 13px;
+  color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.gate-tabs button:hover { color: var(--text); }
+.gate-tabs button[aria-current="true"] { color: var(--text); font-weight: 600; border-bottom-color: var(--brand); }
+
+/* ── 骨架 ───────────────────────────────────────────────────────────────── */
+.admin-app { display: flex; min-height: 100vh; }
+.admin-side {
+  width: var(--side-w); flex: 0 0 var(--side-w);
+  border-right: 1px solid var(--line); background: var(--side);
+  padding: 18px 12px; position: sticky; top: 0; height: 100vh;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.admin-brand { font-size: 13px; font-weight: 600; color: var(--text); padding: 0 10px 12px; letter-spacing: .02em; }
+.admin-brand span { display: block; font-weight: 400; font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+.admin-nav { display: flex; flex-direction: column; gap: 1px; }
+.admin-nav button {
+  all: unset; cursor: pointer; padding: 7px 10px; border-radius: var(--r-sm);
+  font-size: 13px; color: var(--muted); display: flex; justify-content: space-between;
+}
+.admin-nav button:hover { background: var(--soft); color: var(--text); }
+.admin-nav button[aria-current="true"] { background: var(--soft); color: var(--text); font-weight: 600; }
+.admin-nav .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.admin-side-foot { margin-top: auto; padding: 10px; font-size: 11.5px; color: var(--muted); line-height: 1.6; }
+
+.admin-main { flex: 1; min-width: 0; padding: 22px 26px 60px; }
+.admin-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.admin-head h1 { font-size: 18px; margin: 0; }
+.admin-head .sub { font-size: 12.5px; color: var(--muted); }
+
+/* ── 统计卡 ─────────────────────────────────────────────────────────────── */
+.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 10px; margin-bottom: 18px; }
+.stat { border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; background: var(--soft); }
+.stat b { display: block; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; }
+.stat span { font-size: 11.5px; color: var(--muted); }
+
+/* ── 表 ─────────────────────────────────────────────────────────────────── */
+.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--r); }
+table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.tbl th, .tbl td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line-2); white-space: nowrap; }
+.tbl th { color: var(--muted); font-weight: 500; background: var(--soft); position: sticky; top: 0; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl td.num, .tbl th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.tbl td.wrap { white-space: normal; max-width: 340px; }
+.tbl tbody tr:hover td { background: var(--soft); }
+/* 正在看的那一行。详情面板在列表**上方**，滚到下面点行之后，得看得出在编辑谁。 */
+.tbl tbody tr.on td { background: var(--soft); }
+/* 「操作」列钉在右边。用户表 10 列，窄屏（手机）必然横向滚动，
+   而"能不能给 TA 加 Pro"恰恰是这张表存在的理由 —— 不能让它在屏幕外。
+   贴住的单元格必须有不透明底色，否则滚过去的字会从它底下透出来。 */
+.tbl th.act, .tbl td.act {
+  position: sticky; right: 0; background: var(--bg);
+  border-left: 1px solid var(--line-2); white-space: nowrap;
+}
+.tbl th.act { background: var(--soft); }
+.tbl .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.toolbar input[type="text"], .toolbar input[type="password"], .toolbar input[type="number"], .toolbar select {
+  font: inherit; font-size: 13px; padding: 6px 9px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: var(--bg); color: var(--text);
+}
+.toolbar input[type="text"] { min-width: 170px; }
+.toolbar input[type="number"] { width: 74px; }
+
+/* ── 档位徽标 ───────────────────────────────────────────────────────────── */
+.tag { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.tag.pro { color: var(--brand); border-color: var(--brand); }
+.tag.free { color: var(--muted); }
+.tag.warn { color: var(--warn); border-color: var(--warn); }
+.tag.ok { color: var(--ok); border-color: var(--ok); }
+.tag.danger { color: var(--danger); border-color: var(--danger); }
+/* 用户名 + 管理员/已封禁徽标并排（徽标本身是 inline-block，靠这层 flex 给间距） */
+.who { display: inline-flex; align-items: center; gap: 6px; }
+/* 侧栏底部"现在是谁在操作" */
+.whoami { font-size: 11.5px; color: var(--muted); padding: 0 10px 10px; }
+
+/* ── 详情面板 ───────────────────────────────────────────────────────────── */
+.detail { border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; margin-bottom: 16px; }
+.detail h2 { font-size: 15px; margin: 0 0 4px; }
+.detail h3 { font-size: 12.5px; color: var(--muted); font-weight: 500; margin: 16px 0 6px; }
+/* 能力分组标题（付费版（Pro） / 封禁 / 账号管理）。
+   刻意比上面那行普通小节标题更"实"（正文色 + 加粗 + 上分隔线）——
+   主人的原话是「没有看到真正的用户管理」，这三组必须一眼扫得到，
+   不能再做成一堆没有标题的灰按钮。第一组不要上分隔线（它紧跟着头部的徽标行）。 */
+.detail h3.act-h {
+  color: var(--text); font-weight: 600;
+  margin: 14px 0 2px; padding-top: 12px; border-top: 1px solid var(--line-2);
+}
+.detail h3.act-h:first-child { border-top: 0; padding-top: 0; margin-top: 6px; }
+.bars { display: flex; flex-direction: column; gap: 3px; }
+.bar-row { display: grid; grid-template-columns: 82px 1fr 44px; gap: 8px; align-items: center; font-size: 11.5px; color: var(--muted); }
+.bar-track { height: 8px; background: var(--soft); border-radius: 999px; overflow: hidden; }
+.bar-fill { height: 100%; background: var(--brand); border-radius: 999px; }
+.bar-row .v { text-align: right; font-variant-numeric: tabular-nums; }
+
+.hint { font-size: 12px; color: var(--muted); line-height: 1.65; margin: 8px 0 0; }
+.err { color: var(--danger); }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.mini-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+.mini-form input { font: inherit; font-size: 12.5px; padding: 5px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg); color: var(--text); }
+
+@media (max-width: 860px) {
+  .admin-side { position: static; width: auto; flex: 0 0 auto; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; border-right: 0; border-bottom: 1px solid var(--line); }
+  .admin-app { flex-direction: column; }
+  .admin-nav { flex-direction: row; flex-wrap: wrap; }
+  .admin-side-foot { display: none; }
+  .admin-main { padding: 16px 14px 48px; }
+}

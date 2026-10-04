@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>后台管理 · cyanovo.top</title>
+<!-- 复用官网那套已验证的 token 与组件样式，本页只加一层布局（admin.css）。
+     不引任何第三方脚本/字体/图表库：后台页零依赖，且不想让口令页多一个外部请求。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234176e6'/%3E%3Cpath d='M9 21V11h4.2c2.4 0 3.9 1.3 3.9 3.4 0 1.5-.8 2.6-2 3.1L18.4 21h-2.3l-2.9-3.2h-2V21H9Zm2.2-5h1.9c1.2 0 1.9-.6 1.9-1.6s-.7-1.5-1.9-1.5h-1.9V16Z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/admin.css">
+</head>
+<body class="admin">
+
+<!-- ── 闸门 ─────────────────────────────────────────────────────────────────
+     两条并列的进法（服务端也是两条并列的通道，谁都没把谁削弱）：
+       ① 账号登录 —— 用**管理员账号**的 cookie 进（`/api/login` → `/api/admin/*` 认 cookie）；
+          普通账号会被挡在门外，且**不计入口令失败次数**（否则谁都能把主人的 IP 锁 10 分钟）。
+       ② 后台口令 —— 服务器 `/var/lib/dsh-web/admin-token`，CLI/应急通道，永远可用。 -->
+<div class="gate" id="gate">
+  <div class="card">
+    <h1>后台管理</h1>
+    <div class="gate-tabs" role="tablist">
+      <button class="btn ghost" id="gateTabAccount" aria-current="true">账号登录</button>
+      <button class="btn ghost" id="gateTabToken" aria-current="false">后台口令</button>
+    </div>
+
+    <div id="gatePaneAccount">
+      <p class="hint">用<b>管理员账号</b>登录。登录后所有请求走 cookie，看得见是谁在操作。</p>
+      <div class="row">
+        <input type="text" id="gateUser" placeholder="用户名" autocomplete="username" style="flex:1;min-width:0">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input type="password" id="gatePass" placeholder="密码" autocomplete="current-password" style="flex:1;min-width:0">
+        <button class="btn primary" id="gateLoginBtn">登录</button>
+      </div>
+      <p class="hint">普通账号会被拒（403）。口令不受影响，连打多少次都不会锁。</p>
+    </div>
+
+    <div id="gatePaneToken" hidden>
+      <p class="hint">口令在服务器的 <code>/var/lib/dsh-web/admin-token</code> 里（首次启动自动生成）。<br>
+        它是一串十六进制字符；连错 10 次会锁 10 分钟。</p>
+      <div class="row">
+        <input type="password" id="gateToken" placeholder="后台口令" autocomplete="off" style="flex:1;min-width:0">
+        <button class="btn primary" id="gateBtn">进入</button>
+      </div>
+    </div>
+
+    <div class="msg" id="gateMsg"></div>
+  </div>
+</div>
+
+<!-- ── 后台主体 ───────────────────────────────────────────────────────────── -->
+<div class="admin-app" id="app" hidden>
+  <aside class="admin-side">
+    <div class="admin-brand">后台管理<span>cyanovo.top · dsh-web</span></div>
+    <nav class="admin-nav">
+      <button data-aview="overview" aria-current="true">概览</button>
+      <button data-aview="users">用户 <span class="n" id="nUsers">-</span></button>
+      <button data-aview="records">记录 <span class="n" id="nRecords">-</span></button>
+      <button data-aview="codes">兑换码 <span class="n" id="nCodes">-</span></button>
+      <button data-aview="devices">设备码 <span class="n" id="nDevices">-</span></button>
+    </nav>
+    <div class="admin-side-foot">
+      <div id="sideInfo">—</div>
+      <div id="sideWho" class="whoami">—</div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn ghost" id="logoutBtn">退出</button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="admin-main">
+    <!-- 概览 -->
+    <section data-aview="overview">
+      <div class="admin-head">
+        <h1>概览</h1>
+        <span class="sub" id="ovWhen">—</span>
+      </div>
+      <div class="stats" id="ovStats"></div>
+      <div class="card">
+        <h3>当前生效的档位</h3>
+        <div id="ovConfig" class="mini">—</div>
+      </div>
+      <div class="card">
+        <h3>最近 14 天</h3>
+        <div class="bars" id="ovTrend"></div>
+        <p class="hint">柱高按这 14 天里最高的那天算。每天一行：查看次数 / 新增用户 / 新增记录。</p>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn" id="ovRefresh">刷新</button>
+        <span class="msg" id="ovMsg"></span>
+      </div>
+    </section>
+
+    <!-- 用户 -->
+    <section data-aview="users" hidden>
+      <div class="admin-head">
+        <h1>用户</h1>
+        <span class="sub">口令、档位、用量都在这儿；<b>但看不到任何人的正文</b>。</span>
+      </div>
+      <!-- 这一行是 2026-10-04 补的：此前页面上没有任何文字说明"这页能干什么"，
+           主人看完只当它是一张只读的名单。点名字或点「管理」进的是同一个地方。 -->
+      <p class="hint" id="uHint">点每行最右边的「<b>管理</b>」，就能给 TA
+        <b>加 Pro</b> / <b>取消 Pro</b> / <b>封禁·解封</b> / <b>重置密码</b> / <b>删除账号</b>；
+        点用户名进的是同一处。</p>
+      <div class="toolbar">
+        <input type="text" id="uSearch" placeholder="搜用户名（支持片段）" autocomplete="off">
+        <select id="uSort">
+          <option value="recent">按最近活跃</option>
+          <option value="created">按注册时间</option>
+          <option value="usage">按累计查看</option>
+          <option value="today">按今日用量</option>
+          <option value="name">按用户名</option>
+        </select>
+        <button class="btn" id="uReload">查询</button>
+      </div>
+      <div class="card">
+        <h3>新建账号</h3>
+        <div class="toolbar" style="margin-bottom:0">
+          <input type="text" id="uCreateUser" placeholder="用户名" autocomplete="off">
+          <input type="text" id="uCreatePass" placeholder="初始密码（≥6 位）" autocomplete="off">
+          <input type="number" id="uCreateDays" value="0" min="0" max="36500" title="给多少天 Pro，0 = 免费版">
+          <label class="mini"><input type="checkbox" id="uCreateForever"> 永久 Pro</label>
+          <button class="btn primary" id="uCreateBtn">建号</button>
+        </div>
+        <div class="hint" id="uCreateHint">天数留 0 就是免费版（100 次/天 · 留 5 小时）。</div>
+      </div>
+      <div class="msg" id="uMsg"></div>
+      <div id="uDetail"></div>
+      <div class="tbl-wrap"><table class="tbl" id="uList"></table></div>
+    </section>
+
+    <!-- 记录 -->
+    <section data-aview="records" hidden>
+      <div class="admin-head">
+        <h1>记录</h1>
+        <span class="sub">只给元信息：谁、什么时候、多长、什么时候过期。</span>
+      </div>
+      <div class="toolbar">
+        <input type="text" id="rUser" placeholder="只看某个用户（留空 = 全部）" autocomplete="off">
+        <input type="number" id="rLimit" value="50" min="1" max="200" title="最多显示多少条">
+        <button class="btn" id="rReload">查询</button>
+      </div>
+      <p class="hint">后台<b>读不到</b>任何人的正文：服务端在列表接口里就没返回 <code>text</code> 字段。
+        口令泄露也不会带出用户写过什么。要看正文只能本人登录。</p>
+      <div class="msg" id="rMsg"></div>
+      <div class="tbl-wrap"><table class="tbl" id="rList"></table></div>
+    </section>
+
+    <!-- 兑换码 -->
+    <section data-aview="codes" hidden>
+      <div class="admin-head">
+        <h1>兑换码</h1>
+        <span class="sub">付费版（Pro）= 每天 1000 次 + 记录保留 48 小时；兑换是<b>叠加</b>，天数往后加。</span>
+      </div>
+      <div class="card">
+        <h3>生成</h3>
+        <div class="toolbar" style="margin-bottom:0">
+          <input type="number" id="cCount" value="1" min="1" max="50" title="生成几个">
+          <input type="number" id="cDays" value="30" min="1" max="3650" title="每个码多少天">
+          <input type="text" id="cNote" placeholder="备注（可选，最多 60 字）" autocomplete="off">
+          <button class="btn primary" id="cGen">生成</button>
+        </div>
+        <div class="hint">没有在线支付。怎么收钱全靠兑换码：确认到账后手工发一个给对方。</div>
+      </div>
+      <div class="msg" id="cMsg"></div>
+      <div class="tbl-wrap"><table class="tbl" id="cList"></table></div>
+    </section>
+
+    <!-- 设备码 -->
+    <section data-aview="devices" hidden>
+      <div class="admin-head">
+        <h1>设备码</h1>
+        <span class="sub">插件正在等主人确认的那些绑定请求；长码只在该插件手里，这里也看不到。</span>
+      </div>
+      <div class="row" style="margin-bottom:12px"><button class="btn" id="dReload">刷新</button></div>
+      <div class="msg" id="dMsg"></div>
+      <div class="tbl-wrap"><table class="tbl" id="dList"></table></div>
+    </section>
+  </main>
+</div>
+
+<script src="/admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  plugin:
+    name: 插件测试 · Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      # 这些依赖是 DSH 自己的包，只用于本地测试；真正跑起来时由 DSH 宿主提供。
+      - run: npm install --no-audit --no-fund
+      - run: npm test
+
+  render-service:
+    name: 渲染服务自测
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # check.mjs 打的是已经在跑的实例，所以先起一个，笔记目录指向仓库里的测试样本。
+      - name: 起服务并跑断言
+        run: |
+          NOTES_DIR="$PWD/server/dsh-notes-render/test" PORT=8791 \
+            node server/dsh-notes-render/server.mjs &
+          for i in $(seq 1 20); do
+            if curl -sf -o /dev/null http://127.0.0.1:8791/dsh/sample.md; then break; fi
+            sleep 0.5
+          done
+          BASE=http://127.0.0.1:8791 node server/dsh-notes-render/test/check.mjs

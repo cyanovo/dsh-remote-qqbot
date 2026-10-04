@@ -1,0 +1,10 @@
+# 一律以 LF 存进版本库、以 LF 检出。
+# 理由：lib/ 的字节会被 scripts/verify-ui-installed.mjs 逐一比对哈希，
+# 行尾被平台自动转换过一次（CRLF）就会全线变红 —— 那是最难查的一类假故障。
+* text=auto eol=lf
+
+# 二进制，别碰
+*.tgz binary
+*.png binary
+*.jpg binary
+*.jpeg binary

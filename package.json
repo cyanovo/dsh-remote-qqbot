@@ -1,0 +1,83 @@
+{
+  "name": "dsh-remote-qqbot",
+  "version": "1.0.4",
+  "description": "把 DSH 接到 QQ 官方机器人：跑完了、要你回答、出错了都推到你手机，引用那条消息回复就等于接着聊。默认零上传、不需要账号。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "link": "node scripts/link-dev.mjs",
+    "test": "node tests/agentmd.test.mjs && node tests/settings.test.mjs && node tests/config-view.test.mjs && node tests/fulltext.test.mjs && node tests/ui-persist.test.mjs && node tests/qq.test.mjs && node tests/status.test.mjs && node tests/session-picker.test.mjs && node tests/screen.test.mjs && node tests/plugin.test.mjs && node tests/collab.test.mjs && node tests/notes.test.mjs && node tests/cloud.test.mjs && node tests/cloud-integration.test.mjs && node tests/cloud-routing.test.mjs && node tests/load-verify.mjs",
+    "pack": "node scripts/build.mjs && node scripts/pack.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "docs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "qq",
+    "qq-bot",
+    "qqrobot",
+    "notification",
+    "remote"
+  ],
+  "license": "MIT",
+  "author": "Cyan (https://github.com/cyanovo)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cyanovo/dsh-remote-qqbot.git"
+  },
+  "homepage": "https://github.com/cyanovo/dsh-remote-qqbot#readme",
+  "bugs": {
+    "url": "https://github.com/cyanovo/dsh-remote-qqbot/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.0.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-tools": "^0.0.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.4"
+  }
+}

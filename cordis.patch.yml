@@ -1,0 +1,12 @@
+# dsh-remote-qqbot bundle patch
+#
+# 这个文件是 npm 包的 `dsh.bundle.patch` 层。
+# 用官方 CLI 安装时：
+#
+#   dsh plugin --profile web add dsh-remote-qqbot
+#
+# 该命令会把本包加入 `dsh.profile.bundles`，并在 profile 启动时
+# 合并本 patch（下面这一个 insert 行），无需手工编辑 profile 文件。
+- insert:
+    - id: remote-qqbot
+      name: 'dsh-remote-qqbot'

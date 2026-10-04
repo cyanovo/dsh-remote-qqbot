@@ -1,0 +1,31 @@
+[Unit]
+Description=DSH notes markdown renderer (/dsh/<id>.md -> HTML)
+Documentation=https://cyanovo.top:8444/dsh/
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dsh-notes-render
+ExecStart=/usr/bin/node /opt/dsh-notes-render/server.mjs
+Environment=HOST=127.0.0.1
+Environment=PORT=8790
+Environment=NOTES_DIR=/var/www/dsh-notes
+Restart=always
+RestartSec=3
+
+# 只读渲染，不需要任何写权限：1.6G 内存无 swap 的机器上必须把爆炸半径压到最小
+MemoryMax=128M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadOnlyPaths=/var/www/dsh-notes
+
+[Install]
+WantedBy=multi-user.target
