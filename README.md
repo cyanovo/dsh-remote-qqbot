@@ -126,6 +126,8 @@ npm run pack                                          # 产出 dsh-remote-qqbot-
 dsh plugin --profile desktop add ./dsh-remote-qqbot-<版本>.tgz
 ```
 
+用 `dsh web` 起的把命令里的 `--profile desktop` 换成 `--profile web`，其余不变。
+
 三个容易踩的地方（都踩过）：
 
 | 坑 | 说明 |
