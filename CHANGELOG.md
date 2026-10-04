@@ -14,3 +14,8 @@
 
 - `dsh-web` 网页端与后台文案重写为中性说明体，档位名与插件统一
 - `dsh-notes-render` 同时提供 `/dsh/<id>.html`、兼容旧链接的 `/dsh/<id>.md` 与纯文本 `/dsh/raw/<id>.md`
+
+文档：
+
+- README 收敛为落地页，配置、接入 QQ、完整回答、协作、agentmd、开发各自拆到 `docs/`
+- README 增加网站入口（<https://cyanovo.top>）：完整回答在网页端阅读，QQ 里只留短链接

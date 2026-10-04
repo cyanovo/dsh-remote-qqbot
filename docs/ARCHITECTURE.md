@@ -57,7 +57,7 @@
 > （v0.1.0 就是这么挂的）。
 
 核心不变量：**`src/` 里没有一个文件读环境变量、没有一个文件写死生产地址。**
-所有真实配置只从 `~/.dsh/settings.yaml`（及其 profile 补丁层）来，见 [第六节](#六配置系统为什么这么绕)。
+所有真实配置只从 `~/.dsh/settings.yaml`（及其 profile 补丁层）来，见 [第五节](#五配置系统为什么这么绕)。
 
 ---
 
@@ -119,7 +119,7 @@ agent 事件
 
 **推送里怎么出现「查看完整回答」链接：** 长回答会先走 `notes.publishTurnNote()`
 （渲染 markdown → 上传中枢 → 换回 `<id>`），推送正文只留摘要 + 一个链接。
-链接必须过 `qqPreviewUrl()` 加工（见 [第七节](#七qq-三个容易踩死的点)）。
+链接必须过 `qqPreviewUrl()` 加工（见 [第六节](#六qq四个容易踩死的点)）。
 
 ### 3.2 跨会话记忆
 
@@ -385,7 +385,6 @@ UI 上目前有两个挂点：
 > `scripts/verify-ui-installed.mjs` 会**数** `InputDockControls` 里 MiniToggle 的个数（必须恰为 2），
 > 谁加回去谁报红；同时另有两条断言要求设置字段表里**必须还有** `qqFulltextMode` / `cloudEnabled`
 > —— 合起来守住"只搬位置、不砍能力"。
-
 
 ---
 
@@ -757,7 +756,6 @@ QQ 的自定义菜单是**平台侧的一份静态配置**，而且客户端有�
 
 ## 七、状态文件与落盘位置
 
-
 | 内容 | 位置 | 说明 |
 |---|---|---|
 | QQ 状态（open_id / 专属会话 id / 去重表） | `qqStateFile`，默认 `~/.dsh/qq-bot-state.json` | 换机器要重新授权 |
@@ -935,7 +933,7 @@ dsh plugin --profile desktop add github:<owner>/dsh-remote-qqbot
 
 ## 十一、给下一个改这个插件的人
 
-1. **先读 [../README.md](../README.md) 的「五条必须遵守的加载/配置期约束」**，再看本文件。
+1. **先读 [DEVELOPMENT.md](DEVELOPMENT.md) 的「四条必须遵守的加载/配置期约束」**，再看本文件。
 2. 加配置项：`DEFAULTS` → `Config` → `FIELD_SPECS` → 测试，四步缺一不可。
 3. 改文案/排版：**把规则放进导出的纯函数**，让测试真跑它，别写只匹配字符串的断言。
 4. 改完必须：`build` → `npm test` → `pack` → `install` → `verify-*` → **让用户重启** → 比时间戳。
