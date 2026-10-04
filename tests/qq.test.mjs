@@ -1524,6 +1524,152 @@ await t('影子 signal 的两条铁律：只中止它自己、且落定后摘掉
     '进来时外层就已经中止的话，影子必须同样是中止态，否则会挂出一张没人管的卡片')
 })
 
+// ── [12] 提问「等太久」与「被取消」：条目必须跟提问同生共死（2026-10-05 主人报的 bug）──
+//
+// 现场时间线（全部来自 `~/.dsh/qq-bot-state.json` 与两次会话快照，不是推测）：
+//   23:51:38  提问发到 QQ（askId=ask-…-j65zsj，会话 session-edc80d93…）
+//   00:21:38  30 分钟 TTL 到期，条目**静默**作废（当时日志里一个字都没有）
+//   00:45:13  主人引用那条提问作答 → 路由查不到待答提问 → 回一句「这会儿没有等你回答的问题」
+//             → 他的回答被丢掉，而 agent 那边还卡在这个提问上等
+//
+// 所以这里钉两件事：①「等 54 分钟才答」必须仍然算数；②提问结束（turn 被取消）时
+// 条目必须立刻摘掉，别留下来把之后某条消息误当成它的答案。
+
+const askTtlMs = (() => {
+  const m = /const ASK_TTL_MS = ([^\n]+)/.exec(qqruntimeSrc)
+  assert.ok(m, '找不到 ASK_TTL_MS —— 测试已与源码脱节')
+  return new Function(`return ${m[1]}`)()
+})()
+
+await t('提问的等待上限必须是「人话尺度」：30 分钟那种会把正常作息判成没回答', () => {
+  assert.ok(askTtlMs >= 6 * 60 * 60 * 1000,
+    `ASK_TTL_MS 只有 ${Math.round(askTtlMs / 60000)} 分钟：主人出门/睡一觉回来再答就不算数了`)
+})
+
+/** 在受控环境里跑真的 `oldestPending()`：pendingAsks / TTL / 日志全部由测试注入。 */
+function makeOldestPending(pendingAsks, ttlMs = askTtlMs) {
+  const src = extractFunction(qqruntimeSrc, 'function oldestPending() {')
+  const fmtSrc = extractFunction(qqruntimeSrc, 'function fmtDuration(ms) {')
+  const fmtDuration = new Function(`return ${fmtSrc}`)()
+  const logs = []
+  const fn = new Function('l', 'pendingAsks', 'ASK_TTL_MS', 'fmtDuration', `${src}\nreturn oldestPending`)
+  return { fn: fn((m) => logs.push(String(m)), pendingAsks, ttlMs, fmtDuration), logs }
+}
+
+await t('【行为】等了 54 分钟还没人答的提问**仍然算数**（就是现场那条时间线的长度）', () => {
+  const pendingAsks = new Map()
+  pendingAsks.set('ask-old', {
+    questions: [{ id: 'q1' }], createdAt: Date.now() - 54 * 60 * 1000, resolve: () => {},
+  })
+  const { fn, logs } = makeOldestPending(pendingAsks)
+  const hit = fn()
+  assert.ok(hit, '54 分钟前发出的提问被作废了 —— 主人这时作答又会被判成「没有在等你回答的问题」')
+  assert.equal(hit.askId, 'ask-old')
+  assert.equal(pendingAsks.size, 1, '没超上限就不该删条目')
+  assert.equal(logs.length, 0, '没作废就不该打「已作废」日志')
+})
+
+await t('【行为】超过上限的陈年提问照样要让位，而且必须留日志', () => {
+  const pendingAsks = new Map()
+  pendingAsks.set('ask-stale', {
+    questions: [], createdAt: Date.now() - askTtlMs - 60 * 1000, resolve: () => {},
+  })
+  const { fn, logs } = makeOldestPending(pendingAsks)
+  assert.equal(fn(), null, '超过上限的条目必须让位，否则它会永远吞掉后续消息')
+  assert.equal(pendingAsks.size, 0)
+  assert.ok(logs.some((m) => m.includes('ask-stale') && m.includes('作废')),
+    `作废必须留痕（这次故障最难查的就是"静默消失"），实际日志：${logs.join('｜')}`)
+})
+
+// 🔴 反向校验：把口径换回 30 分钟，上一条「54 分钟仍算数」的行为必须变红。
+// 这条测的是**量具本身**——如果这里也拿到条目，说明 makeOldestPending 根本没在测 TTL。
+await t('【反向】口径换回 30 分钟，54 分钟那条就必须被判死（证明上面测的是真行为）', () => {
+  const pendingAsks = new Map()
+  pendingAsks.set('ask-old', {
+    questions: [], createdAt: Date.now() - 54 * 60 * 1000, resolve: () => {},
+  })
+  const { fn } = makeOldestPending(pendingAsks, 30 * 60 * 1000)
+  assert.equal(fn(), null, '30 分钟口径下这条提问应当被摘掉 —— 拿到条目说明测试环境是假的')
+})
+
+await t('【行为】turn 被取消 → QQ 那条待答条目必须跟着摘掉（且不再弹桌面卡片）', async () => {
+  const outer = new AbortController()
+  const pendingAsks = new Map()
+  let desktopCalls = 0
+  let release = null
+  const { relay, logs } = makeRelay({
+    fallbackMs: 10,
+    pendingAsks,
+    askViaQq: (request, hooks) => {
+      pendingAsks.set('ask-cancel', {
+        questions: request.questions, createdAt: Date.now(), resolve: () => {},
+      })
+      hooks.onDelivered(true, 'ask-cancel')
+      return new Promise((resolve) => { release = resolve }) // QQ 那边还没答
+    },
+  })
+  const ka = keepAlive()
+  void relay({ questions: [], signal: outer.signal }, () => {
+    desktopCalls += 1
+    return new Promise(() => {})
+  })
+  await sleep(5)
+  assert.equal(pendingAsks.size, 1, '刚发到 QQ，条目应该在里面')
+  outer.abort() // 等价于这一轮 turn 被取消
+  await sleep(30) // 跨过兜底窗口
+  clearTimeout(ka)
+  assert.equal(pendingAsks.size, 0,
+    'turn 都取消了条目还留着 = 几小时后主人回一句会被错当成「它的答案」')
+  assert.ok(logs.some((m) => m.includes('ask-cancel')), `摘条目要留日志，实际：${logs.join('｜')}`)
+  assert.equal(desktopCalls, 0, '提问已经作废，兜底闹钟不许再把卡片弹到桌面上')
+  release('late-answer') // 别留下悬着的 Promise
+})
+
+await t('【行为】signal 进来时就已中止 → 一个字都不发到 QQ，且立刻以 ASK_ABORTED 落定', async () => {
+  const outer = new AbortController()
+  outer.abort()
+  let asked = 0
+  const { relay } = makeRelay({
+    fallbackMs: 5,
+    askViaQq: () => { asked += 1; return new Promise(() => {}) },
+  })
+  let rejected = null
+  await relay({ questions: [], signal: outer.signal }, () => Promise.resolve('desktop'))
+    .catch((err) => { rejected = err })
+  await sleep(20)
+  assert.equal(asked, 0, '这轮提问早就作废了，不该再往 QQ 发一条没人等的提问')
+  assert.equal(rejected?.code, 'ASK_ABORTED',
+    '早中止的提问必须立刻落定（api-proxy 在同样情况下也是 ASK_ABORTED），不能把 caller 吊住')
+})
+
+await t('提问取消时摘条目的接线（源码级）：cancelAsk 必须挂在 request.signal 的中止监听上', () => {
+  assert.ok(relaySrc.includes('pendingAsks.delete(askIdInFlight)'),
+    'turn 取消时必须把 QQ 的待答条目摘掉（askIdInFlight 就是那条线的 askId）')
+  assert.ok(/onOuterAbort = \(\) => cancelAsk\(/.test(relaySrc),
+    '外层 signal 的中止监听必须接到 cancelAsk 上')
+  assert.ok(relaySrc.includes('if (askId) askIdInFlight = askId'),
+    'onDelivered 里必须记下 askId，否则 cancelAsk 无从下手')
+})
+
+await t('作答时提问已经结束 → 必须说清「提问结束了 / 你这句没送进去」', () => {
+  // ⚠️ 不能直接扫全文里有没有那句话：**注释里也引用了旧文案**（就是为了说明它被换掉了），
+  //    那样会把说明文字当成代码判红 —— 这个项目已经在"正则扫源码"上栽过好几次。
+  //    所以只看真的会被发出去的那一行：`replyPassive(data, '这会儿没有…')`。
+  const stillAnsweredWith = qqruntimeSrc
+    .split('\n')
+    .filter((line) => line.includes('replyPassive') && line.includes('这会儿没有'))
+  assert.equal(stillAnsweredWith.length, 0,
+    `旧文案还在往外发（主人明明刚回答了，却被告知没有提问在等）：${stillAnsweredWith.join('｜')}`)
+  // 反向校验：把旧写法塞回一份假源码，这个"检查器"必须认出来 —— 否则上面那条等于没测。
+  const fakeSrc = "await replyPassive(data, '这会儿没有在等你回答的问题～')\n"
+  assert.equal(
+    fakeSrc.split('\n').filter((line) => line.includes('replyPassive') && line.includes('这会儿没有')).length,
+    1, '检查器本身失效了：旧写法放回去它也认不出来',
+  )
+  assert.ok(qqruntimeSrc.includes('你刚发的这句我没送进去'),
+    '必须明确告诉他这句话没被送进去，并给出下一步（引用别的通知 / /task）')
+})
+
 console.log(`\n${'─'.repeat(60)}`)
 console.log(`通过 ${pass} 项，失败 ${fail} 项`)
 if (fail > 0) {

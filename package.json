@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-qqbot",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "把 DSH 接到 QQ 官方机器人：跑完了、要你回答、出错了都推到你手机，引用那条消息回复就等于接着聊。默认零上传、不需要账号。",
   "type": "module",
   "main": "lib/index.js",
