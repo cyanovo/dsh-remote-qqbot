@@ -98,6 +98,9 @@ function layerStub() {
     id, innerHTML: '', textContent: '', hidden: false, value: '', className: '', style: {}, dataset: {}, onclick: null,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false } },
     addEventListener() {}, appendChild() {}, querySelectorAll() { return [] },
+    // 验证码那张图要用到真浏览器有的这几个方法（src 赋值、removeAttribute/setAttribute）：
+    // 桩里少了它，loadCaptcha 会 TypeError，整份脚本连第一条断言都跑不到 —— 那不是产品坏了，是尺子缺件。
+    src: '', setAttribute() {}, removeAttribute() {}, getAttribute() { return null },
   })
   const ctx = {
     console,

@@ -7,6 +7,11 @@
  * 但"加了分支"和"分支真的会走"是两件事，所以这里用一个只会 429 的桩服务把它走一遍。
  *
  * 用法：node verify-live-429.mjs
+ *
+ * ⚠️ 2026-10-05 补：子脚本现在还有一道"公网要人机验证"的前置断言，桩必须**照真服务的形状**
+ *    回（/api/meta 带 captcha.required=true；不带 x-admin-token 的注册回 400+captcha:true，
+ *    带了就豁免）—— 否则子脚本会先在第 111 行说"被验证码拦下了"并退 3，
+ *    这条 429 分支压根走不到，而两条路径的退出码都是 3，看起来还会"全绿"。
  */
 import http from 'node:http'
 import fs from 'node:fs'
@@ -48,8 +53,17 @@ const server = http.createServer((req, res) => {
         ok: true, modes: [], freeDaily: 100, priceCny: '2.99',
         plans: { free: { daily: 100, retentionText: '5 小时' }, pro: { daily: 1000, days: 30, retentionText: '48 小时' } },
         device: { ttlMs: 600000, interval: 3 },
+        // 公网这一份要人机验证（桩要跟真服务一个形状，否则 verify-live.mjs 前面的断言先红）
+        captcha: { required: true, chars: 4, ttlMs: 180000 },
       }
     } else if (u.startsWith('/api/register')) {
+      // 真服务的规矩：不带验证码 → 400 + captcha:true；带对后台口令 → 豁免。
+      // 桩照这个形状回，子脚本才能走到我们要验的那条 429 分支（否则它会先在第 111 行退出）。
+      if (!req.headers['x-admin-token']) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, captcha: true, error: '请先填写图片里的验证码' }))
+        return
+      }
       body = { ok: true, me: { username: 'p1livestub', plan: 'free', quota: { limit: 100, used: 0, remaining: 100 } } }
     } else if (u.startsWith('/api/me')) {
       body = { ok: true, me: { username: 'p1livestub', plan: 'free', quota: { limit: 100, used: 0, remaining: 100 } } }
@@ -70,7 +84,9 @@ const out = fs.openSync(outFile, 'w')
  * stdio 用文件描述符而不是管道：管道在本机沙箱下可能直接 EPERM。
  */
 const child = spawn(process.execPath, ['verify-live.mjs', base], {
-  cwd: HERE, stdio: ['ignore', out, out], env: { ...process.env },
+  // 子脚本要求"公网注册要么带验证码要么带后台口令"。桩服务不校验口令的值（它只是个桩），
+  // 所以这里塞一个占位值让它走豁免通道 —— 不然它会先在第 111 行退 3，这条 429 分支就验不到了。
+  cwd: HERE, stdio: ['ignore', out, out], env: { ...process.env, ADMIN_TOKEN: process.env.ADMIN_TOKEN || 'stub-token' },
 })
 const status = await new Promise((resolve) => {
   const timer = setTimeout(() => { child.kill(); resolve('timeout') }, 25000)
