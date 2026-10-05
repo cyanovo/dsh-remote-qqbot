@@ -535,6 +535,17 @@ await t('空消息忽略', () => {
 await t('/task 不带内容给用法', () => {
   assert.equal(routeIncoming('/task').kind, 'usage')
 })
+// 远程更新（1.0.7）：`/update` 直接装、`/update check` 只查不装；中文同义词 `/更新`。
+// 这里守的是**路由**这一层（三分支判断与文案在 tests/update.test.mjs 里守）。
+await t('/update 与 /更新 路由到 {kind:update}，check 只查不装', () => {
+  assert.deepEqual(routeIncoming('/update'), { kind: 'update', check: false })
+  assert.deepEqual(routeIncoming('/更新'), { kind: 'update', check: false })
+  assert.deepEqual(routeIncoming('/update check'), { kind: 'update', check: true })
+  assert.deepEqual(routeIncoming('/更新 检查'), { kind: 'update', check: true })
+})
+await t('帮助里列了 /update（否则用户不知道有这个功能）', () => {
+  assert.match(HELP_TEXT, /^\/update\s+把插件更新到最新版（会自动重启 DSH）$/m)
+})
 await t('★ 投递模式默认 queue：DSH 里才会落成正常的用户消息气泡', () => {
   // 依据 DSH 源码：queue → `user` 节点（正常消息）；steer → `steering`（「插话」节点）。
   // 主人明确要求「QQ 提问跟在 dsh 输入框提问一样」，所以**会话在跑时也必须是 queue**。
@@ -1668,6 +1679,178 @@ await t('作答时提问已经结束 → 必须说清「提问结束了 / 你这
   )
   assert.ok(qqruntimeSrc.includes('你刚发的这句我没送进去'),
     '必须明确告诉他这句话没被送进去，并给出下一步（引用别的通知 / /task）')
+})
+
+// ── [13] 引用「机器人自己的回执 / 旧消息」不能再把主人的话丢掉 ────────────────
+//
+// 2026-10-05 主人报的 bug：QQ 里引用一条消息发过去，DSH 侧明明在跑（上一句进去了），
+// 机器人却回「你引用的这条我认不出是哪次通知了」—— 而且**他这句话哪儿都没进去**。
+// 取证（~/.dsh/qq-bot-state.json + 解压 session-edc80d93 的转录）：
+//   02:28:25 收到 2 条 QQ 消息，只有 1 条进了会话（user/message 里有），另一条在
+//   `user/message` 与 `agent/inbox/spliced` 里**都没有**；02:31 又丢了 2 条。
+// 根因三条：①回执（✅ 收到/❌）从来不登记 ref_idx → 引用回执必然反查落空；
+//          ②兜底只看 recent[] 且窗口只有 5 分钟（当时最近一条通知是 02:24:00，
+//            到 02:31 早过窗了）；
+//          ③两路落空就回一句「认不出」并**把消息整条丢掉**。
+// 下面这几条分别钉住这三处，任何一处回退都会变红。
+
+console.log('\n[13] 引用回执／旧消息：认不出会话也不能把主人的话丢掉（2026-10-05 报的 bug）')
+
+// ⚠️ 这里**故意不用顶层 extractFunction**：万一签名被改回去（= 修复被回退），顶层断言会
+//    让整个测试文件当场崩掉 —— 那样只会看到一句 AssertionError，看不到"哪几条行为红了"。
+//    改成把源码抠取放进每条测试里失败，反向校验时才能拿到清清楚楚的红色。
+let replyPassiveSrc = ''
+try { replyPassiveSrc = extractFunction(qqruntimeSrc, 'async function replyPassive(data, text, target) {') } catch { replyPassiveSrc = '' }
+
+/** 把 replyPassive 放进受控环境跑：日志 / bot / state 全由测试注入。 */
+function makeReplyPassive({ bot, state, logs = [] }) {
+  assert.notEqual(replyPassiveSrc, '',
+    '源码里找不到 replyPassive(data, text, target) —— 回执登记的修复被回退了？')
+  const build = new Function('l', 'bot', 'state', `${replyPassiveSrc}\nreturn replyPassive`)
+  return { replyPassive: build((m) => logs.push(String(m)), bot, state), logs }
+}
+
+const ackData = (id = 'M-ack-1') => ({ id, author: { user_openid: 'openid-a' } })
+
+await t('【行为】回执也要登记 ref_idx —— 主人引用那句「✅ 收到」时必须认得出会话', async () => {
+  const st = new BotState(path.join(tmp, 'state-ack.json'))
+  const sent = []
+  const bot = {
+    sendC2C: async (openId, text, opts) => {
+      sent.push({ openId, text, opts })
+      return { id: 'S1', ext_info: { ref_idx: 'REFIDX_ACK_1' } }
+    },
+  }
+  const { replyPassive } = makeReplyPassive({ bot, state: st })
+  const res = await replyPassive(ackData(), '✅ 收到，我这就开始（插件）', { sessionId: 'session-x', session: '插件' })
+  assert.equal(res?.ext_info?.ref_idx, 'REFIDX_ACK_1', '要把发送响应交回去（调用方可能还要用）')
+  assert.equal(sent[0].opts.msgId, 'M-ack-1', '回执必须走被动回复（带 msg_id）')
+
+  const tgt = st.refTarget('REFIDX_ACK_1')
+  assert.equal(tgt?.sessionId, 'session-x', '回执没登记 ref_idx ⇒ 引用这句回执永远认不出会话')
+  assert.equal(tgt?.session, '插件', '会话名也要记，回复文案才说得出进的是哪个会话')
+  assert.equal(tgt?.kind, 'ack')
+
+  // 端到端：拿这个 ref_idx 去路由，必须回到同一个会话 —— 而不是掉进 unknown_ref
+  const route = routeMessage({
+    text: '接着说一句', refIdx: 'REFIDX_ACK_1', hasPendingQuestion: false, refTarget: st.refTarget('REFIDX_ACK_1'),
+  })
+  assert.equal(route.kind, 'prompt', `引用回执必须回到会话，实际路由成 ${route.kind}`)
+  assert.equal(route.sessionId, 'session-x')
+})
+
+await t('【行为】不知道属于哪个会话时**不许**瞎登记（否则引用它会被送错地方）', async () => {
+  const st = new BotState(path.join(tmp, 'state-ack-2.json'))
+  const bot = { sendC2C: async () => ({ id: 'S2', ext_info: { ref_idx: 'REFIDX_ACK_2' } }) }
+  const { replyPassive } = makeReplyPassive({ bot, state: st })
+  await replyPassive(ackData('M-ack-2'), '这条指令 /x 我不认识，发 /help 看看我会些什么')
+  assert.deepEqual(st.data.sentRefs, {}, '没给 target 就不该登记（/help、/status 这些不属于任何会话）')
+  assert.equal(st.refTarget('REFIDX_ACK_2'), null)
+})
+
+await t('【行为】被动回复发送失败：记日志、返回 null、绝不登记', async () => {
+  const st = new BotState(path.join(tmp, 'state-ack-3.json'))
+  const bot = { sendC2C: async () => { const e = new Error('发送单聊消息失败 code=22009: 回复次数超限'); e.code = 22009; throw e } }
+  const { replyPassive, logs } = makeReplyPassive({ bot, state: st })
+  const res = await replyPassive(ackData('M-ack-3'), '✅ 收到', { sessionId: 'session-x', session: '插件' })
+  assert.equal(res, null, '发失败就该老实回 null，不能假装发出去了')
+  assert.deepEqual(st.data.sentRefs, {}, '没发出去的东西不许登记')
+  assert.ok(logs.some((m) => m.includes('被动回复失败')), `失败要留日志，实际：${logs.join('｜')}`)
+})
+
+await t('【行为】兜底要认得 sentRefs 里的记录，窗口也不止 5 分钟（40 分钟前那条仍兜得住）', () => {
+  const st = new BotState(path.join(tmp, 'state-fb-sentrefs.json'))
+  st.addSentRef('REFIDX_ACK_OLD', { sessionId: 'session-ack', session: '插件', kind: 'ack' })
+  st.data.sentRefs.REFIDX_ACK_OLD.at = Date.now() - 40 * 60 * 1000
+  assert.deepEqual(st.data.recent, [], '这条记录只在 sentRefs 里（回执不进最近通知表）')
+
+  const tgt = st.recentTarget()
+  assert.equal(tgt?.sessionId, 'session-ack',
+    '精确反查落空时连 sentRefs 都不看 = 引用回执必丢（老实现就是这样）')
+  assert.equal(tgt.viaFallback, true)
+  assert.ok(tgt.ageMs >= 39 * 60 * 1000, `ageMs 要如实报出多久之前，好在回复里说清楚（实际 ${tgt.ageMs}）`)
+})
+
+// 🔴 反向校验：窗口换回 5 分钟，上面那条「40 分钟仍兜得住」必须变红 ——
+// 否则说明测的不是窗口，只是碰巧有别的路径兜住了。
+await t('【反向】窗口换回 5 分钟，40 分钟前那条就必须兜不住（证明上面测的是窗口本身）', () => {
+  const st = new BotState(path.join(tmp, 'state-fb-window.json'))
+  st.addSentRef('REFIDX_ACK_OLD2', { sessionId: 'session-ack', kind: 'ack' })
+  st.data.sentRefs.REFIDX_ACK_OLD2.at = Date.now() - 40 * 60 * 1000
+  assert.equal(st.recentTarget(5 * 60 * 1000), null)
+})
+
+await t('【行为】兜底取的是**真正最新**的那条（recent 与 sentRefs 混排）', () => {
+  const st = new BotState(path.join(tmp, 'state-fb-mix.json'))
+  st.addSentRef('R-old', { sessionId: 'session-old', kind: 'turn-complete' })
+  st.data.sentRefs['R-old'].at = Date.now() - 30 * 60 * 1000
+  st.noteRecent({ sessionId: 'session-new', kind: 'turn-complete', refIdx: 'R-new' })
+  assert.equal(st.recentTarget().sessionId, 'session-new', 'recent 里那条更新，就该它赢')
+
+  // 反过来：recent 里那条更旧，sentRefs 里那条更新 → 必须换人
+  st.data.recent[0].at = Date.now() - 30 * 60 * 1000
+  st.data.sentRefs['R-old'].at = Date.now() - 60 * 1000
+  assert.equal(st.recentTarget().sessionId, 'session-old',
+    'sentRefs 与 recent 混排要按时间取最新，不能死认 recent[0]')
+})
+
+await t('【行为】手上一条带会话的记录都没有 → 老实返回 null（截图那种不算）', () => {
+  const st = new BotState(path.join(tmp, 'state-fb-none.json'))
+  st.addSentRef('R-screen', { kind: 'screen' })
+  assert.equal(st.recentTarget(), null, '截图没有 sessionId，不能拿它当兜底会话')
+})
+
+await t('【源码】unknown_ref 分支必须真的把消息投出去（不许再只回一句「认不出」就丢掉）', () => {
+  const at = qqruntimeSrc.indexOf("case 'unknown_ref': {")
+  assert.notEqual(at, -1, '找不到 unknown_ref 分支 —— 测试已与源码脱节')
+  const end = qqruntimeSrc.indexOf("case 'screen_ref':", at)
+  assert.notEqual(end, -1, '找不到 unknown_ref 分支的结尾')
+  const block = qqruntimeSrc.slice(at, end)
+  assert.ok(block.includes('handlePrompt('), '认不出的引用也必须投进一个会话（以前整条丢）')
+  assert.ok(block.includes('chatTarget()'), '没有已知会话时该落到闲聊会话（只读，安全）')
+  assert.ok(!block.includes("你引用的这条我认不出是哪次通知了"),
+    '不许再回到「回一句就丢掉」的老写法')
+
+  // 反向校验：把老写法塞回去，这个检查器必须认出来
+  const fake = [
+    "case 'unknown_ref':",
+    "  await replyPassive(data, '你引用的这条我认不出是哪次通知了（可能是太久以前、被清理了）。')",
+    '  break',
+    "case 'screen_ref':",
+  ].join('\n')
+  const fakeBlock = fake.slice(fake.indexOf("case 'unknown_ref':"), fake.indexOf("case 'screen_ref':"))
+  assert.ok(!fakeBlock.includes('handlePrompt(') && fakeBlock.includes('你引用的这条我认不出是哪次通知了'),
+    '检查器本身失效了：老写法放回去它也认不出来')
+})
+
+await t('【源码】「✅ 收到 / ❌ 没送进」两条回执都必须带上会话（好让引用它时认得出）', () => {
+  const hp = extractFunction(qqruntimeSrc, 'async function handlePrompt(sessionId, label, text, data) {')
+  const okLine = hp.split('\n').find((l) => l.includes('✅ ${how}'))
+  const badLine = hp.split('\n').find((l) => l.includes('❌ 这句没送进'))
+  assert.ok(okLine.includes('sessionId, session: label'), `✅ 回执要带会话，实际：${okLine}`)
+  assert.ok(badLine.includes('sessionId, session: label'), `❌ 回执也要带会话，实际：${badLine}`)
+
+  const ha = extractFunction(qqruntimeSrc, 'async function handleAnswer(askId, text, data) {')
+  const lines = ha.split('\n')
+  const i = lines.findIndex((l) => l.includes('已经把你的回答带过去了'))
+  assert.notEqual(i, -1, '找不到作答回执 —— 测试已与源码脱节')
+  assert.ok(lines.slice(i, i + 3).join(' ').includes('sessionId: item.sessionId'),
+    '作答回执要带上提问所属的会话')
+})
+
+await t('【源码】按兜底送进去时必须明说，并带上「那条是多久之前发的」', () => {
+  const at = qqruntimeSrc.indexOf("case 'prompt': {")
+  assert.notEqual(at, -1, '找不到 prompt 分支 —— 测试已与源码脱节')
+  const end = qqruntimeSrc.indexOf('// 显式 /task', at)
+  const block = qqruntimeSrc.slice(at, end)
+  assert.ok(block.includes('refTarget?.viaFallback'), '兜底送进去必须能被识别出来')
+  assert.ok(block.includes('fmtDuration(refTarget.ageMs)'), '要说清是多久之前那条通知，好让他判断猜得对不对')
+  assert.ok(block.includes('如果送错了地方'), '要说清送错了怎么补救')
+})
+
+await t('【源码】pendingAsks 条目要带会话名（回执登记时才有 label 可用）', () => {
+  assert.ok(qqruntimeSrc.includes('session: sessionTitleOf(request?.agent), resolve'),
+    'pendingAsks 里没记会话名，作答回执只能说「那个会话」')
 })
 
 console.log(`\n${'─'.repeat(60)}`)

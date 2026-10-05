@@ -350,6 +350,34 @@ const DEFAULTS = {
    *     `steering`（「插话」）节点，样式完全不同、不占正常对话位。
    */
   qqPromptMode: 'queue',
+
+  // ── 远程更新（在 QQ 里发现新版 / 一条 /update 装上新版）────────────────────
+  /**
+   * 发现新版本时要不要在 QQ 里提醒，**默认开**。
+   *
+   * 关掉只是不提醒，`/update` 照样能用（升级这件事本身不受这个开关限制）。
+   * 提醒本身是"同一个版本只发一次"的，不会变成每天骚扰。
+   */
+  qqUpdateEnabled: true,
+  /**
+   * 从哪里取新版。默认是主人自己服务器上的版本索引（一个静态 `update.json`）。
+   *
+   * 为什么默认走自己服务器而不是 GitHub：插件还在测试期，发一次版就在仓库里留一条提交，
+   * 主人不要这种历史；而且本机到 github.com / raw.githubusercontent.com 的连接不稳。
+   * 索引里带着压缩包地址，插件直接 `pnpm add <那个地址>`，Git 全程不参与。
+   * 三种写法都认：https 版本索引地址、`github:作者/仓库`、npm 包名。
+   */
+  qqUpdateSource: 'https://cyanovo.top/plugins/dsh-remote-qqbot/update.json',
+  /**
+   * 更新完自动重启 DSH，**默认开**。
+   *
+   * 为什么必须重启才有意义：DSH **没有插件热重载**，插件代码是主进程启动时加载进内存的。
+   * 代价是重启期间机器人会离线十几秒 —— 所以更新回执里会提前把这件事说明白。
+   * 关掉的话就只回一句「重启 DSH 后生效」，由你自己挑时间重启。
+   */
+  qqUpdateAutoRestart: true,
+  /** 多久查一次新版本（小时），默认 6。越小越及时，代价是多几个请求。 */
+  qqUpdateCheckHours: 6,
 }
 
 /**
@@ -421,6 +449,12 @@ export const Config = z.object({
   notesMaxChars: z.number().default(DEFAULTS.notesMaxChars).description('单篇完整回答的字符上限，超过截断'),
   qqMarkdown: z.boolean().default(DEFAULTS.qqMarkdown).description('QQ 推送用 markdown 消息（链接可折叠成文字）；关掉则退回纯文本'),
   qqPromptMode: z.string().default(DEFAULTS.qqPromptMode).description('QQ 提问的投递方式：queue 排队（像在输入框打字，默认）/ steer 插话打断当前这轮'),
+
+  // ── 远程更新 ─────────────────────────────────────────────────────────────
+  qqUpdateEnabled: z.boolean().default(DEFAULTS.qqUpdateEnabled).description('发现新版本时在 QQ 里提醒（默认开；关掉只是不提醒，/update 照样能用）'),
+  qqUpdateSource: z.string().default(DEFAULTS.qqUpdateSource).description('从哪里取新版：github:作者/仓库（默认）或 npm 包名'),
+  qqUpdateAutoRestart: z.boolean().default(DEFAULTS.qqUpdateAutoRestart).description('更新完自动重启 DSH（默认开；DSH 没有插件热重载，必须重启才生效，重启期间机器人离线十几秒）'),
+  qqUpdateCheckHours: z.number().default(DEFAULTS.qqUpdateCheckHours).description('多久查一次新版本（小时，默认 6）'),
 })
 
 export const name = 'remote-qqbot'
@@ -820,6 +854,20 @@ export function apply(ctx, rawConfig = {}) {
       qqScreenMaxWidth: Number.isFinite(merged.qqScreenMaxWidth) && merged.qqScreenMaxWidth >= 0
         ? Math.floor(merged.qqScreenMaxWidth)
         : DEFAULTS.qqScreenMaxWidth,
+
+      // ── 远程更新 ──────────────────────────────────────────────────────────
+      // 提醒默认开：主人在手机上收到一句「有新版本」，发 /update 就装上了。
+      qqUpdateEnabled: merged.qqUpdateEnabled !== false,
+      // 源写空了就回到默认源 —— 空串会让 /update 直接没法用，而这是"配置没填"，
+      // 不是"我不想更新"，所以给默认值比报错更符合预期。
+      qqUpdateSource: typeof merged.qqUpdateSource === 'string' && merged.qqUpdateSource.trim() !== ''
+        ? merged.qqUpdateSource.trim()
+        : DEFAULTS.qqUpdateSource,
+      qqUpdateAutoRestart: merged.qqUpdateAutoRestart !== false,
+      // 上限 168 小时（一周）：填成 10000 小时等于把功能关掉却还留着定时器，没意义。
+      qqUpdateCheckHours: Number.isFinite(merged.qqUpdateCheckHours) && merged.qqUpdateCheckHours > 0
+        ? Math.min(168, merged.qqUpdateCheckHours)
+        : DEFAULTS.qqUpdateCheckHours,
     }
   }
 
@@ -1758,6 +1806,19 @@ export function apply(ctx, rawConfig = {}) {
   // 真正建立连接（惰性：配置不全时什么也不做）。
   if (liveConfig().qqEnabled) {
     void qq.ensureStarted()
+    // ── 远程更新接线 ──────────────────────────────────────────────────────
+    // ①先回上一条「重启完成」的确认（状态文件里有标记才发）——
+    //   主人发完 /update 就眼睁睁看着机器人掉线，起来后必须有一句回执，否则他不知道成没成。
+    // ②再开始轮询：启动查一次 + 每 qqUpdateCheckHours 小时一次。
+    // 两件事都**不许把异常冒到启动流程里**（更新是"顺手做的事"），所以整段包在 try 里。
+    void (async () => {
+      try {
+        if (await qq.ensureStarted()) await qq.reportRestartIfPending()
+        qq.startUpdateCheck()
+      } catch (err) {
+        log(`远程更新检查启动失败（不影响其它功能）：${err?.message ?? err}`)
+      }
+    })()
     ctx.effect?.(() => () => {
       qq.stop()
       log('QQ 通道已停止')

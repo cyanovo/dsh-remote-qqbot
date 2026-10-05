@@ -6,17 +6,18 @@
 # 一次性准备（只需执行一次）
 node scripts/link-dev.mjs       # 建 node_modules junction（本地测试必需）
 
-# ── npm test 跑的就是下面这 16 条，顺序与 package.json 一致 ────────────
-node tests/agentmd.test.mjs     # agentmd 追加逻辑单测（16 项）
+# ── npm test 跑的就是下面这 17 条，顺序与 package.json 一致 ────────────
+node tests/agentmd.test.mjs     # agentmd 追加逻辑单测（30 项）
 node tests/settings.test.mjs    # settings 注册/覆盖语义单测（9 项）
-node tests/config-view.test.mjs # 设置面板读数来源：describe 为空时必须靠 host 兜底（18 项）
+node tests/config-view.test.mjs # 设置面板读数来源：describe 为空时必须靠 host 兜底（24 项）
 node tests/fulltext.test.mjs    # ★三档全文模式：切分不丢字符、序号不超限（49 项）
 node tests/ui-persist.test.mjs  # ★开关落盘：桌面版拒绝原生写入 → 落覆盖文件；写失败必须抛（29 项）
-node tests/qq.test.mjs          # QQ 桥接纯逻辑单测（146 项，含入站路由、ref_idx 反查、提问中继）
-node tests/status.test.mjs      # /status 排版纯函数（23 项：列出正在跑的会话、截断、折叠、当前会话行）
+node tests/qq.test.mjs          # QQ 桥接纯逻辑单测（181 项，含入站路由、ref_idx 反查、提问中继）
+node tests/update.test.mjs      # 远程更新纯逻辑单测（91 项：三种更新源解析、版本比较、重启脚本、三条启动方式）
+node tests/status.test.mjs      # /status 排版纯函数（24 项：列出正在跑的会话、截断、折叠、当前会话行）
 node tests/session-picker.test.mjs # ★挑会话：编号/时效/优先级（提问与引用优先）、指针落盘（33 项）
 node tests/screen.test.mjs      # 截图：脚本内容（★不含会被 AMSI 拦的构造、★DPI 认领顺序）、路由、图片上行形状（59 项）
-node tests/plugin.test.mjs      # mock ctx 驱动的插件集成测试（32 项，含协作接线回归）
+node tests/plugin.test.mjs      # mock ctx 驱动的插件集成测试（33 项，含协作接线回归）
 node tests/collab.test.mjs      # 协作模式纯逻辑单测（44 项，含总开关护栏，零裸导入、不需要 DSH）
 node tests/notes.test.mjs       # 完整回答渲染与上传单测（19 项，注入假 fetch，不出网）
 node tests/cloud.test.mjs       # 云端账号 API 客户端单测（29 项，注入假 fetch）
@@ -24,7 +25,7 @@ node tests/cloud-integration.test.mjs # ★插件 × 云端 端到端（22 项�
 node tests/cloud-routing.test.mjs     # 云端优先 / 失败**不**改发中枢的路由规则（7 项）
 node tests/load-verify.mjs      # 三层加载验证：import / bundle 解析 / 真实装配（要装到 profile 上）
 
-# 改完代码先跑这个（等价于上面 16 条）
+# 改完代码先跑这个（等价于上面 17 条，合计 683 项断言）
 npm test
 
 # 构建 / 打包
@@ -72,24 +73,29 @@ src/
   agentmd.js   操作日志表格定位与追加（纯逻辑，可脱离 DSH 单测）
   collab.js    协作模式：会话注册表 / 文件占用 / 留言 / 注入渲染 / 自动面板（零裸导入，可独立单测）
   notes.js     完整回答：渲染 markdown + 上传中枢换短链接（零裸导入，可独立单测）
+  fulltext.js  完整回答三档的路由与切分（零裸导入，可独立单测）
+  cloud.js     云端账号 API 客户端：设备码绑定、记录上传、额度（注入 fetch，可独立单测）
   screenshot.js 抓屏：生成 PowerShell 脚本（纯 ASCII）、跑它、拿 JPEG 字节；临时目录必删
   summary.js   从会话事件提取本轮摘要
   qqbot.js     QQ 官方机器人客户端（取 token / WebSocket 长连接 / REST 发送）
   qqbridge.js  QQ 桥接纯逻辑：文案、引用索引（ref_idx）、入站路由、本机 /api 客户端
   qqruntime.js 把上面两者接到 DSH 插件生命周期：通知、提问中继、作答
+  update.js    远程更新：三种更新源解析、版本比较、安装命令、重启脚本生成（零裸导入，可独立单测）
   config-api.js 浏览器侧用的配置路由（/remote-qqbot/api）：字段表 + 白名单写入 + 信任校验
   overrides.js **插件自有覆盖存储**：原生写入被拒时的落盘、原子写、失败必须抛（零裸导入）
   client.js    **浏览器侧 bundle**（DSH loader 的闭包工厂格式）：设置页那一项 + 输入框下方的两个小开关
 
 tests/         单元测试，全部进 npm test 链，零外部依赖（不连中枢、不连 QQ、不读真实 profile）
-  agentmd / settings / config-view / ui-persist / qq / status / screen / plugin / collab / notes : 各组断言
-  load-verify.mjs  三层加载验证（import → bundle 解析 → 真实装配），最后一道防线
+  agentmd / settings / config-view / fulltext / ui-persist / qq / update / status /
+  session-picker / screen / plugin / collab / notes / cloud / cloud-integration / cloud-routing : 各组断言
+  load-verify.mjs  三层加载验证（import → bundle 解析 → 真实装配），最后一道防线，顺带比对 lib/ 与 src/ 是否一致
 
 tests/live/    要真实环境才跑得起来的一次性脚本（不在 npm test 链里，见上）
 scripts/       正式工具：build / pack / link-dev / verify-installed / verify-ui-installed
 scripts/oneoff/ 运维一次性脚本
 docs/          架构文档
-lib/           构建产物（npm run build 生成，**不手工编辑、不进版本库**）
+lib/           构建产物（npm run build 生成，**不手工编辑**；本仓库**故意把它入库** ——
+               `dsh plugin add github:…` 装的是 Git 里的文件，安装时不会跑构建）
 ```
 
 > 分层原则：**纯逻辑必须能脱离 DSH 单测**，所以 `qqbridge.js` / `collab.js` / `notes.js` /

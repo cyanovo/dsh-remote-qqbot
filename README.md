@@ -50,7 +50,7 @@ QQ 消息里放不下长回答。这个站点是完整回答的落脚点：插�
 
 | 你想要的功能 | 要准备什么 |
 |---|---|
-| 跑完 / 提问 / 出错推送到 QQ；QQ 里引用回复；`/status` `/sessions` `/screen` `/help` | **只要一对 QQ 凭证** |
+| 跑完 / 提问 / 出错推送到 QQ；QQ 里引用回复；`/status` `/sessions` `/screen` `/update` `/help` | **只要一对 QQ 凭证** |
 | agentmd 自动操作日志、会话上下文注入 | 只要填一个本机目录 `agentmdDir` |
 | 同一工作区多会话自动协作、QQ 闲聊 | **零配置**（默认就开着） |
 | 跨会话记忆（`memory_read` / `memory_write`） | 一个中枢地址（可自建）—— 可选 |
@@ -81,6 +81,7 @@ QQ 消息里放不下长回答。这个站点是完整回答的落脚点：插�
 | 13 | **闲聊：只看不动 + 回答直接回聊天框** | 不引用直接发消息时，会话被切成**只读**（能查不能改），回答**正文直接发回 QQ**、不占服务器 |
 | 14 | **QQ 菜单里的「屏幕」→ 手机收到电脑截图** | 点菜单「屏幕」（把 `/screen` 填进输入框）或直接发 `/screen`：抓**所有显示器合成的整块桌面**，压缩成 JPEG 发给你 |
 | 15 | **QQ 菜单里的「会话」→ 挑一个最近的会话说话** | 点菜单「会话」（`/sessions`）→ 列出最近在聊的 6 个会话 → **回个数字**就切过去；之后不引用消息直接说的话都进它，直到你再切 |
+| 16 | **远程更新：有新版本 QQ 提醒，`/update` 一句话装好** | 插件定期查版本索引；装完自动重启 DSH（不重启不生效）。见「[QQ 指令](#qq-指令)」 |
 
 > **一句话记住入站规则**：**引用**机器人的消息 = 对那条消息所属的会话说话；
 > **不引用**直接发 = **用 `/sessions` 指定过就进那个会话**（有提问在等时优先当作答），
@@ -106,16 +107,16 @@ QQ 消息里放不下长回答。这个站点是完整回答的落脚点：插�
 
 ## 安装
 
-**方式一：从 npm 装（推荐）** —— 一条命令：
-
-```powershell
-dsh plugin --profile desktop add dsh-remote-qqbot
-```
-
-**方式二：从 GitHub 装** —— 仓库里带了构建好的 `lib/`，装完即可用，不需要本地构建：
+**方式一：从 GitHub 装（推荐）** —— 仓库里带了构建好的 `lib/`，装完即可用，不需要本地构建：
 
 ```powershell
 dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot
+```
+
+**方式二：从 npm 装** —— 包**还没有发布到 npm**，这条现在会报 `ERR_PNPM_FETCH_404`：
+
+```powershell
+dsh plugin --profile desktop add dsh-remote-qqbot
 ```
 
 **方式三：本机构建 tgz**（改过源码，或想离线装）：
@@ -171,6 +172,43 @@ QQ 连着，有事我立刻能收到
 想知道「中枢 / 云端 / agentmd / 界面里改过的配置」各自落在哪、值是什么，
 看 **设置 → QQ 远程提醒与跨会话记忆 → 顶部「运行状态」**（只读）。
 
+## QQ 指令
+
+发在聊天框里、以 `/` 开头的话：
+
+| 指令 | 作用 |
+|---|---|
+| `/task <内容>` | 强制当新任务送进专属会话（压过引用与闲聊的全部判断） |
+| `/sessions`（也认 `/会话`、`/list`） | 列出最近在聊的几个会话（默认 6 个，见 `qqRecentCount`），回个数字就切过去 |
+| `/use <N>`（也认 `/切 <N>`） | 直接切到第 N 个；`/use 0` = 取消指定 |
+| `/screen`（也认 `/screenshot`、`/shot`、`/截图`、`/屏幕`） | 抓一张电脑屏幕发给你，见 [docs/QQ.md](docs/QQ.md) |
+| `/status` | 看状态：正在跑哪些会话，以及 QQ 与入站链路是否正常 |
+| `/update`（也认 `/更新`） | 把插件更新到最新版（默认装完自动重启 DSH）；`/update check` 只查不装 |
+| `/help` | 打印指令清单 |
+
+### 有新版本时：它来告诉你，`/update` 一句话装好
+
+QQ 里会收到「🔔 插件有新版本 x.y.z（现在跑的是 a.b.c）。发 /update 我就装上 —— 装完会自动重启 DSH，中间有十几秒连不上。」
+回一个 `/update` 就行；只想确认一下，用 `/update check`。
+
+- **只在真的有新版时才吭声**：同一个版本只提醒一次，已经是最新版就什么都不发（不刷屏）。
+  🔴 远端版本比本机**旧**时同样不发、也**绝不安装** —— 版本号不一样就装等于把用户降级。
+- 装完回一条 `✅ 已装 x.y.z（原来是 a.b.c）`，然后**自动重启 DSH**（DSH 没有插件热重载，重启是唯一让新版本生效的办法）。
+  起来之后还会再回一条 `✅ 重启完成，插件现在是 x.y.z`；那条回执靠一个重启标记文件，所以手动重启也会收到。
+- 那句话里带着兜底动作：**要是过了一分钟 DSH 还没回来，手动打开一次就行**。插件自己会被这个重启流程杀掉，
+  没法当场汇报重启结果，所以这句必须提前说。
+- 不想自动重启，把 `qqUpdateAutoRestart` 关掉：只回一句「重启后生效」，由你自己挑时间。
+- 更新源默认是作者服务器上的版本索引（`https://cyanovo.top/plugins/dsh-remote-qqbot/update.json`：
+  版本号 + 压缩包地址 + sha256），所以发版**不需要往 Git 仓库里塞提交**。想换成 GitHub 或 npm，
+  把 `qqUpdateSource` 改成 `github:作者/仓库` 或包名。自己搭通道的格式见 [docs/UPDATE.md](docs/UPDATE.md)。
+- 更新走**桌面版自带的那套运行时**（`DeepSeek Harness.exe --expose-internals …/pnpm.mjs add …`），
+  不会去调用 PATH 上的 `dsh`（开发机上那个 `dsh` 常常指向一份源码检出，用它更新会装错地方）。
+- 自动重启在 Windows 上有两个坑（1.0.10 / 1.0.11 修）：启动新进程前要清掉从插件进程继承来的
+  `ELECTRON_RUN_AS_NODE`（带着它的 `DeepSeek Harness.exe` 只当 node 跑一下就退出，桌面版不会启动）；
+  认进程不能只看 `Get-Process` 的 `.Path`（刚创建的进程读不到它），要用 CIM 兜底。
+  细节见 [docs/UPDATE.md](docs/UPDATE.md) 与 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3.10。
+- 每次检查与安装都追加到 `~/.dsh/dsh-remote-update.log`，事后能查。
+
 ## 工具
 
 | 工具 | 作用 |
@@ -206,6 +244,7 @@ QQ 连着，有事我立刻能收到
 |---|---|
 | [docs/CONFIG.md](docs/CONFIG.md) | 配置写在哪个文件、谁盖谁、全部字段与默认值 |
 | [docs/QQ.md](docs/QQ.md) | 接入 QQ 官方机器人：能力边界、配置步骤、指令、屏幕与会话 |
+| [docs/UPDATE.md](docs/UPDATE.md) | 远程更新：版本索引的格式、自己搭通道、自动重启与失败排查 |
 | [docs/FULLTEXT.md](docs/FULLTEXT.md) | 完整回答三档、设备码绑定、短链接 |
 | [docs/COLLAB.md](docs/COLLAB.md) | 协作模式：同一工作区多会话自动避让 |
 | [docs/AGENTMD.md](docs/AGENTMD.md) | agentmd 自动操作日志与会话上下文注入 |
@@ -218,7 +257,7 @@ QQ 连着，有事我立刻能收到
 
 ~~~bash
 npm install          # 装 DSH 自己的包，仅用于本地测试；跑起来时由 DSH 宿主提供
-npm test             # 16 组测试
+npm test             # 17 组测试
 npm run pack         # 构建 + 打出 tgz
 ~~~
 

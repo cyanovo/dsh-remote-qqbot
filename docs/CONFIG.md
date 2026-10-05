@@ -139,6 +139,10 @@ DEFAULTS  <  settings 用户层  <  cordis.patch.yml 的显式键  <  ~/.dsh/rem
 | `cloudToken` | secret | `''` | **云端账号令牌**（每账号一把，服务端只存 sha256）。**别手填** —— 让 DSH 调工具 `cloud_bind` 走设备码绑定自动写入 |
 | `qqFulltextMode` | string | `'chat'` | **完整回答三档**：`chat` 正文切条直接发 QQ（不落服务器）/ `note` 存服务器但不给链接 / `note-link` 存服务器 + 短链接。非法值一律按 `chat`（**永不误上传**） |
 | `qqFulltextMaxChars` | number | `6000` | 「完整回答」正文写进 QQ 分条前的字符上限（按**码点**截断，不会把中文/emoji 切成半个） |
+| `qqUpdateEnabled` | boolean | `true` | **有新版本时在 QQ 里提醒一次**（同一个版本只提一次）。关掉只是不提醒，发 `/update` 照样能更新 |
+| `qqUpdateSource` | string | 作者服务器上的版本索引 | 从哪儿取新版：① 一个 https 版本索引地址（JSON，里写版本号 + 压缩包地址 + sha256）；② `github:作者/仓库`（可带 `#分支`）；③ npm 包名。格式与自建通道见 [UPDATE.md](UPDATE.md) |
+| `qqUpdateAutoRestart` | boolean | `true` | 更新完**自动重启 DSH**（DSH 没有插件热重载，不重启不生效）。关掉就只回一句「重启后生效」，由你自己挑时间 |
+| `qqUpdateCheckHours` | number | `6` | 多久查一次新版本（小时），上限 168。启动时也会查一次 |
 
 ---
 

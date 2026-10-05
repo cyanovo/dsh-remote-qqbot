@@ -711,6 +711,7 @@ export const HELP_TEXT = [
   '/sessions    列出最近在聊的几个会话，回个数字就切过去',
   '/use 3       切到 /sessions 列表里第 3 个（0 = 取消指定）',
   '/screen      给我截一张你电脑的屏幕',
+  '/update      把插件更新到最新版（会自动重启 DSH）',
   '/help        看这条说明',
 ].join('\n')
 
@@ -834,6 +835,10 @@ export function routeIncoming(text, { hasPendingQuestion = false } = {}) {
       // 顺带认英文同义词，主人手打 /shot 也能用。
       case 'screen': case 'screenshot': case 'shot': case '截图': case '屏幕':
         return { kind: 'screen' }
+      // 远程更新：`/update` 直接装，`/update check` 只查不装。
+      // 装完会重启 DSH（这一条只在这里说没用 —— 回执里也必须说清，见 update.js 的文案）。
+      case 'update': case '更新':
+        return { kind: 'update', check: rest === 'check' || rest === '检查' }
       case 'help': case 'h': case '?': case '帮助':
         return { kind: 'help' }
       default:
@@ -895,6 +900,21 @@ export class BotState {
       /** 上次那份名单的会话 id，顺序与列表里显示的编号一一对应。 */
       pickerIds: [],
       lastSeq: null, seen: [], sentRefs: {}, recent: [],
+      /**
+       * 已经提醒过新版本的版本号（空串 = 还没提醒过）。
+       *
+       * 为什么必须落盘：更新检查是按小时轮询的，不记下来的话**每一个周期都会再推一条**
+       * 同样的「有新版本」——那就变成每天骚扰好几次。同一个版本只提醒一次。
+       */
+      updateNotified: '',
+      /**
+       * 重启标记：`{ version, at }`，在「装完新版本、即将重启 DSH」时写，重启后读到就回一条确认。
+       *
+       * 为什么要落盘而不是留在内存里：写它的进程**正是接下来要被杀掉的那个**，
+       * 重启后是一个全新进程 —— 不落盘就没人知道"这次启动是因为刚更新过"。
+       * `at` 是写标记的时刻，用来算"重启用了多少秒"。
+       */
+      updateRestart: null,
     }
     this._load()
   }
@@ -978,21 +998,42 @@ export class BotState {
   }
 
   /**
-   * 引用反查的兜底：ref_idx 认不出来时，如果**最近一条通知刚刚发出**，就用它。
+   * 引用反查的兜底：ref_idx 认不出来时，用**最近一条我发过、且知道属于哪个会话**的消息。
    *
-   * 为什么值得冒"可能送错会话"的风险：反查落空时当前代码回一句「认不出这条消息」，
-   * 用户的提问就**整条丢失**了（既不进任何会话、也不会被回答）—— 那比"落到最近那个
-   * 会话"糟糕得多。窗口限制得很短，避免引用一条很旧的消息时送错地方。
+   * 为什么值得冒"可能送错会话"的风险：反查落空时调用方会回一句「认不出这次通知」，
+   * 用户的那句话就**整条丢失**了（既不进任何会话、也不会被回答）—— 那比"落到最近那个
+   * 会话"糟糕得多。
    *
-   * @param {number} [withinMs] - 兜底时间窗，默认 5 分钟。
-   * @returns {object|null} 兜底目标（带 `viaFallback: true`）。
+   * ⚠️ 两个数据源都要看（2026-10-05 修）：
+   *   - `recent[]`  —— 主动推送的通知（跑完了／提问／出错…），最新在前；
+   *   - `sentRefs{}` —— **每一条**带 `ref_idx` 的发出记录（通知、回执、全文、截图…）。
+   *   以前只看 `recent[]` 且窗口只有 5 分钟：主人引用的若是我发的一句**回执**
+   *   （✅ 收到…，那时回执还没登记 ref_idx），或者最近一条通知已经过了 5 分钟，
+   *   两路就一起落空 → 回「认不出这是哪次通知」并把他那句话整条丢掉。
+   *   实测（2026-10-05 02:31）：最近一条通知 02:24:00、消息 02:31:2x —— 差 7 分钟，
+   *   状态文件里 108 条 sentRefs 明明都认得那个会话，却一条都没用上。
+   *
+   * 窗口放宽到 12 小时是有意的：QQ 的引用没有有效期，隔一顿饭再引用一条通知回话是
+   * 正常用法；再往前的（隔天、隔几天）就不敢猜了。返回值里带 `ageMs`，好在 QQ 回复
+   * 里明说「我按 N 分钟前那条通知的会话送进去了」，送错了他也能立刻看出来。
+   *
+   * @param {number} [withinMs] - 兜底时间窗，默认 12 小时。
+   * @returns {object|null} 兜底目标（带 `viaFallback: true` 与 `ageMs`）。
    */
-  recentTarget(withinMs = 5 * 60 * 1000) {
-    const list = Array.isArray(this.data.recent) ? this.data.recent : []
-    const first = list[0]
-    if (!first?.sessionId) return null
-    if (Date.now() - (first.at ?? 0) > withinMs) return null
-    return { ...first, viaFallback: true }
+  recentTarget(withinMs = 12 * 60 * 60 * 1000) {
+    const all = []
+    for (const r of Array.isArray(this.data.recent) ? this.data.recent : []) {
+      if (r?.sessionId && r.at) all.push(r)
+    }
+    for (const r of Object.values(this.data.sentRefs ?? {})) {
+      if (r?.sessionId && r.at) all.push(r)
+    }
+    if (all.length === 0) return null
+    all.sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
+    const first = all[0]
+    const ageMs = Math.max(0, Date.now() - (first.at ?? 0))
+    if (ageMs > withinMs) return null
+    return { ...first, viaFallback: true, ageMs }
   }
 }
 

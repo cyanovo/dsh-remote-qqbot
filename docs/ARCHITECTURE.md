@@ -3,7 +3,19 @@
 > 这份文档写给**要改这个插件的人**（未来的我、别的会话、别的机器）。
 > 面向使用者的安装/配置说明在 [../README.md](../README.md)，本文只讲**内部怎么跑的**。
 >
-> 文档描述的是当前源码状态。最后核对：2026-10-05（版本 **1.0.5**；1.0.5 修的是
+> 文档描述的是当前源码状态。最后核对：2026-10-05（版本 **1.0.7**；1.0.7 新增
+> **远程更新**：启动时查一次、之后每 `qqUpdateCheckHours` 小时查一次，发现新版本就在 QQ 里提醒一次
+> （同一个版本只提一次、远端更旧或相同都**不吭声**）；QQ 里发 `/update`（同义词 `/更新`，
+> `/update check` 只查不装）就装新版，装完**自动重启 DSH**（可关），重启后回一条「已生效」确认。
+> 新增 `src/update.js`（纯逻辑，零外部依赖）与 `tests/update.test.mjs`，见 3.10。
+> 1.0.6 修的是
+> **「引用一条 QQ 消息发过去，机器人回『认不出这是哪次通知』，而那句话哪儿都没进去」**：
+> ①机器人自己的**回执**（✅ 收到 / ❌ 没送进）以前从不登记 `ref_idx` → 引用回执必然反查落空；
+> ②兜底只有 5 分钟窗口、且只看 `recent[]`（不看 `sentRefs`）；
+> ③两路落空就回一句「认不出」并把消息**整条丢掉**。
+> 现在：回执也登记 `ref_idx`；兜底窗口放宽到 12 小时并合并两个数据源（回复里明说是多久前那条）；
+> 真的一条都对不上时改投**闲聊会话（只读）**并说清去了哪 —— 绝不静默丢消息。见 3.6b。
+> 1.0.5 修的是
 > **「AI 提问后隔久了再答，系统却说没有在等你回答的问题」**：`ASK_TTL_MS` 从 30 分钟放宽到
 > **24 小时**（提问是 agent 在阻塞等的东西，清理依据该是"这轮提问结不结束"，不是"过了多久"），
 > 且 `request.signal` 一中止就立刻摘掉 QQ 条目、真过期必须打日志、提问已结束时把话说明白。
@@ -63,7 +75,7 @@
 > （v0.1.0 就是这么挂的）。
 
 核心不变量：**`src/` 里没有一个文件读环境变量、没有一个文件写死生产地址。**
-所有真实配置只从 `~/.dsh/settings.yaml`（及其 profile 补丁层）来，见 [第五节](#五配置系统为什么这么绕)。
+所有真实配置只从 `~/.dsh/settings.yaml`（及其 profile 补丁层）来，见 [第六节](#六配置系统为什么这么绕)。
 
 ---
 
@@ -125,7 +137,7 @@ agent 事件
 
 **推送里怎么出现「查看完整回答」链接：** 长回答会先走 `notes.publishTurnNote()`
 （渲染 markdown → 上传中枢 → 换回 `<id>`），推送正文只留摘要 + 一个链接。
-链接必须过 `qqPreviewUrl()` 加工（见 [第六节](#六qq四个容易踩死的点)）。
+链接必须过 `qqPreviewUrl()` 加工（见 [第七节](#七qq-三个容易踩死的点)）。
 
 ### 3.2 跨会话记忆
 
@@ -219,6 +231,26 @@ agent 卡在提问上等你回一个 `1` 时，那个 `1` 是在**回答它**；
 （自己的短 id）。你引用那条消息回复，QQ 会把被引用消息的原文回传，插件据此解析出它当时属于
 哪个会话 —— 所以「引用谁 → 回到谁」是**确定性**的，不是猜的。
 
+**但「发出去的每条都要埋」这条以前没做到 —— 回执漏了**（1.0.6 修，见 3.6b）。
+
+### 3.6b 引用反查的三级兜底：认不出会话也**不许丢消息**（1.0.6）
+
+真事故（2026-10-05 02:31，主人报「机器人说认不出这是哪次通知」）：QQ 里收到 4 条消息，
+只有 1 条进了会话，另外 3 条**哪儿都没进去** —— `session-edc80d93` 的转录里连
+`user/message` 和 `agent/inbox/spliced` 都没有，等于主人的话凭空消失。
+
+| 级 | 判据 | 以前的行为 | 现在的行为 |
+|---|---|---|---|
+| ① 精确 | `sentRefs[ref_idx]` 里有这条 | 只登记**通知/提问/全文/截图**；**回执不登记** → 引用「✅ 收到」必然落空 | 回执（`replyPassive`，带 target 时）**也登记** `ref_idx` → 引用它回到同一个会话 |
+| ② 兜底 | `ref_idx` 不认识，但最近发过带会话的消息 | 只看 `recent[]`、窗口 **5 分钟** | `recentTarget()` 合并 `recent[]` + `sentRefs{}` 取**真正最新**一条，窗口 **12 小时**；回复里明说「按最近那条的会话送进去了，那条是 N 分钟前发的」 |
+| ③ 落底 | 一条带会话的记录都没有（引用自己发的、或好几天前的） | 回一句「你引用的这条我认不出是哪次通知了」→ **消息整条丢掉** | 投进**闲聊会话**（`qqChatReadOnly`，只读、动不了手）并说清「这句话我放进了闲聊」 |
+
+三条的设计取向都是同一句话：**落错一个只读会话，也比让主人的话消失强**。
+`ageMs` 会如实报出来，所以他一眼能判断②猜得对不对，错了立刻 `/sessions` 重挑再发。
+
+窗口为什么是 12 小时：QQ 的引用没有有效期，隔一顿饭再引用一条通知回话是正常用法；
+再往前的（隔天、隔几天）就不敢猜了，那时宁可按③落到只读的闲聊会话。
+
 **`qqPromptMode` 决定投递方式**（这是渲染差异，不是审美问题）：
 
 | 值 | 行为 | 在 DSH 里长什么样 |
@@ -281,6 +313,7 @@ agent 要提问 ──▶ svc.ask(request)
 | `relayAsk` 的 `cancelAsk()` | `request.signal` 一中止（turn 被取消）就**立刻摘掉** QQ 条目，并撤掉兜底闹钟；早中止的 signal 干脆一个字都不发到 QQ |
 | `oldestPending()` / 兜底闹钟 | 真过期时必须**打日志**（这次故障最难查的就是"提问静默消失"） |
 | 已结束的提问收到回答 | 文案改成说清「提问结束了 / 你这句没送进去 / 下一步怎么办」，而不是一句「没有在等你回答的问题」 |
+
 
 ---
 
@@ -363,6 +396,115 @@ upload  ──→ publishTurnNote(agent, parts) → notes.js → POST <hubUrl>/a
    `onEvent` 的 catch 也补了最后一道兜底：任何没被各路由接住的异常，也要在 QQ 里回一句，
    不再出现「你什么都收不到」的静默失败（`chat` / `task` 两条路过去就会这样）。
 
+### 3.10 远程更新：怎么装、装哪儿、怎么重启（1.0.11）
+
+整条链是**四段**，每段都可能失败，所以每段的失败都被收敛成「日志 + 一句人话」，
+**绝不允许把异常抛进 agent 主流程**（更新是顺手做的事，不能因为它把会话搞崩）。
+
+**① 查版本（`fetchLatestVersion`）**
+源有**三种**写法，`parseUpdateSource` 解析：
+- **版本索引（默认）**：一个 https 地址，返回 JSON（`{version, url, sha256}`）。默认值
+  `https://cyanovo.top/plugins/dsh-remote-qqbot/update.json` —— 自己服务器上的静态文件（nginx 直出）。
+  `pnpm add` 用的是**索引里的 `url`**，不是索引地址本身；请求带 `cache-control: no-cache`。
+  校验必须严：索引地址打错时宿主的单页应用会回**首页 HTML 且状态码 200**（实测），
+  所以只认「对象 + 非空 `version` + http(s) 的 `url`」，缺字段逐条说清（`versionFromManifestResponse`）。
+- `github:作者/仓库[#ref]` → `https://api.github.com/repos/<仓库>/contents/package.json`
+  （`raw.githubusercontent.com` 在本机不可达，所以走 contents API，`content` 是 base64）
+- npm 包名 → `https://registry.npmjs.org/<包名>/latest`
+
+带 UA、20 秒超时。
+
+**② 比版本 —— 这里必须三分支（`compareVersions`）**
+`>` 才提醒/安装；`===` 回「已经是最新版」并静默；`<` 回「远端还旧」并静默。
+实测过：GitHub 上还是 1.0.5，而本机已经 1.0.6 —— 只判「不一样就装」等于**把用户降级**。
+版本号比较按数字段（`1.0.10 > 1.0.9`）、认 `v` 前缀、pre-release 排在同号正式版之前、忽略 `+build`。
+
+**③ 装（`buildAddCommand` + `runProcess`）—— 通道选择是这一版最重要的硬事实**
+PATH 上的 `dsh` 在开发机上指向一份**源码检出**（`node --import tsx/esm .../bin.ts`），
+拿它更新会装到别的地方；所以顺序是：
+1. **桌面版自带运行时**（首选）：`spawn(process.execPath, ['--expose-internals', <argv 里的 pnpm.mjs>, 'add', spec])`，
+   `cwd` = profile 目录、`env` 带 `ELECTRON_RUN_AS_NODE=1`（同一个 exe 当 node 用，官方 `node.cmd` 就是这么干的）；
+   这些路径全部从**本进程自己的 `process.argv`** 里认（`parseDesktopRuntime`），不猜安装位置；
+2. `%DSH_DESKTOP_NODE_EXECUTABLE%` + 同一个 pnpm.mjs；
+3. PATH 上的 `dsh`（Windows 上 `.cmd` 不能直接 spawn，要 `cmd.exe /c`，路径带空格必须加引号）；
+4. profile 目录里的 `pnpm add`。
+
+profile 目录的判定是「`package.json` 里有 `dsh.profile`」，不是目录名（`isProfileDir`）。
+子进程输出**必须重定向到临时文件**（`stdio: ['ignore', fd, fd]`）——
+Windows 沙箱下用管道收子进程输出会 `EPERM`，这条踩过。安装超时 180 秒，超时就 kill。
+
+**④ 重启 + 回执**
+- 装的版本号从**安装目录的 `node_modules/dsh-remote-qqbot/package.json` 读回来**，
+  不靠「命令成功」推断（pnpm 可能打印 `Already up to date` 却什么都没换）；
+  版本没变就老实回「版本还是 x.y.z，远端可能还没发这一版」。
+- 重启靠一个**临时目录里的 PowerShell 脚本**：等 10 秒（让那条回执先发出去）→
+  按**可执行文件路径**杀进程（同名进程可能不止一个）→ 等它真的消失（最多 20 秒）→
+  再稳 3 秒 → 启动 → 最多 3 次、每次隔 5 秒 → 全程追加写
+  `~/.dsh/dsh-remote-update.log`。脚本文件**带 BOM**（PowerShell 5.1 才认中文）。
+- 🔴 **启动新进程前必须清掉 `ELECTRON_RUN_AS_NODE`** —— 这是 2026-10-05 那次
+  「`/update` 装好了、DSH 却没自己回来，主人手动打开」的根因，现场取证如下：
+  插件跑在桌面版的 host 子进程里，host 是**把 Electron 当 node 用**跑起来的，所以插件进程
+  （以及它派生的一切：`cmd` → 启动器 → PowerShell 脚本）都带着 `ELECTRON_RUN_AS_NODE=1`；
+  `Start-Process` 把这个环境原样传给了新进程，而带着这个变量的
+  `DeepSeek Harness.exe` **只会当 node 跑一下就退出**（实测 `--version` 输出 `v24.18.1`、退出码 0）
+  —— 桌面版根本没启动：没有进程、没有 `lockfile`、没有崩溃日志，脚本只看到「启动后没看到进程」，
+  三次重试全一样；主人双击能起来，是因为 explorer 的环境里没有这个变量。
+  修法是脚本开头 `Remove-Item Env:<名单>`，名单常量 `RESTART_POISON_ENV` 是唯一来源
+  （`ELECTRON_RUN_AS_NODE`、`ELECTRON_NO_ATTACH_CONSOLE`、`NODE_OPTIONS`，
+  加上这次会话自己的标记 `DSH_SHELL` / `DSH_SESSION_ID` / `DSH_WEB_URL`）。
+- 启动有**三种方式依次兜底**：`Start-Process -WorkingDirectory <exe 目录>` →
+  `explorer.exe "<exe>"`（和主人双击同一条路，环境天然干净）→
+  `Invoke-CimMethod Win32_Process Create`（由 `WmiPrvSE` 服务建进程，完全不沾我们的进程树）。
+  前一种失败要把原因写进日志再换下一种，不能默默跳过。
+- **认进程用两套量具**：`Get-Process` 的 `.Path` **常常读不到**（刚创建的进程实测就是空串），
+  所以读不到时用 `Get-CimInstance Win32_Process` 的 `ExecutablePath` 兜底 ——
+  只看前者会把「其实已经起来了」判成失败。
+- **"看到进程"也算不上成功**：抢单实例锁失败会「起来又秒退」，所以看到进程后还要再盯 4 秒；
+  盯不住就换下一种启动方式。**新进程"起了又没"时日志会带上它的退出码**（`Get-ExitCodeText`，
+  需要 `-PassThru` 拿到的那个进程对象）—— 秒退这类故障看一眼退出码就能定性（当 node 跑那次就是
+  退出码 0、零点几秒结束）。全部失败时把桌面版最新的 `crash-*.log` 尾巴抄进同一份日志
+  （下次不用满硬盘找线索）。
+- **"进程建出来了"不等于"脚本在跑"**：脚本第一件事就是写日志，所以拉起之后要用
+  `verifyRestartLaunched()` 等日志长出来（最多 4 秒，落在脚本自己的 10 秒延迟之内）；
+  没长出来就回「自动重启没能排上，手动重启 DSH 后生效」，而不是让主人干等一个不会发生的重启。
+- ⚠️ **插件自己活不到重启那一刻**（它会被自己拉起的脚本杀掉），所以「重启成功没有」它当场
+  验证不了，只能事后靠状态文件里的标记回执。因此装好那条回复必须**提前把兜底动作说清楚**：
+  「要是过了一分钟还没回来，手动打开 DSH 就行」—— 2026-10-05 就是没说这句，主人对着 QQ 等
+  一条永远不会来的确认。
+- 🔴 **怎么把脚本拉起来，这一版踩过坑**（2026-10-05 四种配方差分实测）：
+  直接 `spawn('powershell.exe', …, {detached:true, stdio:'ignore'})` 时**脚本一行都不执行**
+  （进程建出来了、`unref()` 也正常，就是没动静）；同一个 spawn **不分离**时脚本能跑、
+  但活不过父进程结束；`spawn(process.execPath, …, {detached:true})` 反而正常 ——
+  所以不是"分离"本身的问题，是"分离 + powershell.exe"这个组合。
+  最终方案：多写一个一行的 `.cmd` 启动器（`start "" /min "powershell.exe" … -File 脚本`，
+  内容保持全 ASCII），再用 `spawn(comspec, ['/c', 启动器], {detached:true, stdio:'ignore', windowsHide:true})`
+  + `unref()` 拉起 —— 实测这是唯一"既跑得起来、又活得过父进程"的配方。
+- **"进程建出来了"不等于"脚本在跑"**：脚本第一件事就是写日志，所以拉起之后要用
+  `verifyRestartLaunched()` 等日志长出来（最多 4 秒，落在脚本自己的 10 秒延迟之内）；
+  没长出来就回「自动重启没能排上，手动重启 DSH 后生效」，而不是让主人干等一个不会发生的重启。
+- 重启目标 exe **不写死路径**：优先环境变量 `DSH_DESKTOP_EXE`，否则从本进程的 `process.argv`
+  里认（`parseDesktopRuntime`）。认不出来（web 版 / 纯 node 版）就**不自动重启** ——
+  杀掉别人的服务是灾难，而且拿 node 也起不回一个服务。
+- **重启后的确认**靠状态文件里的 `updateRestart` 标记：插件下次启动时 `reportRestartIfPending()`
+  先**清标记再发**（发失败也不会每次启动都重发），文案带上新版本号与用时。
+
+**⑤ 提醒的闸门**
+自动提醒要求 `qqUpdateEnabled !== false` **且** `qqEnabled === true` **且** `qqNotifyEnabled !== false`；
+手动 `/update` 不受这三个开关限制（用户主动要求的事不该被静默吞掉）。
+状态文件里 `updateNotified` 记住「已经提醒过哪个版本」，同一个版本只提一次。
+
+离线测试在 `tests/update.test.mjs`（91 条）：版本比较、三种源解析（含"索引地址打错拿到首页
+HTML 也必须判失败"）、三分支、**用本机实测 argv** 跑通道选择、注入假 `spawn`/`fs` 跑 `runProcess`
+（含超时，并断言 `stdio` 里不许出现 `pipe`）、重启脚本的形状与 BOM（含"清环境变量的动作必须排在
+任何启动动作之前"、退出码诊断）、启动器的形状与 `cmd /c` 配方、"日志长出来才算脚本在跑"的正反两向，
+以及每一条用户可见文案的逐字断言。
+另有一次性端到端探针（跑完即删）：`.tmp-restart-e2e.mjs` 用 `cmd.exe` 的副本当假 DSH，
+让它把**自己继承到的环境**导出到文件并靠 `ping` 撑住不退出，从而真实走一遍
+「写脚本 → 写 `.cmd` 启动器 → `cmd /c` 拉起 → 杀进程 → 清环境 → 启动 → 4 秒复检 → 写日志」，
+再用"直接起同一个假 DSH"作反向对照，证明量具本身认得出 `ELECTRON_RUN_AS_NODE`；
+`.tmp-restart-exitcode.mjs` 用 `whoami.exe` 的副本（永远秒退）走失败路径，
+断言日志里出现「已经退出，退出码 0」、三种启动方式都试过、最后落到「重启失败」。
+
 ---
 
 ## 四、模块职责与关键导出
@@ -413,6 +555,7 @@ UI 上目前有两个挂点：
 > `scripts/verify-ui-installed.mjs` 会**数** `InputDockControls` 里 MiniToggle 的个数（必须恰为 2），
 > 谁加回去谁报红；同时另有两条断言要求设置字段表里**必须还有** `qqFulltextMode` / `cloudEnabled`
 > —— 合起来守住"只搬位置、不砍能力"。
+
 
 ---
 
@@ -784,6 +927,7 @@ QQ 的自定义菜单是**平台侧的一份静态配置**，而且客户端有�
 
 ## 七、状态文件与落盘位置
 
+
 | 内容 | 位置 | 说明 |
 |---|---|---|
 | QQ 状态（open_id / 专属会话 id / 去重表） | `qqStateFile`，默认 `~/.dsh/qq-bot-state.json` | 换机器要重新授权 |
@@ -808,7 +952,7 @@ npm test    # 16 组，全部零外部依赖（cloud-integration 会顺手做一
 | `tests/config-view.test.mjs` | 24 | 设置页读数来源（`describe` 为空时必须靠 host 兜底、secret 绝不回显、**提示里点名的字段必须真的存在**、**「运行状态」只读块与告警位**） |
 | `tests/fulltext.test.mjs` | 49 | **三档全文模式**：`normalizeFulltextMode` 非法值必落 `chat`、`uploadsFulltext`/`showsFulltextLink` 语义、切分**不丢字符**、**带序号不超限**（★`limit=100` 边界）、`maxChars` 下限 100 的契约 |
 | `tests/ui-persist.test.mjs` | 29 | 开关落盘：桌面拒绝原生写入 → 落插件自有覆盖文件；写失败必抛；`ok:false` 不被 success spread 掩盖；secret 不回显 |
-| `tests/qq.test.mjs` | 146 | QQ 文案、引用索引、入站路由、`qqPreviewUrl`、提问中继行为 |
+| `tests/qq.test.mjs` | 179 | QQ 文案、引用索引、入站路由、`qqPreviewUrl`、提问中继行为、**引用反查三级兜底（回执登记 `ref_idx` / 12 小时兜底窗口 / 认不出也必须投递）** |
 | `tests/status.test.mjs` | 23 | `/status` 排版（真跑 `formatStatusText`），含「当前会话看得见」 |
 | `tests/session-picker.test.mjs` | 33 | **挑会话**：列表编号与纯文本、`isPickerFresh` 时效、**裸数字的优先级（提问 > 选会话）**、`formatPickAck` 四种结果、指针真的落盘（含老状态文件） |
 | `tests/screen.test.mjs` | 59 | 抓屏脚本内容（**不含 AMSI 触发构造**、**DPI 认领必须在读 VirtualScreen 之前**）、`parseRawOutput`、隐私清理、`/screen` 路由、图片上行形状、AMSI 报错翻译 |
@@ -940,6 +1084,7 @@ dsh plugin --profile desktop add github:<owner>/dsh-remote-qqbot
 | **`blocksToText()` 把换行压平**（0.8.6 修） | 原来是 `parts.join(' ').replace(/\s+/g,' ')` ⇒ 上传的正文从源头就不是 markdown（实测 `hhfwa.md` 单行 1290 字符里塞 5 个 `##` 标题）。现在只统一换行、压行内空格、折叠多余空行，**段落/标题/表格结构保住**；需要单行摘要的调用方（`composeSummary` / `composeChatSummary`）自己压平 |
 | **「默认不发正文」只是句承诺**（0.8.6） | 拆成「模式（意图）+ `cloudEnabled` 总闸（授权）」两道，只有两者都满足才上传。`chat` 档 + 总闸关闭 ⇒ **对服务器 0 字节**，探针实测 `/api/notes` 请求数为 0 |
 | **`MARKER_RESERVE` 下限缺陷**（0.8.6） | `bodyLimit` 原来写 `Math.max(MIN_CHUNK_CHARS, …)`，`limit ≤ 109` 时反而超限（实测 `limit=100` 产出 106 字）。改成 `Math.max(1, limit - MARKER_RESERVE)`；★边界用例钉在 `tests/fulltext.test.mjs` |
+| **引用一条 QQ 消息 → 回「认不出这是哪次通知」且消息消失**（1.0.6） | 三级兜底缺了两级：①回执（`replyPassive`）从不登记 `ref_idx`；②兜底只看 `recent[]` 且只有 5 分钟。现在回执登记 `ref_idx`、兜底合并 `sentRefs{}` 并放宽到 12 小时、真认不出**也必须投进闲聊会话（只读）**。**任何一级都不许再退回"只回一句就丢掉"**，见 3.6b |
 
 ### 已知未解决 / 未验证
 
@@ -961,7 +1106,7 @@ dsh plugin --profile desktop add github:<owner>/dsh-remote-qqbot
 
 ## 十一、给下一个改这个插件的人
 
-1. **先读 [DEVELOPMENT.md](DEVELOPMENT.md) 的「四条必须遵守的加载/配置期约束」**，再看本文件。
+1. **先读 [../README.md](../README.md) 的「五条必须遵守的加载/配置期约束」**，再看本文件。
 2. 加配置项：`DEFAULTS` → `Config` → `FIELD_SPECS` → 测试，四步缺一不可。
 3. 改文案/排版：**把规则放进导出的纯函数**，让测试真跑它，别写只匹配字符串的断言。
 4. 改完必须：`build` → `npm test` → `pack` → `install` → `verify-*` → **让用户重启** → 比时间戳。
