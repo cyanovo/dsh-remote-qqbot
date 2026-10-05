@@ -38,7 +38,7 @@ QQ 消息里放不下长回答。这个站点是完整回答的落脚点：插�
 
 ## 上手：两步
 
-1. **装插件** —— 一条命令，见「[安装](#安装)」。
+1. **装插件** —— 一条命令，或者把「[安装](#安装)」里那段话整个复制给 DSH，让它自己装。
 2. **填一对 QQ 机器人凭证** —— DSH 里「设置 → QQ 远程提醒与跨会话记忆 → QQ 远程提醒」，
    打开「QQ 机器人通道」，填 **AppID** 与 **ClientSecret**，然后**重启 DSH**。
 
@@ -107,7 +107,25 @@ QQ 消息里放不下长回答。这个站点是完整回答的落脚点：插�
 
 ## 安装
 
-**方式一：从 GitHub 装（推荐）** —— 仓库里带了构建好的 `lib/`，装完即可用，不需要本地构建：
+### 不想敲命令：把下面这段复制给 DSH
+
+DSH 自己能装插件。把下面这段整个复制下来（GitHub 代码块右上角有复制按钮），粘进 DSH 的输入框发出去：
+
+```text
+帮我把 dsh-remote-qqbot 装到 DSH 里。
+
+请执行这条命令，源是 GitHub，仓库里带了构建好的 lib/，装完即可用：
+dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot
+
+如果你这台是 dsh web 起的，把 --profile desktop 换成 --profile web。
+
+装完核对一次结果（版本号、profile 的 bundles 里有没有 dsh-remote-qqbot），
+然后提醒我：要重启 DSH 才会生效。
+```
+
+它会自己装好、核对一遍，再把结果告诉你。装完接着看「[上手](#上手两步)」填 QQ 凭证。
+
+**方式一：从 GitHub 装** —— 仓库里带了构建好的 `lib/`，装完即可用，不需要本地构建：
 
 ```powershell
 dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot
