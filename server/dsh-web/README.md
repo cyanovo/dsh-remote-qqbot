@@ -167,6 +167,24 @@
 `DSH_WEB_CAPTCHA_TTL_MS` / `DSH_WEB_CAPTCHA_IP_LIMIT`（调短 TTL、调小领取上限）。
 和 `DSH_WEB_RETENTION_MS` 一样，它们只为"跑一遍就能验到期/限流"存在。
 
+**前端按服务端说的来**：`/api/meta` 会回 `captcha.required`（服务端自己按上面两条豁免算），
+前端只有看到 `true` 才画那张图、才把 `captchaId/captchaText` 带进请求。少了这一步，本机直连与带口令的请求
+会被前端拦在一张服务端根本不看的图上（本机那些真浏览器验收会因此全红，而且看着像产品坏了）。
+
+**上线实测（2026-10-05 17:5x）**：
+
+| 量具 | 结果 |
+|---|---|
+| 公网 `http://cyanovo.top/api/meta` 与 https 两个入口 | `captcha:{required:true,chars:4,ttlMs:180000}` |
+| 公网不带验证码注册 | `400` + `captcha:true`「请先填写图片里的验证码」 |
+| 公网登录：密码错 + 图里填错 | `400`「验证码不对（还能试 2 次）」（**不是 401** —— 闸在密码比对之前） |
+| 公网 `GET /api/captcha` | 200、`Cache-Control: no-store`、SVG 里正好 4 个 `<text>`，**响应里没有 `answer` 字段** |
+| 服务器本机直连（回环） | `required:false`，注册走到的是「密码至少 6 位」、登录走到 401 —— 都没被人机验证拦下 |
+| 对照：同一个 8795，只多带一个 `x-real-ip: 203.0.113.99` | 又被拦下（`captcha:true`）⇒ 公网迈不进回环那条通道 |
+| 线上真浏览器（`_live-captcha-ui.mjs`） | 11/0：图解码成 132×44、点「换一张」换到另一张、空着点登录本地就拦下 |
+| 线上链路（`verify-live.mjs`，带 `ADMIN_TOKEN`） | 31/0 |
+| `/opt/dsh-web/server.mjs` 的 md5 | `86b9b91b98754924bfb392b4a57c52e9`，与本地**逐字节相同**；unit 里没有 `CAPTCHA` 相关环境变量 |
+
 ## 后台管理页（`/admin.html`）
 
 浏览器打开 `https://cyanovo.top/admin.html`（`noindex,nofollow`），粘贴后台口令即可。
@@ -281,13 +299,14 @@ node verify-p1-quota1000.mjs  #  7 条：真打 1000 次，第 1001 次必须 42
 node verify-captcha.mjs       # 19 条：人机验证（签发/强制/一次性/试错/过期/绑 IP/限流/两条豁免/不落盘）
 node verify-dom-ids.mjs       #  9 条：app.js 要用的每个元素 id 都有人提供（补无头桩的盲区）
 node verify-deeplink.mjs      # 16 条：`/n/<id>` 深链（无头 DOM 桩跑真 app.js）
-node verify-account-ui.mjs    # 51 条：首页能渲染 + 账号页设备码/令牌 + 登录页的验证码（同一个桩，真浏览器语义）
+node verify-account-ui.mjs    # 55 条：首页能渲染 + 账号页设备码/令牌 + 登录页的验证码（同一个桩，真浏览器语义）
 node verify-landing.mjs       # 33 条：**线上**首页落地页 + 三个静态文件逐字节一致
 node verify-live-429.mjs      #  7 条：被限流时脚本要"说清 + 退出码 3"，不许级联变红
-node verify-live.mjs          # 30 条（+1 跳过）：打公网入口，全程真链路，收尾自删临时账号
+node verify-live.mjs          # 31 条（没给 ADMIN_TOKEN 则 30 条 + 1 条显式跳过）：打公网入口，全程真链路，收尾自删临时账号
                               # 给了 ADMIN_TOKEN 才能验"账号数/记录数回到开跑前"（走 /health/detail），
                               # 没给就**显式打印「跳过」**，绝不让 undefined===undefined 冒充通过
-                              # 公网注册/登录现在要人机验证 ⇒ 这两个脚本**必须**带 ADMIN_TOKEN 才跑得通
+                              # 公网注册/登录现在要人机验证 ⇒ 这个脚本**必须**带 ADMIN_TOKEN 才跑得通
+node _live-captcha-ui.mjs     # 11 条：**线上**真浏览器打开登录页，验那张图真的画得出来、点「换一张」真的换
 node verify-admin.mjs         # 124 条：后台 API 全套（自助临时数据目录，不碰线上）
 node verify-admin-ui.mjs      # 167 条：无头 Edge + CDP 真点后台页面（真 CSS 层叠、真事件）
 node verify-admin-role.mjs    # 76 条：账号身份的管理员角色（DSH_WEB_OWNER 自举、封禁、最后一个管理员）
@@ -298,7 +317,10 @@ node _live-admin.mjs <后台口令>  # 40 条：http 与 https **各 20 条**打
 # PowerShell:  $env:ADMIN_TOKEN='<后台令牌>'; $env:OWNER_PASS='<主人账号口令>'
 node _live-role.mjs           # 63 条：拿真口令打**线上**，跑一遍封禁/解封/付费版/管理员四类角色（自建自删临时账号）
 # PowerShell:  $env:ADMIN_PASS='<主人账号口令>'
-node _live-admin-ui.mjs       # 34 条：无头 Edge 打开**线上** /admin.html，走「账号+密码」那条进后台通道
+node _live-admin-ui.mjs       # 34 条：无头 Edge 进后台「账号+密码」通道。⚠️ 公网上跑不了（账号登录要人机验证，
+                              # 无头浏览器不会看图）——脚本开工前会自己问 /api/meta 并给出隧道跑法：
+                              #   ssh -N -L 18795:127.0.0.1:8795 cyanovo
+                              #   $env:BASE_URL='http://127.0.0.1:18795'; $env:ADMIN_PASS='…'; node _live-admin-ui.mjs
 # verify-deeplink-live.mjs 同理：口令用 --pass 或环境变量 DSW_PASS，不再有默认值
 # 服务器上（它会写真实 data.json，跑完用 _cleanup-testdata.mjs 清测试账号）
 ssh cyanovo 'cd /opt/dsh-web && node verify.mjs'      # 56 条：旧契约回归
@@ -342,9 +364,12 @@ node verify-captcha.mjs --server <拆掉校验的那份副本>        # 实测 1
 # 前端：把「先 render 再注入明文令牌」改回「先注入再 render」→ verify-account-ui.mjs 期望 3 条红
 ```
 
-实测：新版 `43/0`、`12/0`、`7/0`、人机验证 `19/0`、`id 一致性 9/0`、深链 `16/0`、账号页 `51/0`、首页 `33/0`、限流分支 `7/0`、旧契约 `56/0`、
+实测：新版 `43/0`、`12/0`、`7/0`、人机验证 `19/0`、`id 一致性 9/0`、深链 `16/0`、账号页 `55/0`、首页 `33/0`、限流分支 `7/0`、旧契约 `56/0`、
 后台 API `124/0`、后台页面 `167/0`、后台角色 `76/0`、线上后台 `40/0`（http+https）、
-线上角色 `63/0`、**线上后台页面（账号通道）`34/0`**；
+线上角色 `63/0`、**线上后台页面（账号通道）`34/0`**（那把是 2026-10-04 打公网入口测的；
+加了人机验证之后公网入口跑不了它 —— 得挂 SSH 隧道，脚本开工前会把跑法打出来）、
+**线上登录页人机验证 `11/0`**（`_live-captcha-ui.mjs`，真 Edge 打开 `https://cyanovo.top`：图解码出来了、
+点「换一张」真的换、空着点登录本地就拦住不发请求）、**线上 `verify-live.mjs` `31/0`**；
 对回退副本分别 `38/5`、`3/4`。账号页那次反向校验实测 **23/3**（红的正是明文那三条）；
 `_reverse-boot.mjs` 往 app.js 里注入一句坏查找 → `verify-account-ui.mjs` 实测 **13 红**（含「boot 抛异常」与「空卡片」两条）；
 `_reverse-admin-ui.mjs` 把 `public/` 切 3 刀 → **149/3，红的正好是预期的 3 条**（探针 exit 1）。
