@@ -24,10 +24,12 @@ const check = (name, okk, detail = '') => {
 /** 造一个元素：只要能被读写就行 */
 function el(id) {
   return {
-    id, innerHTML: '', textContent: '', hidden: false, value: '', className: '',
+    id, innerHTML: '', textContent: '', hidden: false, value: '', className: '', src: '',
     style: {}, dataset: {}, onclick: null,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false } },
     addEventListener() {}, appendChild() {}, querySelectorAll() { return [] },
+    // 真浏览器每个元素都带这几个：桩里漏掉，就会把"代码路径没问题"误报成抛异常
+    setAttribute() {}, removeAttribute() {}, getAttribute() { return null },
   }
 }
 
@@ -132,6 +134,8 @@ console.log('\n── 三、登录成功后接着自动打开 ──')
       '/api/meta': { status: 200, data: { ok: true, modes: [], plans: {}, priceCny: '2.99', freeDaily: 100 } },
       '/api/me': { status: 200, data: { ok: true, me: null } },
       '/api/login': { status: 200, data: { ok: true, me: ME.me } },
+      // 登录页现在有人机验证：没有一张有效验证码，app.js 会**本地拦住**根本不发登录请求
+      '/api/captcha': { status: 200, data: { ok: true, id: 'cap-dl-1', image: 'data:image/svg+xml;base64,PHN2Zy8+', chars: 4, ttlMs: 180000 } },
       '/api/records/abc123/view': { status: 200, data: REC },
     },
   })
@@ -140,12 +144,17 @@ console.log('\n── 三、登录成功后接着自动打开 ──')
   if (typeof btn.onclick === 'function') {
     getEl('loginName').value = 'someone'
     getEl('loginPass').value = 'pw'
+    getEl('capText_login').value = 'AB12'
     await btn.onclick()
     for (let i = 0; i < 40; i++) await Promise.resolve()
     await new Promise((r) => setImmediate(r))
     const view = calls.filter((c) => c.path === '/api/records/abc123/view')
     check('★ 登录后自动打开了那条记录（不用再点一次链接）', view.length === 1, JSON.stringify(calls.map((c) => `${c.method} ${c.path}`)))
     check('正文确实进了阅读器', String(getEl('readerBody').innerHTML).includes('正文第二行'))
+    const login = calls.find((c) => c.path === '/api/login')
+    check('★ 这次的登录也带上了验证码（深链自动续上的那一步不能绕过这道闸）',
+      !!login && login.body && login.body.captchaId === 'cap-dl-1' && login.body.captchaText === 'AB12',
+      JSON.stringify(login && login.body))
   }
 }
 

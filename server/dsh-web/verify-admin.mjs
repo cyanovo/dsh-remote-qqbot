@@ -21,6 +21,10 @@ const argOf = (name, dflt) => {
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : dflt
 }
 const SERVER = path.resolve(__dirname, argOf('--server', 'server.mjs'))
+// 人机验证的答案只在**测试模式**下由 /api/captcha 一并返回（生产 unit 不设这个变量）。
+// 本脚本第 [11] 节要打的是"公网形态"的请求（用 x-real-ip 伪造来源，所以服务端会要求验证码），
+// 不打开这个开关就没法把"错密码 → 401 / 账号被锁 → 429"这条链走通。
+process.env.DSH_WEB_CAPTCHA_TEST = '1'
 
 let pass = 0
 const fails = []
@@ -63,6 +67,16 @@ function makeClient() {
   }
 }
 const anon = makeClient()
+
+/** 领一张验证码并解出来。
+ *  ⚠️ 两条讲究：
+ *    ① 领题的 IP 必须与随后那次登录**一致** —— 服务端把题绑在来源 IP 上，不一致会被判失效；
+ *    ② 需要计时的断言必须把这一步放在计时**之外**，否则量到的是"领题"的耗时，不是"比对密码"的耗时。 */
+async function solveCaptcha(ip) {
+  const r = await anon('GET', '/api/captcha', ip ? { headers: { 'x-real-ip': ip } } : {})
+  if (r.status !== 200 || !r.json || !r.json.id) throw new Error(`领验证码失败：HTTP ${r.status} ${JSON.stringify(r.json)}`)
+  return { captchaId: r.json.id, captchaText: r.json.answer }
+}
 
 async function waitReady() {
   for (let i = 0; i < 100; i++) {
@@ -370,18 +384,26 @@ async function main() {
   const spoofIp = '203.0.113.' + (Math.floor(Math.random() * 200) + 1)
   const fakeUser = 'vnouser' + Math.floor(Math.random() * 90000 + 10000)
   const acctCodes = []
-  for (let i = 0; i < 12; i++) acctCodes.push((await anon('POST', '/api/login', { headers: { 'x-real-ip': spoofIp }, body: { username: fakeUser, password: 'wrong-' + i } })).status)
+  for (let i = 0; i < 12; i++) {
+    const cap = await solveCaptcha(spoofIp)
+    acctCodes.push((await anon('POST', '/api/login', { headers: { 'x-real-ip': spoofIp }, body: { username: fakeUser, password: 'wrong-' + i, ...cap } })).status)
+  }
   const firstAcctLock = acctCodes.indexOf(429)
   chk('★ 同一账号错密码会被锁（12 次里出现 429）', firstAcctLock >= 0, JSON.stringify(acctCodes))
   chk('★ 不是一上来就锁（前 5 次只是 401）', acctCodes.slice(0, 5).every((c) => c === 401), JSON.stringify(acctCodes.slice(0, 5)))
   chk('★ 锁定发生在上限附近（第 8~11 次）', firstAcctLock >= 7 && firstAcctLock <= 11, `firstLock=${firstAcctLock} codes=${JSON.stringify(acctCodes)}`)
   // 账号被锁后**换一个 IP 也进不来**（按账号记的锁与 IP 无关）
-  const rOtherIp = await anon('POST', '/api/login', { headers: { 'x-real-ip': '203.0.113.250' }, body: { username: fakeUser, password: 'wrong-again' } })
+  // ⚠️ 仍要带一张**有效**验证码：服务端是在人机验证之后才回答"这个账号被锁了"的
+  //    （否则任何人不用过验证码就能问出"某个账号是不是存在/被锁"）。
+  const othIp = '203.0.113.250'
+  const rOtherIp = await anon('POST', '/api/login', { headers: { 'x-real-ip': othIp }, body: { username: fakeUser, password: 'wrong-again', ...(await solveCaptcha(othIp)) } })
   chk('★ 账号锁与 IP 无关（换 IP 仍是 429）', rOtherIp.status === 429, `status=${rOtherIp.status}`)
   // 同一 IP 继续用**不同**账号撞库 → 撞到 IP 闸
+  // （前 30 次各带一张验证码，之后的请求会在**限流这一层**就被 429 挡下，压根轮不到验证码）
   const ipCodes = []
   for (let i = 0; i < 40 && !ipCodes.includes(429); i++) {
-    ipCodes.push((await anon('POST', '/api/login', { headers: { 'x-real-ip': spoofIp }, body: { username: 'vspray' + i, password: 'x' } })).status)
+    const cap = await solveCaptcha(spoofIp)
+    ipCodes.push((await anon('POST', '/api/login', { headers: { 'x-real-ip': spoofIp }, body: { username: 'vspray' + i, password: 'x', ...cap } })).status)
   }
   chk('★ 换账号继续撞库会撞到每 IP 的闸（40 次内出现 429）', ipCodes.includes(429), `n=${ipCodes.length} 末几次=${JSON.stringify(ipCodes.slice(-6))}`)
   const rRegLocked = await anon('POST', '/api/register', { headers: { 'x-real-ip': spoofIp }, body: { username: 'vlocked' + Math.floor(Math.random() * 900 + 100), password: 'locked-pass-1234' } })
@@ -392,10 +414,26 @@ async function main() {
   // 反枚举：存在的账号与不存在的账号，耗时不应该差出量级（审计实测改前 22.5 倍）
   const tExist = []
   const tMiss = []
+  const timingCodes = []
   for (let i = 0; i < 5; i++) {
-    const t0 = Date.now(); await anon('POST', '/api/login', { headers: { 'x-real-ip': '198.51.100.' + (i + 1) }, body: { username: U1, password: 'nope-' + i } }); tExist.push(Date.now() - t0)
-    const t1 = Date.now(); await anon('POST', '/api/login', { headers: { 'x-real-ip': '198.51.100.' + (i + 11) }, body: { username: 'vghost' + i, password: 'nope-' + i } }); tMiss.push(Date.now() - t1)
+    // 领题放在计时之外（见 solveCaptcha 的注释）；带对验证码之后才轮得到 scrypt 那一步
+    const ipE = '198.51.100.' + (i + 1)
+    const capE = await solveCaptcha(ipE)
+    const t0 = Date.now()
+    const rE = await anon('POST', '/api/login', { headers: { 'x-real-ip': ipE }, body: { username: U1, password: 'nope-' + i, ...capE } })
+    tExist.push(Date.now() - t0)
+    timingCodes.push(rE.status)
+    const ipM = '198.51.100.' + (i + 11)
+    const capM = await solveCaptcha(ipM)
+    const t1 = Date.now()
+    const rM = await anon('POST', '/api/login', { headers: { 'x-real-ip': ipM }, body: { username: 'vghost' + i, password: 'nope-' + i, ...capM } })
+    tMiss.push(Date.now() - t1)
+    timingCodes.push(rM.status)
   }
+  // 🔴 先证明"这几次真的走到了密码比对"：否则两次量到的都是被验证码拦下的 400，
+  //    比值照样好看，而反枚举这件事**根本没被验到**（量具骗人的经典形状）。
+  chk('★ 计时的那 10 次确实走到密码比对（全是 401，不是被验证码拦下的 400）',
+    timingCodes.length === 10 && timingCodes.every((c) => c === 401), JSON.stringify(timingCodes))
   const med = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)]
   const ratio = med(tExist) / Math.max(1, med(tMiss))
   chk('★ 存在/不存在账号的登录耗时同量级（< 3 倍，反枚举）', ratio < 3, `存在中位 ${med(tExist)}ms vs 不存在中位 ${med(tMiss)}ms = ${ratio.toFixed(2)}x`)

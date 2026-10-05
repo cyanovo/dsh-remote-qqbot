@@ -120,6 +120,56 @@ async function api(path, { method = 'GET', body } = {}) {
   return json;
 }
 
+/* ── 人机验证（后台的「账号登录」这条通道）──────────────────────────────
+   和前台登录页同一道闸：后台账号密码更值钱，没有理由只在前台拦机器。
+   「后台口令」那条通道不受影响（口令本身就是全权凭证，服务端直接免验证码）。
+   🔴 带对 x-admin-token 的请求**免验证码**（见 server.mjs「人机验证」一节）——
+      所以 _live-*.mjs 这类线上验收脚本仍能登录；而前台浏览器请求一律要过这一关。 */
+let capId = '';
+// 拿不到 /api/meta 时按"要验证码"来：宁可多要一张，不可放过。真值由 probeCaptcha() 填。
+let capRequired = true;
+let capProbed = false;
+
+/** 问服务端"这次要不要验证码"（/api/meta 的 captcha.required）：
+ *  本机直连（回环）与带对后台口令的请求服务端一律免掉 —— 前端也就不该拿一张必被忽略的图去烦人。
+ *  ⚠️ 不问就一律要，会让本机验收（verify-admin-ui.mjs：真浏览器打 127.0.0.1）卡在一张
+ *     服务端根本不看的图上，而且那种"红"看着像产品坏了。 */
+async function probeCaptcha() {
+  try {
+    // 同样不走 api()：这一句在闸门还没开的时候跑，api() 遇 401 会去调 lockGate
+    const r = await fetch('/api/meta', { headers: { Accept: 'application/json' } })
+    const j = await r.json()
+    capRequired = !(j && j.captcha && j.captcha.required === false)
+  } catch { capRequired = true }
+  capProbed = true;
+  const box = $('capBox_admin');
+  if (box) box.hidden = !capRequired;
+  if (capRequired) loadCaptcha();
+}
+
+async function loadCaptcha() {
+  const img = $('capImg_admin');
+  capId = '';
+  if (img) { img.classList.add('is-loading'); img.removeAttribute('src'); }
+  try {
+    // ⚠️ 这里刻意**不走 api()**：api() 遇到 401/429 会调 lockGate，而 lockGate 结尾又会调回本函数 ——
+    //    验证码接口一旦被限流，就成了无限递归。所以这里用裸 fetch。
+    const r = await fetch('/api/captcha', { headers: { Accept: 'application/json' } });
+    let j = null;
+    try { j = await r.json(); } catch { /* 下面按状态码报错 */ }
+    if (!r.ok || !j || j.ok === false) throw new Error((j && j.error) || `HTTP ${r.status}`);
+    capId = j.id;
+    const el = $('capImg_admin');
+    if (el) { el.src = j.image; el.classList.remove('is-loading'); }
+    const box = $('capText_admin');
+    if (box) box.value = '';
+  } catch (e) {
+    const el = $('capImg_admin');
+    if (el) el.classList.remove('is-loading');
+    msg('gateMsg', '验证码没加载出来：' + e.message + '（点「换一张」重试）', 'err');
+  }
+}
+
 /* ── 闸门（两条通道） ──────────────────────────────────────────────────── */
 
 function showPane(which) {
@@ -129,6 +179,8 @@ function showPane(which) {
   $('gateTabAccount').setAttribute('aria-current', account ? 'true' : 'false');
   $('gateTabToken').setAttribute('aria-current', account ? 'false' : 'true');
   msg('gateMsg', '');
+  // 切到账号通道时保证手上有一张没被用掉的验证码（每次进来一张新图）
+  if (account && capProbed && capRequired && !capId) loadCaptcha();
   const focus = account ? $('gateUser') : $('gateToken');
   if (focus && !$('gate').hidden) focus.focus();
 }
@@ -158,6 +210,8 @@ function lockGate(reason) {
   paintWho();
   const g = $('gatePass');
   if (g) g.value = '';
+  // 闸门重新亮出来时换一张新验证码：旧的那张多半已经用掉/作废了
+  if (!$('gatePaneAccount').hidden && capRequired) loadCaptcha();
   if (reason) msg('gateMsg', reason, 'err');
 }
 
@@ -199,6 +253,11 @@ async function tryLogin() {
   const name = $('gateUser').value.trim();
   const pass = $('gatePass').value;
   if (!name || !pass) { msg('gateMsg', '用户名和密码都要填', 'err'); return; }
+  if (capRequired) {
+    if (!capId) { msg('gateMsg', '验证码还没加载出来，点「换一张」重试', 'err'); loadCaptcha(); return; }
+    // 空着就别白跑一趟（服务端也会拒，但那是一次没必要的往返）
+    if (!($('capText_admin').value || '').trim()) { msg('gateMsg', '请照图填写这 4 位验证码（看不清就点「换一张」）', 'err'); return; }
+  }
   mode = 'account';
   who = name;
   token = '';
@@ -211,7 +270,11 @@ async function tryLogin() {
       r = await fetch('/api/login', {
         method: 'POST',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: name, password: pass }),
+        body: JSON.stringify({
+          username: name,
+          password: pass,
+          ...(capRequired ? { captchaId: capId, captchaText: ($('capText_admin').value || '').trim() } : {}),
+        }),
       });
     } catch (err) {
       throw new Error(`连不上服务器（${err.message}）`);
@@ -240,6 +303,8 @@ async function tryLogin() {
     mode = 'token';
     who = '';
     paintWho();
+    // 失败一律换一张：这张不是被用掉了就是作废了，留着只会让人抱着废图反复点
+    if (capRequired) loadCaptcha();
     msg('gateMsg', err.message, 'err');
   } finally {
     if (btn) btn.disabled = false;
@@ -741,6 +806,9 @@ function boot() {
   $('gateTabAccount').addEventListener('click', () => showPane('account'));
   $('gateTabToken').addEventListener('click', () => showPane('token'));
   $('gateLoginBtn').addEventListener('click', tryLogin);
+  // 人机验证：点图或点按钮都换一张
+  $('capNew_admin').addEventListener('click', loadCaptcha);
+  $('capImg_admin').addEventListener('click', loadCaptcha);
   for (const id of ['gateUser', 'gatePass']) {
     $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') tryLogin(); });
   }
@@ -763,6 +831,8 @@ function boot() {
   const saved = sessionStorage.getItem(TOKEN_KEY);
   if (saved) { showPane('token'); tryEnter(saved); return; }
   showPane('account');
+  // 先问清"这次要不要验证码"再决定画不画那张图（本机直连时服务端会免掉）
+  probeCaptcha();
   trySession().then((ok) => { if (!ok) $('gate').hidden = false; });
 }
 

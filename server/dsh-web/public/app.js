@@ -11,6 +11,10 @@ const state = {
   busy: false,
   reader: null,
   pendingRecord: '',
+  // 人机验证：{ login: {id, image}, reg: {id, image} }
+  // 🔴 存着**图和 id**，不是只存 id：render() 每次都会重建表单元素，
+  //    只存 id 的话重建出来的 <img> 是空白的，用户看到的是"图没了"。
+  captcha: { login: null, reg: null },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -238,18 +242,77 @@ function accountBlock() {
       <hr style="border:0;border-top:1px solid var(--line-2);margin:24px 0">
       ${tokensBlock()}`;
   }
+  // ⚠️ 这两个块是**字面写死的 id**（不是拼出来的）：verify-dom-ids.mjs 靠字面 id 判断
+  //    "脚本要用的元素有没有人提供"，拼出来的 id 它看不见 —— 而看不见就等于没验。
+  // 要不要显示，看服务端 /api/meta 怎么说的（本机直连/带后台口令时是 false）。
+  const capLogin = captchaNeeded() ? `
+    <div class="cap">
+      <img class="cap-img" id="capImg_login" alt="人机验证图片，点击可换一张" width="132" height="44">
+      <input type="text" id="capText_login" autocomplete="off" spellcheck="false" inputmode="latin"
+             maxlength="8" placeholder="图里的 4 位" aria-label="人机验证">
+      <button type="button" class="btn" id="capNew_login">换一张</button>
+    </div>
+    <p class="cap-tip">看不清就点「换一张」。这一关是给机器设的，不是给你设的。</p>` : '';
+  const capReg = captchaNeeded() ? `
+    <div class="cap">
+      <img class="cap-img" id="capImg_reg" alt="人机验证图片，点击可换一张" width="132" height="44">
+      <input type="text" id="capText_reg" autocomplete="off" spellcheck="false" inputmode="latin"
+             maxlength="8" placeholder="图里的 4 位" aria-label="人机验证">
+      <button type="button" class="btn" id="capNew_reg">换一张</button>
+    </div>
+    <p class="cap-tip">同样要填一张图里的 4 位。</p>` : '';
   return `<h2>登录</h2>
     <label class="f"><span>用户名</span><input type="text" id="loginName" autocomplete="username" placeholder="2–24 位，中文/字母/数字"></label>
     <label class="f"><span>密码</span><input type="password" id="loginPass" autocomplete="current-password"></label>
+    ${capLogin}
     <div class="row"><button class="btn primary" id="loginBtn">登录</button></div>
     <div class="msg" id="loginMsg"></div>
     <hr style="border:0;border-top:1px solid var(--line-2);margin:24px 0">
     <h2>还没有账号</h2>
-    <p class="hint">注册只需用户名和密码，注册后每天有 100 次免费完整查看。</p>
+    <p class="hint">注册只需用户名和密码（外加一张图里的 4 位），注册后每天有 100 次免费完整查看。</p>
     <label class="f"><span>用户名</span><input type="text" id="regName" autocomplete="username"></label>
     <label class="f"><span>密码（至少 6 位）</span><input type="password" id="regPass" autocomplete="new-password"></label>
+    ${capReg}
     <div class="row"><button class="btn" id="regBtn">注册并登录</button></div>
     <div class="msg" id="regMsg"></div>`;
+}
+
+/* ── 人机验证（登录 / 注册的图形码）────────────────────────────────────────
+   图片是服务端现画的 SVG，走 /api/captcha 拿 data URL —— 这里只负责「取一张、显示、连同输入一起提交」。
+   ⚠️ 不能在 render() 里无条件重取：那张图就是用户正在看的题目，重取等于把题换掉、还让他白填一次。
+   ⚠️ 表单里那两个块是**字面写死的 id**（不是拼出来的）：verify-dom-ids.mjs 靠字面 id 判断
+      "脚本要用的元素有没有人提供"，拼出来的 id 它看不见 —— 而看不见就等于没验。 */
+/** 把已有的图贴回新元素上；没有就取一张。 */
+function paintCaptcha(which) {
+  const img = $('capImg_' + which);
+  if (!img) return;
+  const c = state.captcha[which];
+  if (c && c.image) img.src = c.image;
+  else loadCaptcha(which);
+}
+/** 这次要不要验证码 —— **由服务端说了算**（/api/meta 的 captcha.required）。
+ *  本机直连（回环）与带后台口令的请求服务端会免掉，前端也就不该拿一张必被忽略的图去烦人；
+ *  拿不到 meta 时按"要"处理：宁可多要一张，不可放过。 */
+function captchaNeeded() {
+  return !(state.meta && state.meta.captcha && state.meta.captcha.required === false);
+}
+async function loadCaptcha(which) {
+  const img = $('capImg_' + which);
+  state.captcha[which] = null;
+  if (img) { img.classList.add('is-loading'); img.removeAttribute('src'); }
+  try {
+    const r = await api('/api/captcha');
+    state.captcha[which] = { id: r.id, image: r.image };
+    const el = $('capImg_' + which);   // 重新取一次：await 期间表单可能已被 render() 重建
+    if (el) { el.src = r.image; el.classList.remove('is-loading'); }
+    const box = $('capText_' + which);
+    if (box) box.value = '';
+  } catch (e) {
+    const el = $('capImg_' + which);
+    if (el) el.classList.remove('is-loading');
+    // 取不到图就说清楚，别让人对着一张空白图反复点登录 —— 本项目不许静默失败。
+    toast('验证码没加载出来：' + e.message + '（点「换一张」重试）', 'err');
+  }
 }
 
 /* ── 渲染入口 ──────────────────────────────────────────────────────────── */
@@ -273,6 +336,8 @@ function render() {
   $('aboutModes').innerHTML = ((state.meta && state.meta.modes) || [])
     .map((m) => `<li><b>${esc(m.name)}</b>：${esc(m.detail)}</li>`).join('');
   bindDynamic();
+  // 没登录时表单里就有验证码：元素是刚重建的，把上一张图贴回去；没有才去取。
+  if (!state.me) { paintCaptcha('login'); paintCaptcha('reg'); }
 }
 
 function bindDynamic() {
@@ -291,19 +356,58 @@ function bindDynamic() {
     if (el) { el.textContent = text || ''; el.className = 'msg' + (kind ? ' ' + kind : ''); }
   };
 
+  // 人机验证：点图或点按钮都换一张
+  on('capNew_login', () => loadCaptcha('login'));
+  on('capImg_login', () => loadCaptcha('login'));
+  on('capNew_reg', () => loadCaptcha('reg'));
+  on('capImg_reg', () => loadCaptcha('reg'));
+
   on('loginBtn', async () => {
+    // 服务端说不用（本机直连/带后台口令）时就别拦人；说要，就必须图、id、答案三样齐全
+    const need = captchaNeeded();
+    const cap = need ? state.captcha.login : null;
+    if (need && (!cap || !cap.id)) { msg('loginMsg', '验证码还没加载出来，点「换一张」重试', 'err'); loadCaptcha('login'); return; }
+    const capText = need ? $('capText_login').value.trim() : '';
+    // 空着就别白跑一趟服务端（服务端那边也会拒，但那是一次没必要的往返）
+    if (need && !capText) { msg('loginMsg', '请照图填写这 4 位验证码（看不清就点「换一张」）', 'err'); return; }
     msg('loginMsg', '正在登录…');
     try {
-      const r = await api('/api/login', { method: 'POST', body: { username: $('loginName').value.trim(), password: $('loginPass').value } });
+      const r = await api('/api/login', {
+        method: 'POST',
+        body: {
+          username: $('loginName').value.trim(),
+          password: $('loginPass').value,
+          ...(need ? { captchaId: cap.id, captchaText: capText } : {}),
+        },
+      });
       state.me = r.me; toast('登录成功'); await refresh(); await afterAuth();
-    } catch (e) { msg('loginMsg', e.message, 'err'); }
+    } catch (e) {
+      msg('loginMsg', e.message, 'err');
+      // 失败就换一张：这张要么已被这次提交用掉，要么已作废 —— 留着它只会让人反复撞一张废图
+      if (need) loadCaptcha('login');
+    }
   });
   on('regBtn', async () => {
+    const need = captchaNeeded();
+    const cap = need ? state.captcha.reg : null;
+    if (need && (!cap || !cap.id)) { msg('regMsg', '验证码还没加载出来，点「换一张」重试', 'err'); loadCaptcha('reg'); return; }
+    const capText = need ? $('capText_reg').value.trim() : '';
+    if (need && !capText) { msg('regMsg', '请照图填写这 4 位验证码（看不清就点「换一张」）', 'err'); return; }
     msg('regMsg', '正在注册…');
     try {
-      const r = await api('/api/register', { method: 'POST', body: { username: $('regName').value.trim(), password: $('regPass').value } });
+      const r = await api('/api/register', {
+        method: 'POST',
+        body: {
+          username: $('regName').value.trim(),
+          password: $('regPass').value,
+          ...(need ? { captchaId: cap.id, captchaText: capText } : {}),
+        },
+      });
       state.me = r.me; toast('注册成功，已登录'); await refresh(); await afterAuth();
-    } catch (e) { msg('regMsg', e.message, 'err'); }
+    } catch (e) {
+      msg('regMsg', e.message, 'err');
+      if (need) loadCaptcha('reg');
+    }
   });
   on('logoutBtn', async () => {
     try { await api('/api/logout', { method: 'POST' }); state.me = null; state.records = []; state.tokens = []; toast('已退出'); render(); }

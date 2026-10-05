@@ -12,6 +12,26 @@ if (!PASS) { console.error('缺少 ADMIN_PASS'); process.exit(2) }
 const EDGE = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'].find((p) => fs.existsSync(p))
 if (!EDGE) { console.error('找不到 msedge.exe'); process.exit(2) }
 
+// 公网入口的「账号登录」现在要人机验证（见 README「人机验证」一节）。
+// 这个脚本是 headless 浏览器，没法看图写字 —— 在公网 URL 上必然卡在闸门那一步。
+// 与其让它报一堆看不懂的红（看着像产品坏了），不如开工前就问一句，并给出唯一可行的跑法：
+// 走 SSH 隧道打到**线上那一个服务**的回环口，服务端对回环请求免验证码（公网请求永远进不了这条路）。
+let capNeed = null
+try {
+  const mr = await fetch(`${BASE}/api/meta`, { headers: { Accept: 'application/json' } })
+  const mj = await mr.json()
+  capNeed = mj && mj.captcha ? mj.captcha.required : null
+} catch { capNeed = null }
+if (capNeed === true) {
+  console.error(`\n⛔ ${BASE} 的账号登录现在要人机验证（/api/meta：captcha.required=true）。`)
+  console.error('   这个脚本是 headless Edge，没法「看图写字」，所以在这里停下来 —— 不是产品坏了。')
+  console.error('\n   怎么跑通（隧道那一头还是线上跑着的那个服务）：')
+  console.error('     ssh -N -L 18795:127.0.0.1:8795 cyanovo            # 另开一个窗口挂着')
+  console.error("     $env:BASE_URL='http://127.0.0.1:18795'; node _live-admin-ui.mjs")
+  console.error('   隧道进来的是回环请求 ⇒ 服务端按「本机直连」免掉验证码；公网请求永远走不进这条通道。')
+  process.exit(3)
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const PROFILE = fs.mkdtempSync(path.join(os.tmpdir(), 'dshweb-liveui-'))
 const DEBUG_PORT = 9600 + Math.floor(Math.random() * 300)

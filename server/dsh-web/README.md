@@ -77,8 +77,9 @@
 |---|---|---|
 | GET | `/health` | 只回 `{ok:true}`。**故意不报数字**：免鉴权的用量数字本身就是信息披露（2026-10-04 安全审计 H5 前它回 `{ok,records,users}`） |
 | GET | `/health/detail` | 服务自报的记录/账号/设备数与运行时长（要后台口令 `x-admin-token` 或管理员登录） |
-| GET | `/api/meta` | 三档模式、两档额度/保留、价格、设备码参数 |
-| POST | `/api/register` `/api/login` `/api/logout` | 账号与 HttpOnly 会话 cookie |
+| GET | `/api/meta` | 三档模式、两档额度/保留、价格、设备码参数、**本请求要不要人机验证**（`captcha.required`） |
+| GET | `/api/captcha` | 签发一张人机验证图（返回 `id` + SVG 的 data URL）。单次有效，见下「人机验证」 |
+| POST | `/api/register` `/api/login` `/api/logout` | 账号与 HttpOnly 会话 cookie。前两个还要带 `captchaId` + `captchaText`（见下「人机验证」） |
 | GET | `/api/me` | 我的档位、`proUntil`、配额 |
 | POST | `/api/prefs` | 保存全文模式偏好 |
 | GET | `/api/records` | 我的记录（只返回自己的） |
@@ -107,7 +108,7 @@
 
 ## 鉴权与限流（2026-10-04 安全审计后补的闸）
 
-开源前做了一轮安全审计并逐条补了闸。这里只记**行为契约**，
+开源前做了一轮安全审计，报告在 [`SECURITY-AUDIT.md`](SECURITY-AUDIT.md)。这里只记**行为契约**，
 每一条都有反向校验钉着（同一套断言指向打补丁前的 `server.mjs` 必须变红：实测 `123/0` → `105/18`）。
 
 | 闸 | 规则 | 为什么 |
@@ -119,6 +120,7 @@
 | 改密码 | 会话里带「世代号」，改密（含后台重置）时 +1 ⇒ **所有旧 cookie 立刻作废** | 无状态 HMAC 会话没有吊销列表，不这么做"改密码踢不掉已经进来的攻击者" |
 | 兑换码 | 一张码**一生只能兑一次**，谁兑的都不行 | 改前只挡"别人用过"，自己可以反复提交叠加 |
 | 令牌吊销 | `id` 为空 → **400** | 空的 `startsWith('')` 会匹配全部令牌 |
+| 人机验证 | 公网请求的注册/登录必须带一张**没用过、没过期、来源 IP 对得上**的图；错 3 次作废；每 IP 60 张/分钟 | 挡「脚本批量注册/撞库」。规则与豁免见下节 |
 
 **怎么判「走 TLS」**：看 `x-forwarded-proto`（两台 nginx 都设了这个头：80 用 `$scheme`、443 写死 `https`）。
 8795 只监听 `127.0.0.1`，所以这个头和 `x-real-ip` 一样无法被外部伪造 —— **换反代时必须重看这一条**。
@@ -128,6 +130,42 @@
 
 **数字挪了家**：`/health` 现在只回 `{ok:true}`；要账号数/记录数请走 `/health/detail`（要后台口令）。
 验收脚本里凡是靠 `/health` 读数字的地方都一并改掉了 —— 没改的话会退化成 `undefined === undefined` 的**假绿**。
+
+## 人机验证（登录 / 注册的图形码，2026-10-05 加）
+
+公网的 `/api/register` 与 `/api/login` 现在各要一张图。图是**服务端自己画的 SVG**（132×44，含湍流位移滤镜），
+以 data URL 直接塞进 `<img>`，不引任何第三方验证码服务。原因不是"自研更酷"：
+
+- 本站 80 端口**故意**是明文 http（QQ 内置浏览器只能开 `http://` + 全大写域名的链接，见「nginx」一节），
+  在这种页面上加载 reCAPTCHA / Turnstile 的脚本，**脚本没加载出来就是所有人全被锁在门外**；
+- 那些域名在大陆的连通性不由我们掌握，而这道闸必须"永远能出图"。
+
+契约（`verify-captcha.mjs` 里每条都有断言，19 条）：
+
+| 项 | 规则 |
+|---|---|
+| 有效期 | 3 分钟（`DSH_WEB_CAPTCHA_TTL_MS` 仅供验收调短） |
+| 一次性 | 验对即销毁；同一个 id 再用一次 → 400 |
+| 试错 | 同一个 id 错 3 次即作废（第 4 次就算填对也不认） |
+| 绑来源 | 题绑在领题时的来源 IP 上，换 IP 提交作废 |
+| 输入友好 | 答案**只有 4 位**、去空格、忽略大小写、排除易混淆的 `0O1I` 等 |
+| 领取限流 | 每 IP 60 张/分钟，超限锁 10 分钟 |
+| 存储 | 只在内存：`id → sha256(密钥 + 答案)` + 来源 IP + 到期时间。**答案不落盘、不进日志** |
+| 状态码 | 被验证码拦下是 **400** + `captcha:true`（与密码错的 401 分开，前端据此提示"换一张"） |
+| 与账号锁的关系 | 验证码失败**不**计入 `loginFail` —— 否则拿验证码刷一刷就能把别人的账号锁掉 |
+
+**两条豁免通道**（都不是"公开的后门"，`verify-captcha.mjs` 里有反例断言）：
+
+1. **本机直连**：`req.socket.remoteAddress` 是本机回环，**且** 没有 `x-real-ip`（或它也是回环）。
+   nginx 给公网流量一定会写 `x-real-ip`，而 8795 只监听 `127.0.0.1` —— 所以公网请求**永远**迈不进这条通道。
+   留着它是为了本机验收脚本（`verify-*.mjs` 那一串直连 `127.0.0.1`）不必人人先解一张图。
+2. **带对后台口令**（`x-admin-token`）：口令本身就是全权凭证，免掉一张图不多给任何权限；
+   自动化脚本（`verify-live.mjs` / `_live-role.mjs` / `verify-deeplink-live.mjs`）靠它继续跑。
+   ⚠️ **口令为空时千万别带这个头**：服务端会把"带了口令但不对"记成一次失败，10 次就把主人自己的 IP 锁 10 分钟。
+
+验收用的开关只有两个，**生产 unit 里一个都不许设**：`DSH_WEB_CAPTCHA_TEST=1`（把答案一并回给脚本）与
+`DSH_WEB_CAPTCHA_TTL_MS` / `DSH_WEB_CAPTCHA_IP_LIMIT`（调短 TTL、调小领取上限）。
+和 `DSH_WEB_RETENTION_MS` 一样，它们只为"跑一遍就能验到期/限流"存在。
 
 ## 后台管理页（`/admin.html`）
 
@@ -240,15 +278,17 @@ bash /opt/dsh-web/deploy.sh          # 8 步、幂等
 node verify-p1.mjs            # 43 条：档位/设备码/隔离/配额/TTL/叠加/限流/删除    ← 本地，临时数据目录
 node verify-p1-defaults.mjs   # 12 条：生产默认值（必须在不设任何环境变量的进程里读）
 node verify-p1-quota1000.mjs  #  7 条：真打 1000 次，第 1001 次必须 429
+node verify-captcha.mjs       # 19 条：人机验证（签发/强制/一次性/试错/过期/绑 IP/限流/两条豁免/不落盘）
 node verify-dom-ids.mjs       #  9 条：app.js 要用的每个元素 id 都有人提供（补无头桩的盲区）
-node verify-deeplink.mjs      # 15 条：`/n/<id>` 深链（无头 DOM 桩跑真 app.js）
-node verify-account-ui.mjs    # 41 条：首页能渲染 + 账号页设备码/令牌（同一个桩，真浏览器语义）
+node verify-deeplink.mjs      # 16 条：`/n/<id>` 深链（无头 DOM 桩跑真 app.js）
+node verify-account-ui.mjs    # 51 条：首页能渲染 + 账号页设备码/令牌 + 登录页的验证码（同一个桩，真浏览器语义）
 node verify-landing.mjs       # 33 条：**线上**首页落地页 + 三个静态文件逐字节一致
 node verify-live-429.mjs      #  7 条：被限流时脚本要"说清 + 退出码 3"，不许级联变红
-node verify-live.mjs          # 28 条（+1 跳过）：打公网入口，全程真链路，收尾自删临时账号
+node verify-live.mjs          # 30 条（+1 跳过）：打公网入口，全程真链路，收尾自删临时账号
                               # 给了 ADMIN_TOKEN 才能验"账号数/记录数回到开跑前"（走 /health/detail），
                               # 没给就**显式打印「跳过」**，绝不让 undefined===undefined 冒充通过
-node verify-admin.mjs         # 123 条：后台 API 全套（自助临时数据目录，不碰线上）
+                              # 公网注册/登录现在要人机验证 ⇒ 这两个脚本**必须**带 ADMIN_TOKEN 才跑得通
+node verify-admin.mjs         # 124 条：后台 API 全套（自助临时数据目录，不碰线上）
 node verify-admin-ui.mjs      # 167 条：无头 Edge + CDP 真点后台页面（真 CSS 层叠、真事件）
 node verify-admin-role.mjs    # 76 条：账号身份的管理员角色（DSH_WEB_OWNER 自举、封禁、最后一个管理员）
 node verify-css-vars.mjs      #  2 条：两个样式表里不许出现"用了但没定义"的 var(--x)
@@ -275,6 +315,18 @@ ssh cyanovo 'cd /opt/dsh-web && node verify.mjs'      # 56 条：旧契约回归
 累计登录/注册次数可能撞到 30 次 —— 症状是突然一片 429。同样 `systemctl restart dsh-web` 即可清零。
 定向爆破另有"同一账号 10 次失败锁 10 分钟"，那把锁**与 IP 无关**，重启才会清。
 
+⚠️ **2026-10-05 起，线上脚本必须带后台口令**：公网 `/api/register` 与 `/api/login` 加了人机验证，
+而脚本没法"看图写字"，只能走 `x-admin-token` 这条豁免通道（口令本身就是全权凭证，免掉一张图不多给权限）。
+`verify-live.mjs` / `_live-role.mjs` / `verify-deeplink-live.mjs` 都改成了"有口令才带、没口令就**明说并退 3**"，
+不再让 400 冒充成产品故障：
+
+```powershell
+$env:ADMIN_TOKEN = (ssh cyanovo cat /var/lib/dsh-web/admin-token)
+node verify-live.mjs
+node _live-role.mjs                     # 还需要 $env:OWNER_PASS
+node verify-deeplink-live.mjs --pass <主人口令>   # 也可 --admin-token <后台口令>
+```
+
 ⚠️ **`_cleanup-testdata.mjs` 改的是磁盘文件，而服务把 DB 放在内存里** ——
 所以清完必须 `systemctl restart dsh-web`，否则服务下次写盘会把清理覆盖掉
 （实测：清完 `/health/detail` 仍是 2 账号 2 记录，重启后才回到 0）。
@@ -282,27 +334,30 @@ ssh cyanovo 'cd /opt/dsh-web && node verify.mjs'      # 56 条：旧契约回归
 **反向校验**（证明断言不是空的）：
 
 ```bash
-# 先把当前 server.mjs 手工回退那 5 处新语义，另存成一份旧版副本
-P1_SERVER=/tmp/old-server.mjs node verify-p1.mjs            # 期望 5 条红
-P1_SERVER=/tmp/old-server.mjs node verify-p1-quota1000.mjs  # 期望 4 条红
+node Temp/_make-old.mjs                       # 把当前 server.mjs 回退 5 处新语义 → Temp/old-server.mjs
+P1_SERVER=Temp/old-server.mjs node verify-p1.mjs            # 期望 5 条红
+P1_SERVER=Temp/old-server.mjs node verify-p1-quota1000.mjs  # 期望 4 条红
+# 人机验证：把两处 `if (!cap.ok) {` 改成 `if (false) {`（等于把闸拆了）→ verify-captcha.mjs 期望 9 条红
+node verify-captcha.mjs --server <拆掉校验的那份副本>        # 实测 10/9，退出码 1
 # 前端：把「先 render 再注入明文令牌」改回「先注入再 render」→ verify-account-ui.mjs 期望 3 条红
 ```
 
-实测：新版 `43/0`、`12/0`、`7/0`、`id 一致性 9/0`、深链 `15/0`、账号页 `41/0`、首页 `33/0`、限流分支 `7/0`、线上 `28/0`、旧契约 `56/0`、
-后台 API `123/0`、后台页面 `152/0`、后台角色 `76/0`、线上后台 `40/0`（http+https）、
+实测：新版 `43/0`、`12/0`、`7/0`、人机验证 `19/0`、`id 一致性 9/0`、深链 `16/0`、账号页 `51/0`、首页 `33/0`、限流分支 `7/0`、旧契约 `56/0`、
+后台 API `124/0`、后台页面 `167/0`、后台角色 `76/0`、线上后台 `40/0`（http+https）、
 线上角色 `63/0`、**线上后台页面（账号通道）`34/0`**；
 对回退副本分别 `38/5`、`3/4`。账号页那次反向校验实测 **23/3**（红的正是明文那三条）；
 `_reverse-boot.mjs` 往 app.js 里注入一句坏查找 → `verify-account-ui.mjs` 实测 **13 红**（含「boot 抛异常」与「空卡片」两条）；
 `_reverse-admin-ui.mjs` 把 `public/` 切 3 刀 → **149/3，红的正好是预期的 3 条**（探针 exit 1）。
+人机验证那轮的反向校验：把 `server.mjs` 里两处 `if (!cap.ok)` 改成 `if (false)`（等于把闸整个拆掉）
+→ `verify-captcha.mjs` 实测 **10/9**，红的正好是"该被拦下却放行了"那 9 条，退出码 1。
 
 **2026-10-04 安全审计那轮的反向校验**（钉住新增的 7 道闸，用的是**线上那份未打补丁的 `server.mjs`**，
 md5 `a489e480db744a153a4de80dd5edb187`）：
 
 ```bash
-# 先把「未打补丁的那一份」拉到本地当基线副本，再对比
-scp <你的服务器>:/opt/dsh-web/server.mjs /tmp/_baseline-server.mjs
-node verify-admin.mjs                                          # 123/0
-node verify-admin.mjs --server /tmp/_baseline-server.mjs        # 105/18 ← 红的正好是新加的那 18 条
+scp cyanovo:/opt/dsh-web/server.mjs _sec-audit/_baseline-server.mjs
+node verify-admin.mjs                                   # 123/0
+node verify-admin.mjs --server ../_sec-audit/_baseline-server.mjs   # 105/18 ← 红的正好是新加的那 18 条
 ```
 
 红的 18 条逐条对应：`/health` 仍泄 `{records,users}`、`/health/detail` 不存在、改密后旧 cookie 仍 `me!=null` 且 `/api/tokens` 仍 200、

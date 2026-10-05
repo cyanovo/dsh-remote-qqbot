@@ -35,10 +35,12 @@ const check = (name, okk, detail = '') => {
  */
 function el(id, onReplace) {
   const o = {
-    id, textContent: '', hidden: false, value: '', className: '',
+    id, textContent: '', hidden: false, value: '', className: '', src: '',
     style: {}, dataset: {}, onclick: null,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false } },
     addEventListener() {}, appendChild() {}, querySelectorAll() { return [] },
+    // 真浏览器每个元素都有这两个方法；桩里漏掉过一次就会把「代码路径」误判成抛异常
+    setAttribute() {}, removeAttribute() {}, getAttribute() { return null },
   }
   let html = ''
   Object.defineProperty(o, 'innerHTML', {
@@ -287,6 +289,98 @@ console.log('\n── 七、没登录时不显示这些（别误导） ──')
   check('未登录时是登录表单', html.includes('id="loginBtn"'))
   check('未登录时不出现设备码确认区', !html.includes('id="bindDeviceBtn"'))
   check('未登录时不出现令牌列表', !html.includes('data-revoke'))
+}
+
+console.log('\n── 八、人机验证：图要出来、提交要带答案、失败要换一张 ──')
+{
+  // 每次签发回一个**不同的 id**：这样才能分辨"到底换没换"（回同一个 id 的话断言是假的）
+  let issued = 0
+  // ⚠️ 第一张必须走 responses 传进去：render() 在 run() 里就发生了，
+  //    等 run() 返回再换 fetch，那一刻的取图已经用默认响应（没有 image）跑完了。
+  const FIRST = { status: 200, data: { ok: true, id: 'cap-static-1', image: 'data:image/svg+xml;base64,PHN2Zy8+', chars: 4, ttlMs: 180000 } }
+  const h = await run({ responses: { ...base, '/api/me': { status: 200, data: { ok: true, me: null } }, '/api/captcha': FIRST } })
+  const orig = h.ctx.fetch
+  h.ctx.fetch = async (p, opt = {}) => {
+    if (String(p) === '/api/captcha') {
+      issued++
+      h.calls.push({ path: '/api/captcha', method: 'GET', body: undefined })
+      return {
+        ok: true, status: 200, headers: { getSetCookie: () => [] },
+        json: async () => ({ ok: true, id: 'cap-' + issued, image: 'data:image/svg+xml;base64,PHN2Zy8+', chars: 4, ttlMs: 180000 }),
+        text: async () => '{}',
+      }
+    }
+    if (String(p) === '/api/login') {
+      h.calls.push({ path: '/api/login', method: opt.method || 'GET', body: opt.body ? JSON.parse(opt.body) : undefined })
+      return {
+        ok: false, status: 400, headers: { getSetCookie: () => [] },
+        json: async () => ({ ok: false, captcha: true, error: '验证码不对（还能试 2 次）' }),
+        text: async () => '{}',
+      }
+    }
+    return orig(p, opt)
+  }
+  const html = String(h.getEl('accountCard').innerHTML)
+  check('登录框里有验证码图与输入框', html.includes('id="capImg_login"') && html.includes('id="capText_login"'))
+  check('注册框里也各有一张（同一页两个表单）', html.includes('id="capImg_reg"') && html.includes('id="capText_reg"'))
+  check('两个表单都有「换一张」按钮', html.includes('id="capNew_login"') && html.includes('id="capNew_reg"'))
+  await new Promise((r) => setImmediate(r))
+  check('★ 进页面就真的去领了验证码', h.calls.filter((c) => c.path === '/api/captcha').length >= 1, `实际 ${issued} 次`)
+  check('★ 取回来的图被贴到 <img> 上（不是空白框）',
+    String(h.getEl('capImg_login').src).startsWith('data:image/svg+xml'))
+  // 点「换一张」必须换到**新的一张**
+  const before = issued
+  await h.getEl('capNew_login').onclick()
+  await new Promise((r) => setImmediate(r))
+  check('★ 点「换一张」会重新领一张（id 变了，不是把旧图再贴一遍）', issued > before, `换前 ${before} / 换后 ${issued}`)
+
+  h.getEl('loginName').value = 'someone'
+  h.getEl('loginPass').value = 'pw-123456'
+  h.getEl('capText_login').value = 'AB12'
+  const issuedBeforeLogin = issued
+  await h.getEl('loginBtn').onclick()
+  await new Promise((r) => setImmediate(r))
+  const call = h.calls.find((c) => c.path === '/api/login')
+  check('★ 点登录把 captchaId 与 captchaText 一起提交了',
+    !!call && typeof call.body.captchaId === 'string' && call.body.captchaId.startsWith('cap-') && call.body.captchaText === 'AB12',
+    JSON.stringify(call && call.body))
+  check('★ 服务端的失败原话被照出来（不换成"失败"两个字）',
+    String(h.getEl('loginMsg').textContent).includes('验证码不对'), JSON.stringify(String(h.getEl('loginMsg').textContent)))
+  check('★ 提交失败后自动换了一张（旧的那张已经作废，留着只会让人反复撞它）', issued > issuedBeforeLogin)
+  check('没登录时不会把验证码塞进设备码/令牌那些块', !html.includes('id="bindDeviceBtn"') && !html.includes('data-revoke'))
+}
+
+console.log('\n── 九、服务端说「不用验证码」时，前端不该要（本机直连 / 带后台口令那条路）──')
+{
+  // 反向极性：meta 里 captcha.required=false ⇒ 表单里根本不该出现那张图，
+  // 也不该白领一张。少了这一条，前端"永远要验证码"也能全绿 —— 而本机验收会因此全红。
+  const h = await run({
+    responses: {
+      ...base,
+      '/api/me': { status: 200, data: { ok: true, me: null } },
+      '/api/meta': { status: 200, data: { ...base['/api/meta'].data, captcha: { required: false, chars: 4, ttlMs: 180000 } } },
+    },
+  })
+  const html = String(h.getEl('accountCard').innerHTML)
+  check('★ meta 说 required=false 时登录框里没有验证码图', !html.includes('id="capImg_login"'))
+  check('注册框里也没有', !html.includes('id="capImg_reg"'))
+  check('★ 而且不会白领一张（不发 /api/captcha）', !h.calls.some((c) => c.path === '/api/captcha'),
+    JSON.stringify(h.calls.map((c) => c.method + ' ' + c.path)))
+  let body = null
+  const orig = h.ctx.fetch
+  h.ctx.fetch = async (p, opt = {}) => {
+    if (String(p) === '/api/login') {
+      body = opt.body ? JSON.parse(opt.body) : null
+      return { ok: true, status: 200, headers: { getSetCookie: () => [] }, json: async () => ({ ok: true, me: ME.me }), text: async () => '{}' }
+    }
+    return orig(p, opt)
+  }
+  h.getEl('loginName').value = 'someone'
+  h.getEl('loginPass').value = 'pw-123456'
+  await h.getEl('loginBtn').onclick()
+  await new Promise((r) => setImmediate(r))
+  check('★ 提交时 body 里不带 captchaId/captchaText（带空值反而会被服务端记成"验证码不对"）',
+    !!body && body.username === 'someone' && !('captchaId' in body) && !('captchaText' in body), JSON.stringify(body))
 }
 
 console.log(`\n账号页（设备码 + 令牌）桩验收：${pass} 通过 / ${fail} 失败`)

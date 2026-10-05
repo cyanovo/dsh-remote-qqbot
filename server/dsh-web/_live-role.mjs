@@ -33,6 +33,12 @@ async function call(path, { method = 'GET', body, cookie, token, bearer } = {}) 
 }
 const uname = (s) => String(s == null ? '' : s).trim()
 
+// 公网 /api/login 与 /api/register 现在都要过「人机验证」（图形码）。这个脚本没法看图写字，
+// 所以**只在这两步**带上后台口令 —— 服务端对带对口令的请求直接免验证码。
+// ⚠️ 后台接口（/api/admin/*）**绝不能**顺手带上：本脚本有一条断言要证明
+//    "只用登录 cookie 也能进后台"，带上口令就等于把那条断言变成了自欺。
+const AUTH = { token: ADMIN }
+
 console.log(`\n=== 线上管理员角色验收 @ ${BASE} ｜ 临时账号 ${U} ===`)
 
 // ── 0. 口令通道 ────────────────────────────────────────────────────────────
@@ -56,7 +62,7 @@ ok('每一行都带用量字段（状态 + 使用情况都看得到）',
 
 // ── 1. 账号身份通道（登录态即管理员） ────────────────────────────────────────
 console.log('\n[1] 账号身份通道：用 cyanovo 自己登录，不带任何后台口令也能进后台')
-const lg = await call('/api/login', { method: 'POST', body: { username: OWNER, password: OWNER_PASS } })
+const lg = await call('/api/login', { method: 'POST', body: { username: OWNER, password: OWNER_PASS }, ...AUTH })
 ok('cyanovo 登录 → 200', lg.status === 200, `status=${lg.status}`)
 const ownerCookie = lg.cookie
 ok('拿到登录 cookie', !!ownerCookie)
@@ -77,9 +83,9 @@ ok('紧接着用对口令仍然 200（错口令没把自己锁死）', stillOk.s
 
 // ── 3. 普通账号 → 403 且不记失败 ────────────────────────────────────────────
 console.log('\n[3] 普通账号（非管理员）→ 403，且不消耗口令失败次数')
-const rg = await call('/api/register', { method: 'POST', body: { username: U, password: P } })
+const rg = await call('/api/register', { method: 'POST', body: { username: U, password: P }, ...AUTH })
 ok(`临时账号 ${U} 注册成功`, rg.status === 200, `status=${rg.status} ${rg.json?.error || ''}`)
-const uCookie = rg.cookie || (await call('/api/login', { method: 'POST', body: { username: U, password: P } })).cookie
+const uCookie = rg.cookie || (await call('/api/login', { method: 'POST', body: { username: U, password: P }, ...AUTH })).cookie
 ok('临时账号拿到登录 cookie', !!uCookie)
 const ovU = await call('/api/admin/overview', { cookie: uCookie })
 ok('★ 普通账号读 overview → 403', ovU.status === 403, `status=${ovU.status}`)
@@ -115,7 +121,7 @@ const ban = await call('/api/admin/user/ban', { method: 'POST', token: ADMIN, bo
 ok('封禁 → 200 banned=true', ban.status === 200 && ban.json?.banned === true, JSON.stringify(ban.json && { ok: ban.json.ok, banned: ban.json.banned }))
 ok('操作人记成「（服务器口令）」', ban.json?.user?.bannedBy === '（服务器口令）', String(ban.json?.user?.bannedBy))
 ok('封禁原因原样记下', ban.json?.user?.banReason === BAN_REASON, String(ban.json?.user?.banReason))
-const lgBan = await call('/api/login', { method: 'POST', body: { username: U, password: P } })
+const lgBan = await call('/api/login', { method: 'POST', body: { username: U, password: P }, ...AUTH })
 ok('★ 被封账号登录 → 403（不是 401「密码错」）', lgBan.status === 403, `status=${lgBan.status}`)
 ok('★ 登录报文里带上了封禁原因', String(lgBan.json?.error || '').includes(BAN_REASON), String(lgBan.json?.error))
 const meBan = await call('/api/me', { cookie: uCookie })
@@ -146,7 +152,7 @@ ok('后台总数里 adminUsers ≥ 1', (ovAfter.json?.totals?.adminUsers || 0) >
 console.log('\n[7] 解封：记录 / 令牌 / 档位原样回来')
 const unban = await call('/api/admin/user/ban', { method: 'POST', token: ADMIN, body: { username: U, banned: false } })
 ok('解封 → 200 banned=false', unban.status === 200 && unban.json?.banned === false, `status=${unban.status}`)
-const lg2 = await call('/api/login', { method: 'POST', body: { username: U, password: P } })
+const lg2 = await call('/api/login', { method: 'POST', body: { username: U, password: P }, ...AUTH })
 ok('★ 解封后能正常登录', lg2.status === 200, `status=${lg2.status}`)
 const u2Cookie = lg2.cookie
 const me2 = await call('/api/me', { cookie: u2Cookie })
@@ -162,7 +168,7 @@ ok('解封后发布令牌恢复可用 → 200', pub2.status === 200, `status=${p
 console.log('\n[8] 收尾：删掉临时账号，现场不留垃圾')
 const del = await call('/api/admin/user/delete', { method: 'POST', token: ADMIN, body: { username: U } })
 ok('删除临时账号 → 200', del.status === 200, `status=${del.status} ${del.json?.error || ''}`)
-const lgDead = await call('/api/login', { method: 'POST', body: { username: U, password: P } })
+const lgDead = await call('/api/login', { method: 'POST', body: { username: U, password: P }, ...AUTH })
 ok('删掉的账号登录 → 401', lgDead.status === 401, `status=${lgDead.status}`)
 const ovEnd = await call('/api/admin/overview', { token: ADMIN })
 ok(`账号总数回到跑之前的样子（${USERS0} 个）`, ovEnd.json?.totals?.users === USERS0, JSON.stringify(ovEnd.json?.totals))
@@ -172,7 +178,7 @@ ok('列表里没有 vf* 残留', leftover.length === 0, leftover.map((r) => r.us
 // ── 9. 管理员身份可以给别的账号（这是"角色挂在账号上"的一般情形） ──────────────
 console.log('\n[9] 给另一个账号管理员身份 → 它自己就能进后台；取消后立刻失效')
 const U2 = `vf${STAMP}a${Math.random().toString(36).slice(2, 5)}`
-const rg2 = await call('/api/register', { method: 'POST', body: { username: U2, password: P } })
+const rg2 = await call('/api/register', { method: 'POST', body: { username: U2, password: P }, ...AUTH })
 ok(`第二临时账号 ${U2} 注册`, rg2.status === 200, `status=${rg2.status}`)
 const c2 = rg2.cookie
 ok('加管理员之前：它进不去后台（403）', (await call('/api/admin/overview', { cookie: c2 })).status === 403)

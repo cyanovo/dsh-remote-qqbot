@@ -7,8 +7,11 @@
 //
 // 契约（给插件/其他会话用）：
 //   GET  /api/meta                     公开：三档模式定义、配额、保留时长、价格
-//   POST /api/register  {username,password}
-//   POST /api/login     {username,password}   → 种下 dsw_session cookie
+//   GET  /api/captcha                  人机验证图片（一次性，3 分钟过期，绑来源 IP）
+//   POST /api/register  {username,password,captchaId,captchaText}
+//   POST /api/login     {username,password,captchaId,captchaText}   → 种下 dsw_session cookie
+//                                      ↑ 这两个接口对**公网请求**强制要验证码；
+//                                        本机直连（验收脚本）与带对 x-admin-token 的请求免验证（见「人机验证」一节）
 //   POST /api/logout
 //   GET  /api/me                       → 账号、配额、保留策略
 //   POST /api/prefs     {mode}         → 保存默认全文模式
@@ -79,6 +82,20 @@ const AUTH_IP_LOCK_MS = 10 * 60 * 1000
 const LOGIN_FAIL_LIMIT = 10                  // 同一账号 10 分钟内最多 10 次失败
 const LOGIN_FAIL_WINDOW_MS = 10 * 60 * 1000
 const LOGIN_LOCK_MS = 10 * 60 * 1000
+// 人机验证（登录 / 注册）。细节与取舍见下面「人机验证」那一节。
+const CAPTCHA_LEN = 4                        // 字符数
+const CAPTCHA_MAX_TRIES = 3                  // 同一个 id 最多猜 3 次，第 3 次错就作废
+const CAPTCHA_TTL_MS = Number(process.env.DSH_WEB_CAPTCHA_TTL_MS || 3 * 60 * 1000)
+                                             // ↑ 可用环境变量调短：**只为让「过期」能被如实测出来**，
+                                             //   生产 unit 不设它，线上就是 3 分钟。
+const CAPTCHA_IP_LIMIT = Number(process.env.DSH_WEB_CAPTCHA_IP_LIMIT || 60)  // 每 IP 每分钟最多领 60 张
+const CAPTCHA_IP_WINDOW_MS = 60 * 1000
+const CAPTCHA_IP_LOCK_MS = 10 * 60 * 1000
+// 去掉 0/O/1/I/L：验证码要能一眼看清，认错了不是安全问题，是白挨一次失败
+const CAPTCHA_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'
+// 🔴 只给验收脚本用：把答案一并回给调用方。生产 unit 里**不设**这个变量，
+//    所以线上 `/api/captcha` 的响应里根本没有 answer 字段（verify-captcha.mjs 对此有断言）。
+const CAPTCHA_TEST = process.env.DSH_WEB_CAPTCHA_TEST === '1'
 // 用户码字母表：去掉 0/O/1/I/L 这些看错的字符
 const USER_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 // 对外地址（只用于给人看的提示文字；nginx 那边才是权威）
@@ -612,6 +629,138 @@ function checkPasswordOrDummy(password, user) {
   return false
 }
 
+// ── 人机验证（登录 / 注册）──────────────────────────────────────────────────
+// 为什么自研图形码，而不接 reCAPTCHA / hCaptcha / Turnstile：
+//   本站用户几乎全是在**手机 QQ 内置浏览器**里点开 http://cyanovo.top（80 端口是故意留的，
+//   不做跳转也不加 HSTS），而这几个第三方挑战脚本的域名在国内网络里经常拉不下来。
+//   一旦拉不下来，「人机验证」就变成「谁都登不进来」——这是把可用性押在别人身上。
+//   自研的只依赖本站一个 GET：图片是服务端现画的 SVG，跟 JSON 一起回来，断网/被墙都不影响。
+//
+// 三条硬约束（都有断言钉着）：
+//   1. **一次性** —— 校验通过立刻从内存删掉，同一个 id 拿不到第二次；
+//   2. **短命** —— 3 分钟过期；同一个 id 最多猜 3 次，第 3 次错就作废（防"慢慢试"）；
+//   3. **绑来源 IP** —— 签发与使用必须同一个 IP，防"这边领题、那边刷"。
+// 答案既不落盘也不进日志，内存里只留 sha256(SECRET + 答案)。
+//
+// 两种**不收验证码**的请求，都不是给外人留的门：
+//   · 本机直连：socket 对端是回环地址、且没有经 nginx 来的 x-real-ip。
+//     8795 只监听 127.0.0.1，公网根本连不到这条路；验收脚本（verify-*.mjs）走的就是它。
+//   · 带对了 x-admin-token：后台口令本身就是全权凭证，用它跳过验证码不会多给出任何权限。
+const captchas = new Map()       // id -> { h, ip, exp, tries }
+const captchaHits = new Map()    // ip -> { hits: number[], lockedUntil: number }
+const isLoopbackAddr = (a) => {
+  const s = String(a || '')
+  return s === '127.0.0.1' || s === '::1' || s === '::ffff:127.0.0.1'
+}
+function captchaExempt(req) {
+  const socketIp = (req.socket && req.socket.remoteAddress) || ''
+  const real = String(req.headers['x-real-ip'] || '').trim()
+  // 两个条件都要：nginx 反代公网请求时，socket 对端也是 127.0.0.1（nginx 在本机），
+  // 但那时一定带着 x-real-ip = 真实公网 IP。只看 socket 会把所有人放进来。
+  if (isLoopbackAddr(socketIp) && (!real || isLoopbackAddr(real))) return true
+  const given = adminTokenFrom(req)
+  return !!given && tokenEq(given, ADMIN_TOKEN)
+}
+function captchaRateLimit(ip, ts = nowMs()) {
+  let rec = captchaHits.get(ip)
+  if (!rec) { rec = { hits: [], lockedUntil: 0 }; captchaHits.set(ip, rec) }
+  if (rec.lockedUntil > ts) return { ok: false, retryAfterMs: rec.lockedUntil - ts }
+  rec.hits = rec.hits.filter((t) => ts - t < CAPTCHA_IP_WINDOW_MS)
+  if (rec.hits.length >= CAPTCHA_IP_LIMIT) {
+    rec.lockedUntil = ts + CAPTCHA_IP_LOCK_MS
+    log(`⚠️ 验证码领取限流：${ip} 一分钟内 ${rec.hits.length} 次，锁 ${CAPTCHA_IP_LOCK_MS / 60000} 分钟`)
+    return { ok: false, retryAfterMs: CAPTCHA_IP_LOCK_MS }
+  }
+  rec.hits.push(ts)
+  if (captchaHits.size > 5000) {   // 别让这张表自己变成内存泄漏
+    for (const [k, v] of captchaHits) if (v.lockedUntil < ts && !v.hits.some((t) => ts - t < CAPTCHA_IP_WINDOW_MS)) captchaHits.delete(k)
+  }
+  return { ok: true }
+}
+const captchaNormalize = (v) => String(v == null ? '' : v).toUpperCase().replace(/[^0-9A-Z]/g, '')
+const captchaHash = (answer) => crypto.createHash('sha256').update(`${SECRET}:captcha:${answer}`).digest('hex')
+/**
+ * 画一张验证码。刻意做成**图片**而不是"算术题文字"：算术题的答案能直接被正则抓走
+ * （页面上明摆着 3+5=?），图形码至少要走一遍识别。
+ * 每个字随机字号/旋转/上下偏移，再叠三道干扰曲线、十几个噪点，最后过一遍湍流位移滤镜。
+ * 滤镜不被支持时（老浏览器）图照样能看 —— 只是没被扭曲，不会变成"看不见题目"。
+ */
+function captchaSvg(code) {
+  const W = 132
+  const H = 44
+  const rand = (a, b) => a + Math.random() * (b - a)
+  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)]
+  const inks = ['#1e63c8', '#b3261e', '#1d7a4d', '#7a4dbb', '#a15c00', '#0f6f8c']
+  const parts = [`<rect width="${W}" height="${H}" fill="#f5f7fa"/>`]
+  for (let i = 0; i < 3; i++) {
+    const y = Math.round(rand(6, H - 6))
+    parts.push(`<path d="M0 ${y} Q ${(W * 0.35).toFixed(0)} ${(y + rand(-9, 9)).toFixed(0)} ${(W * 0.7).toFixed(0)} ${(y + rand(-6, 6)).toFixed(0)} T ${W} ${(y + rand(-8, 8)).toFixed(0)}" fill="none" stroke="${pick(inks)}" stroke-opacity="0.45" stroke-width="${rand(0.7, 1.5).toFixed(1)}"/>`)
+  }
+  for (let i = 0; i < 18; i++) {
+    parts.push(`<circle cx="${rand(2, W - 2).toFixed(1)}" cy="${rand(2, H - 2).toFixed(1)}" r="${rand(0.4, 1.1).toFixed(1)}" fill="${pick(inks)}" fill-opacity="0.35"/>`)
+  }
+  const step = W / (code.length + 1)
+  for (let i = 0; i < code.length; i++) {
+    const x = step * (i + 0.5) + rand(-3, 3)
+    const y = H / 2 + rand(-3, 3)
+    parts.push(
+      `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" fill="${pick(inks)}" font-size="${rand(21, 27).toFixed(1)}"`
+      + ` font-family="Verdana, DejaVu Sans, Arial, sans-serif" font-weight="700" text-anchor="middle"`
+      + ` dominant-baseline="central" transform="rotate(${rand(-26, 26).toFixed(1)} ${x.toFixed(1)} ${y.toFixed(1)})">${code[i]}</text>`,
+    )
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="人机验证图片">`
+    + `<defs><filter id="w"><feTurbulence type="turbulence" baseFrequency="0.035 0.09" numOctaves="2" seed="${Math.floor(rand(1, 999))}" result="t"/>`
+    + '<feDisplacementMap in="SourceGraphic" in2="t" scale="2.4" xChannelSelector="R" yChannelSelector="G"/></filter></defs>'
+    + `<g filter="url(#w)">${parts.join('')}</g></svg>`
+}
+function newCaptcha(ip) {
+  const ts = nowMs()
+  if (captchas.size > 200) {   // 顺手清过期的，别让表越滚越大
+    for (const [k, v] of captchas) if (v.exp < ts) captchas.delete(k)
+  }
+  if (captchas.size > 5000) captchas.clear()   // 极端情况兜底：宁可让大家重领一张，也不拖垮内存
+  let code = ''
+  for (let i = 0; i < CAPTCHA_LEN; i++) code += CAPTCHA_ALPHABET[Math.floor(Math.random() * CAPTCHA_ALPHABET.length)]
+  const id = crypto.randomBytes(12).toString('base64url')
+  captchas.set(id, { h: captchaHash(code), ip, exp: ts + CAPTCHA_TTL_MS, tries: 0 })
+  return { id, svg: captchaSvg(code), answer: code }
+}
+/**
+ * 校验一张验证码。返回 `{ok:true}` / `{ok:false, error}`。
+ * ⚠️ 失败**不计**入「账号密码失败次数」：否则脚本狂刷错验证码就能把别人的账号锁 10 分钟
+ *    （那是拿验证码当武器打人）。验证码自己那 3 次上限已经够用了。
+ */
+function checkCaptcha(req, id, text) {
+  if (captchaExempt(req)) return { ok: true, skipped: true }
+  const key = String(id || '').trim()
+  const ts = nowMs()
+  if (!key) return { ok: false, error: '请先填写图片里的验证码' }
+  const rec = captchas.get(key)
+  if (!rec || rec.exp < ts) {
+    if (rec) captchas.delete(key)
+    return { ok: false, error: '验证码已过期，请点「换一张」重新获取' }
+  }
+  const ip = clientIp(req)
+  if (rec.ip !== ip) {
+    captchas.delete(key)   // 换了来源：作废，别让它被搬到别处用
+    log(`⚠️ 验证码来源 IP 变了（${rec.ip} → ${ip}），作废`)
+    return { ok: false, error: '验证码已失效，请点「换一张」重新获取' }
+  }
+  const ans = captchaNormalize(text)
+  if (ans.length < CAPTCHA_LEN) return { ok: false, error: `验证码是 ${CAPTCHA_LEN} 位字母数字，请照图填写` }
+  if (tokenEq(captchaHash(ans), rec.h)) {
+    captchas.delete(key)   // 一次性：用过即废，同一个 id 不能再换一次登录
+    return { ok: true }
+  }
+  rec.tries += 1
+  if (rec.tries >= CAPTCHA_MAX_TRIES) {
+    captchas.delete(key)
+    return { ok: false, error: '验证码错了 3 次，已作废，请点「换一张」重填' }
+  }
+  return { ok: false, error: `验证码不对（还能试 ${CAPTCHA_MAX_TRIES - rec.tries} 次）` }
+}
+
 // ── 会话 cookie 的属性 ──────────────────────────────────────────────────────
 // 走 TLS 时**必须**带 Secure：否则同一个 cookie 会在任何 http 请求里被明文发出去。
 // 本站 80 端口是**故意**开着的（QQ 里的链接全是 http 大写域名），所以这不是理论问题 ——
@@ -1134,16 +1283,45 @@ const server = http.createServer(async (req, res) => {
           },
         },
         device: { ttlMs: DEVICE_TTL_MS, interval: DEVICE_POLL_INTERVAL },
+        // required 是**按这次请求**算的：经 nginx 来的公网请求为 true，本机直连（验收脚本）为 false。
+        captcha: { required: !captchaExempt(req), chars: CAPTCHA_LEN, ttlMs: CAPTCHA_TTL_MS },
         timezone: 'Asia/Shanghai',
         now: nowMs(),
       })
+    }
+
+    // 人机验证图片：一次性，答案只在内存里（取舍见上面「人机验证」那一节）。
+    if (p === '/api/captcha') {
+      const ip = clientIp(req)
+      const rl = captchaRateLimit(ip)
+      if (!rl.ok) return json(res, 429, { ok: false, error: `验证码领太频繁，请 ${Math.ceil(rl.retryAfterMs / 60000)} 分钟后再试` })
+      const c = newCaptcha(ip)
+      const body = {
+        ok: true,
+        id: c.id,
+        // 回 data URL 而不是让前端 innerHTML 插一段 SVG：前端只需要 img.src = ...，
+        // 既不碰 innerHTML（本项目对它的纪律），也省掉一个 XSS 面。
+        image: `data:image/svg+xml;base64,${Buffer.from(c.svg).toString('base64')}`,
+        chars: CAPTCHA_LEN,
+        ttlMs: CAPTCHA_TTL_MS,
+      }
+      // 🔴 答案只在验收脚本显式打开 DSH_WEB_CAPTCHA_TEST=1 时才回；生产 unit 不设这个变量，
+      //    所以线上这份响应里没有 answer 字段（verify-captcha.mjs 对此有断言）。
+      if (CAPTCHA_TEST) body.answer = c.answer
+      return json(res, 200, body, { 'Cache-Control': 'no-store' })
     }
 
     if (p === '/api/register' && req.method === 'POST') {
       if (!isJson) return json(res, 415, { ok: false, error: '需要 application/json' })
       const rl = authRateLimit(clientIp(req))
       if (!rl.ok) return json(res, 429, { ok: false, error: `操作太频繁，请 ${Math.ceil(rl.retryAfterMs / 60000)} 分钟后再试` })
-      const { username, password } = await readBody(req)
+      const { username, password, captchaId, captchaText } = await readBody(req)
+      // 人机验证必须在**花 scrypt 之前**：否则脚本拿这个接口当算力靶子照样烧得动。
+      const cap = checkCaptcha(req, captchaId, captchaText)
+      if (!cap.ok) {
+        log(`⚠️ 注册被人机验证拦下（${clientIp(req)}）：${cap.error}`)
+        return json(res, 400, { ok: false, captcha: true, error: cap.error })
+      }
       if (!validName(username)) return json(res, 400, { ok: false, error: '用户名：2–24 位，中文/字母/数字/_/-' })
       if (!validPass(password)) return json(res, 400, { ok: false, error: '密码至少 6 位' })
       if (db.users[username]) return json(res, 409, { ok: false, error: '这个用户名已经被注册了' })
@@ -1159,7 +1337,14 @@ const server = http.createServer(async (req, res) => {
       if (!isJson) return json(res, 415, { ok: false, error: '需要 application/json' })
       const rl = authRateLimit(clientIp(req))
       if (!rl.ok) return json(res, 429, { ok: false, error: `操作太频繁，请 ${Math.ceil(rl.retryAfterMs / 60000)} 分钟后再试` })
-      const { username, password } = await readBody(req)
+      const { username, password, captchaId, captchaText } = await readBody(req)
+      // 人机验证在**比对密码之前**，而且失败**不算密码失败**（见 checkCaptcha 注释：
+      // 否则脚本刷错验证码就能把别人的账号锁上 10 分钟 —— 那是拿验证码当武器打人）。
+      const cap = checkCaptcha(req, captchaId, captchaText)
+      if (!cap.ok) {
+        log(`⚠️ 登录被人机验证拦下（${clientIp(req)}）：${cap.error}`)
+        return json(res, 400, { ok: false, captcha: true, error: cap.error })
+      }
       const user = db.users[username]
       // 先看这个账号是否已被锁：锁了就**不比对密码**（也比对不出结果，白烧 CPU）
       const locked = loginLockLeft(username)
@@ -1556,6 +1741,9 @@ const SWEEP_MS = 10 * 60 * 1000
 function sweepRecords(why) {
   const dropped = pruneRecords()
   const droppedDevices = pruneDevices()
+  // 验证码只活在内存里，过期的顺手删掉（不值得为它单开一个定时器）
+  const ts = nowMs()
+  for (const [k, v] of captchas) if (v.exp < ts) captchas.delete(k)
   if (!dropped && !droppedDevices) return 0
   log(`${why}：清掉 ${dropped} 条过期记录${droppedDevices ? `、${droppedDevices} 个过期设备码` : ''}`)
   saveDB()   // 落盘失败会由 saveDB 自己记一条「落盘失败」，不静默

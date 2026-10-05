@@ -52,6 +52,15 @@ const USER = argOf('--user', 'cyanovo')
 const PASS = argOf('--pass', process.env.DSW_PASS || '')
 if (!PASS) { console.error('缺少口令：请用 --pass 或环境变量 DSW_PASS 传入（不要再写进源码）'); process.exit(2) }
 const ONLY = argOf('--only', '').toUpperCase()
+// 公网 /api/login 与 /api/register 现在要过「人机验证」（图形码）。这一趟是**真浏览器**在打
+// 公网入口，没法人眼看图写字 —— 所以这两步的请求带上后台口令，服务端对带对口令的请求免验证码。
+// 口令只发给**主人自己的域名**（这一趟浏览器本来就在访问它），不流向任何第三方。
+const ADMIN_TOKEN = argOf('--admin-token', process.env.ADMIN_TOKEN || '')
+const AUTH_HDR = ADMIN_TOKEN ? `, 'x-admin-token': ${JSON.stringify(ADMIN_TOKEN)}` : ''
+if (!ADMIN_TOKEN) {
+  console.log('  ℹ 没给 ADMIN_TOKEN：公网注册/登录会被人机验证拦下 —— 那是**正确**行为，不是故障。')
+  console.log('    要跑通请带上：--admin-token <后台口令>，或 $env:ADMIN_TOKEN=<后台口令>')
+}
 
 let pass = 0
 let fail = 0
@@ -193,7 +202,7 @@ async function phaseA(send, events) {
   const upass = 'vf-deeplink-' + Math.random().toString(36).slice(2, 10)
 
   const reg = await ev(send, `
-    const j = (u, o) => fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(o) })
+    const j = (u, o) => fetch(u, { method: 'POST', headers: { 'content-type': 'application/json'${AUTH_HDR} }, body: JSON.stringify(o) })
       .then(async (r) => ({ status: r.status, body: await r.json() }));
     const a = await j('/api/register', { username: ${JSON.stringify(uname)}, password: ${JSON.stringify(upass)} });
     if (a.status !== 200) return { ok: false, step: 'register', status: a.status, body: a.body };
@@ -208,7 +217,12 @@ async function phaseA(send, events) {
   `)
   ok('一次性账号注册 + 令牌 + 发布全部成功',
     reg.ok === true, reg.ok ? `账号=${uname} 记录=${reg.id}` : `卡在 ${reg.step}：${JSON.stringify(reg.body)}`)
-  if (!reg.ok) return
+  if (!reg.ok) {
+    if (reg.step === 'register' && reg.body && reg.body.captcha) {
+      console.log('    ↳ 这是被人机验证拦下的（服务的正常行为）。自动化跑请带 --admin-token 或 $env:ADMIN_TOKEN。')
+    }
+    return
+  }
 
   // 注销（含删记录）—— 不管后面成不成功，先挂个 finally 式的收尾
   const purge = async () => ev(send, `
@@ -276,7 +290,7 @@ async function phaseA(send, events) {
 async function phaseB(send, events) {
   console.log('\n【B】主人真实记录：登录 → 取最近一条 → 打开 /n/<id>')
   const login = await ev(send, `
-    const r = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' },
+    const r = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json'${AUTH_HDR} },
       body: JSON.stringify({ username: ${JSON.stringify(USER)}, password: ${JSON.stringify(PASS)} }) });
     if (r.status !== 200) return { ok: false, status: r.status };
     const b = await r.json();
@@ -284,7 +298,8 @@ async function phaseB(send, events) {
       used: b.me.quota ? b.me.quota.used : null, limit: b.me.quota ? b.me.quota.limit : null };
   `)
   if (!login.ok) {
-    ok('主人账号登录成功', false, `HTTP ${login.status}（密码不对？用 --pass 传，或 DSW_PASS 环境变量）`)
+    ok('主人账号登录成功', false, `HTTP ${login.status}（密码不对？用 --pass 传，或 DSW_PASS 环境变量；` +
+      `被人机验证拦下时请带 --admin-token / $env:ADMIN_TOKEN）`)
     return
   }
   pass++

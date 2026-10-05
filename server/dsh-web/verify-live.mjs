@@ -73,7 +73,12 @@ console.log(`线上入口：${BASE}\n临时账号：${USER}（跑完自删）\n`
 // 2026-10-04 安全审计 H5：/health 不再免鉴权报 counts，数字挪到 /health/detail（要后台口令）。
 // 所以基线要么带 ADMIN_TOKEN 去拿，要么**明确跳过** —— 不能让 "undefined === undefined" 混过去。
 const ADMIN = process.env.ADMIN_TOKEN || ''
-const base0 = ADMIN ? await anon('/health/detail', { headers: { 'x-admin-token': ADMIN } }) : null
+// 公网注册/登录现在要过「人机验证」（图形码）。自动化脚本没法看图写字，所以这两步走
+// x-admin-token 这条**服务端明确豁免**的通道 —— 口令本身就等价于全权凭证，免掉验证码不多给任何权限。
+// ⚠️ 口令为空时**绝不能**带上这个头：服务端会把"带了口令但不对"记成一次口令失败，
+//    连打 10 次就把主人自己的 IP 锁 10 分钟（admin.js 里踩过同一个坑）。
+const ADMIN_HEADERS = ADMIN ? { 'x-admin-token': ADMIN } : {}
+const base0 = ADMIN ? await anon('/health/detail', { headers: ADMIN_HEADERS }) : null
 const healthShape = await anon('/health')
 check('★ /health 只回 {ok:true}，不再泄露账号数/记录数',
   healthShape.status === 200 && healthShape.data.ok === true && !('users' in healthShape.data) && !('records' in healthShape.data),
@@ -89,8 +94,27 @@ check('meta 里有两档（免费版 100/5h，付费版 1000/48h/30 天/2.99）'
 check('meta 里有设备码参数（10 分钟 / 轮询 3 秒）',
   meta.data.device && meta.data.device.ttlMs === 600000 && meta.data.device.interval === 3,
   JSON.stringify(meta.data.device))
+// ★ 人机验证：公网这一份必须真的挂上了。本地断言证明的是**代码**，
+//   这一条证明的是 nginx 后面跑着的那一份（本地全绿、线上还是旧版的事故是有的）。
+const metaCap = meta.data.captcha
+check('★ /api/meta 对公网请求说要验证码（前端据此决定渲不渲染那张图）',
+  !!metaCap && metaCap.required === true && metaCap.chars === 4 && metaCap.ttlMs >= 60000,
+  JSON.stringify(metaCap))
+const noCap = await anon('/api/register', { method: 'POST', body: { username: 'vnocap' + Math.random().toString(36).slice(2, 8), password: PASS } })
+check('★ 线上不带验证码注册 → 400 且明确标了 captcha（不是含糊的"参数错误"）',
+  noCap.status === 400 && noCap.data.captcha === true && /验证码/.test(String(noCap.data.error)),
+  `HTTP ${noCap.status} ${JSON.stringify(noCap.data).slice(0, 160)}`)
 
-const reg = await me('/api/register', { method: 'POST', body: { username: USER, password: PASS } })
+const reg = await me('/api/register', { method: 'POST', body: { username: USER, password: PASS }, headers: ADMIN_HEADERS })
+// 没有人机验证的答案、又没带后台口令时，这里一定是 400 —— 必须**立刻说清并退出**，
+// 否则后面十几条断言会因为"没有账号/没有 cookie"级联变红，看着像产品坏了，实际是量具没带钥匙。
+if (reg.status === 400 && reg.data && reg.data.captcha) {
+  console.log('\n⛔ 公网注册被人机验证拦下了（这是服务的正常行为，不是故障）。')
+  console.log(`   服务端原话：${reg.data.error}`)
+  console.log('   自动化脚本怎么办：拿后台口令走豁免通道再跑，例如 PowerShell：')
+  console.log("     $env:ADMIN_TOKEN = (ssh cyanovo cat /var/lib/dsh-web/admin-token); node verify-live.mjs")
+  process.exit(3)
+}
 check('注册成功且是免费版', reg.status === 200 && reg.data.me.plan === 'free' && reg.data.me.quota.limit === 100,
   `HTTP ${reg.status} ${JSON.stringify(reg.data).slice(0, 160)}`)
 
@@ -189,7 +213,7 @@ check('注销时密码不对 → 401（记录已删）', badpass.status === 401 
 
 const gone = await me('/api/me/purge', { method: 'POST', body: { scope: 'all', password: PASS } })
 check('密码对了 → 账号注销', gone.status === 200 && gone.data.deletedAccount === true, JSON.stringify(gone.data))
-const relogin = await anon('/api/login', { method: 'POST', body: { username: USER, password: PASS } })
+const relogin = await anon('/api/login', { method: 'POST', body: { username: USER, password: PASS }, headers: ADMIN_HEADERS })
 check('注销后不能再登录（临时数据真的清干净了）', relogin.status === 401, `HTTP ${relogin.status}`)
 
 if (!ADMIN) {
