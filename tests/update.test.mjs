@@ -432,7 +432,13 @@ await t('即使 PATH 上有 dsh，也优先用桌面版自带 pnpm（dsh 在开�
 })
 
 await t('bundledPnpmEntry：从 exe 自己推出资源目录，文件不存在就认不出来', () => {
-  assert.equal(bundledPnpmEntry(REAL_EXE), REAL_PNPM, '本机确实存在 <exe目录>/resources/runtime/pnpm/bin/pnpm.mjs')
+  // 真机观察：桌面版的自带运行时确实在 exe 旁边。CI（ubuntu）上没有这个目录，
+  // 所以这条只在真看到了才断言，判据本身用注入的存在性跑（任何平台都能确定地验）。
+  if (fs.existsSync(REAL_PNPM)) {
+    assert.equal(bundledPnpmEntry(REAL_EXE), REAL_PNPM, '本机确实存在 <exe目录>/resources/runtime/pnpm/bin/pnpm.mjs')
+  }
+  const onlyRealPnpm = { exists: (target) => norm(target) === norm(REAL_PNPM) }
+  assert.equal(bundledPnpmEntry(REAL_EXE, onlyRealPnpm), REAL_PNPM, '资源目录贴在 exe 旁边（按注入的存在性判）')
   assert.equal(bundledPnpmEntry(REAL_EXE, { exists: () => false }), '', '文件不存在就不认（不许猜安装位置）')
   assert.equal(bundledPnpmEntry(''), '')
   assert.equal(bundledPnpmEntry('DeepSeek Harness.exe'), '', '相对路径不算')
@@ -459,7 +465,7 @@ await t('argv 里没有 pnpm.mjs 时（主进程 CommandLine 只有 exe 自己�
 })
 
 await t('没有自带 pnpm 时才用 PATH 上的 dsh，且 Windows 必须走 cmd.exe /c', () => {
-  const dshCmd = path.join('D:\\Program Files\\dsh', 'dsh.cmd')
+  const dshCmd = path.win32.join('D:\\Program Files\\dsh', 'dsh.cmd')
   const cmd = buildAddCommand({
     profile: 'desktop',
     spec: DEFAULT_UPDATE_SOURCE,
@@ -497,7 +503,7 @@ await t('非 Windows 上直接用 dsh，不加 cmd.exe 包装', () => {
 
 await t('最后兜底：profile 目录里 pnpm add（连 dsh 都没有时）', () => {
   // 特意用带空格的目录：Windows 上经 cmd.exe /c 启动时必须整体加引号。
-  const pnpm = path.join('D:\\Program Files\\pnpm', 'pnpm.cmd')
+  const pnpm = path.win32.join('D:\\Program Files\\pnpm', 'pnpm.cmd')
   const cmd = buildAddCommand({
     profile: 'desktop',
     spec: 'dsh-remote-qqbot',
@@ -534,9 +540,10 @@ await t('profile 名或源为空时直接拒绝（不拼出半条命令）', () 
 })
 
 await t('findOnPath：Windows 上连 .cmd / .exe / .bat 一起试，找不到返回空串', () => {
-  const exe = path.join('D:\\a', 'pnpm.exe')
+  // 期望值用 path.win32.join 现算：这是**Windows 路径**，在 Linux 的 CI 上也要算出同一条。
+  const exe = path.win32.join('D:\\a', 'pnpm.exe')
   const found = findOnPath('pnpm', {
-    env: { PATH: ['D:\\a', 'D:\\b'].join(path.delimiter) },
+    env: { PATH: ['D:\\a', 'D:\\b'].join(';') },
     platform: 'win32',
     ...fakeDeps([exe], []),
   })
