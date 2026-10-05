@@ -87,14 +87,18 @@ const norm = (x) => String(x).replace(/\\/g, '/').toLowerCase()
  * 让 `exists` 只对给定的路径成立，`readFileSync` 只对 profile 目录给 package.json。
  *
  * 注意 `exists` 还要认「profile 目录下的 package.json」—— `isProfileDir` 问的正是那个路径。
+ * 取父目录用自己的 `dirnameAny`（`/` 与 `\` 都认），**不能用当前平台的 `path.dirname`**：
+ * 在 Linux 的 CI 上，`path.dirname('D:\\x\\y\\package.json')` 只知道 `/`，会把整串原样返回，
+ * 于是「profile 目录」这条判断在 CI 上永远为假（2026-10-05 实测踩到，6 条断言全红）。
  */
+const dirnameAny = (p) => String(p).replace(/[/\\][^/\\]*$/, '')
 function fakeDeps(existing, profileDirs = []) {
   const want = existing.map(norm)
   const profiles = profileDirs.map(norm)
   return {
-    exists: (target) => want.includes(norm(target)) || profiles.includes(norm(path.dirname(String(target)))),
+    exists: (target) => want.includes(norm(target)) || profiles.includes(norm(dirnameAny(target))),
     readFileSync: (target) => {
-      const dir = norm(path.dirname(String(target)))
+      const dir = norm(dirnameAny(target))
       if (profiles.includes(dir)) {
         return JSON.stringify({ name: 'dsh-profile-desktop', dsh: { profile: { bundles: [] } } })
       }
@@ -418,7 +422,7 @@ await t('execPath 不存在时退到 %DSH_DESKTOP_NODE_EXECUTABLE%', () => {
 })
 
 await t('即使 PATH 上有 dsh，也优先用桌面版自带 pnpm（dsh 在开发机上指向源码检出）', () => {
-  const dshCmd = path.join('D:\\tools', 'dsh.cmd')
+  const dshCmd = path.win32.join('D:\\tools', 'dsh.cmd')
   const cmd = buildAddCommand({
     profile: 'desktop',
     spec: DEFAULT_UPDATE_SOURCE,
