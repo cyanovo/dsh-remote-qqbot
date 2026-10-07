@@ -439,7 +439,7 @@ await t('大小写/多余空白也认（手机输入法会自动首字母大写�
 await t('不许过度匹配：/scre 仍是未知指令，/status 仍是 status', () => {
   assert.equal(routeIncoming('/scre').kind, 'unknown')
   assert.equal(routeIncoming('/status').kind, 'status', '加 screen 不能碰坏 status')
-  assert.equal(routeIncoming('截图').kind, 'task', '不带斜杠的"截图"是派活，不是截图')
+  assert.equal(routeIncoming('截图').kind, 'chat', '不带斜杠的"截图"就是一句闲聊（1.0.24 起没有"当派活"这条默认）')
 })
 
 await t('截图指令不吃参数：后面跟的字被安静忽略（不报错、不串到别的分支）', () => {

@@ -451,6 +451,78 @@ await test('跨站请求被挡（sec-fetch-site: cross-site）', async () => {
   assert.equal(res.status, 403)
 })
 
+// ── [C2] 安全护栏：三个「决定数据去哪 / 装哪份代码」的键，不许从这个无认证面写 ──
+//
+// 2026-10-07 安全审查的结论：`isTrustedApiRequest` 只挡浏览器跨站与 DNS-rebinding，
+// **不是身份认证** —— 任何能连 127.0.0.1:19387 的本机进程、或页面里的同源脚本，
+// 都能带一个合法的 Host 打进来。于是三个键必须「只能手改配置文件」：
+//   cloudUrl（正文发去哪台服务器）、hubUrl（摘要去哪台）、qqUpdateSource（装哪份代码 ⇒ RCE）。
+// 这一组就是那条边界的护栏：**改回去就必须报红**。
+
+console.log('\n[C2] 安全护栏：只能手改配置文件的三个键，网页路由写不动')
+
+await test('★ cloudUrl / hubUrl / qqUpdateSource 被硬拒，且如实回报 rejected', async () => {
+  const file = join(tempDir(), OVERRIDE_FILE_NAME)
+  const { handler } = bootRoute({
+    update: async () => { throw new Error(DESKTOP_REJECTION) },
+    file,
+    live: { collabEnabled: true },
+  })
+  const res = await call(handler, 'POST', '/remote-qqbot/api/config.set', {
+    patch: {
+      cloudUrl: 'https://attacker.example',
+      hubUrl: 'https://attacker.example/dsh-hub',
+      qqUpdateSource: 'https://attacker.example/update.json',
+      collabEnabled: false, // 同一批里的合法键必须照旧生效，别因为有人混进来就整批丢
+    },
+  })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.deepEqual(res.body.applied, ['collabEnabled'], '合法键要照旧写入')
+  const rejectedKeys = new Set((res.body.rejected ?? []).map((row) => row.key))
+  for (const key of ['cloudUrl', 'hubUrl', 'qqUpdateSource']) {
+    assert.ok(rejectedKeys.has(key), `${key} 必须出现在 rejected 里（不能静默丢弃）`)
+  }
+  // 落盘面：三个键一个都不许进覆盖文件
+  const onDisk = existsSync(file) ? readOverrides(file, KEYS).values : {}
+  for (const key of ['cloudUrl', 'hubUrl', 'qqUpdateSource']) {
+    assert.equal(key in onDisk, false, `${key} 竟然落进了覆盖文件 —— 安全边界被绕过`)
+  }
+  assert.equal(onDisk.collabEnabled, false, '合法键该存住的还得存住')
+})
+
+await test('★ 只发这三个键：一个都不写，也不会产生覆盖文件', async () => {
+  const file = join(tempDir(), OVERRIDE_FILE_NAME)
+  const { handler } = bootRoute({ update: async () => { throw new Error(DESKTOP_REJECTION) }, file, live: {} })
+  const res = await call(handler, 'POST', '/remote-qqbot/api/config.set', {
+    patch: { cloudUrl: 'https://attacker.example', hubUrl: 'https://attacker.example', qqUpdateSource: 'npm:evil' },
+  })
+  assert.deepEqual(res.body.applied, [])
+  assert.equal((res.body.rejected ?? []).length, 3)
+  assert.equal(existsSync(file), false, '空补丁不该产生覆盖文件')
+})
+
+await test('★ 字段表里的三个键必须真的标了 manualOnly（漏标一个 = 边界破一个口）', async () => {
+  const { FIELD_SPECS, MANUAL_ONLY_KEYS } = await import('../lib/config-api.js')
+  for (const key of ['cloudUrl', 'hubUrl', 'qqUpdateSource']) {
+    const spec = FIELD_SPECS.find((row) => row.key === key)
+    assert.ok(spec, `FIELD_SPECS 里缺 ${key}`)
+    assert.equal(spec.manualOnly, true, `${key} 没标 manualOnly —— 又会变回可写`)
+    assert.ok(MANUAL_ONLY_KEYS.has(key), `${key} 不在 MANUAL_ONLY_KEYS 里`)
+  }
+})
+
+await test('★ 前端也必须只读渲染这些字段（后端拒了、界面还让人改 = 骗用户）', () => {
+  const client = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  assert.match(client, /readOnly:\s*field\.manualOnly === true/, 'manualOnly 的输入框必须是只读')
+  assert.match(client, /只能手改配置文件/, '要让用户知道去哪儿改，而不是给一个改不动的框')
+})
+
+await test('★ 保存回执里的 rejected 要显示给用户（被拒了却一声不吭 = 另一种骗）', () => {
+  const client = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+  assert.match(client, /result\?\.rejected/, '保存结果里的 rejected 必须被界面消费')
+})
+
 // ── [D] 接线护栏 ──────────────────────────────────────────────────────────
 
 console.log('\n[D] 接线：忘了传 persist / 忘了叠加覆盖层，就等于没修')

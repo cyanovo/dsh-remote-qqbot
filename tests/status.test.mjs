@@ -215,6 +215,24 @@ await t('★ 注入腿（引用回复）单独报，别被"QQ 连着"盖过去 �
   assert.ok(noted.includes('已补回签名记录'), noted)
 })
 
+await t('★ 插件版本要能在 /status 里问出来；磁盘比内存新时必须告警（1.0.22）', () => {
+  // 主人 2026-10-07 反复问"为什么新功能没有、它却说已经是最新"。根因是"磁盘装了新版、
+  // 内存跑的还是旧版"这个错位看不见 —— /status 是他手边最好用的地方，必须能问到。
+  const same = formatStatusText({ channelOn: true, runningVersion: '1.0.22', installedVersion: '1.0.22' })
+  assert.ok(same.includes('1.0.22'), same)
+  assert.ok(same.includes('跑的是 1.0.22') || same.includes('插件 1.0.22'), same)
+  assert.ok(!same.includes('重启 DSH 才会换过去'), '一致时不该吓人')
+
+  const behind = formatStatusText({ channelOn: true, runningVersion: '1.0.21', installedVersion: '1.0.22' })
+  assert.ok(behind.includes('⚠️'), behind)
+  assert.ok(behind.includes('跑的是 1.0.21'), behind)
+  assert.ok(behind.includes('1.0.22'), behind)
+  assert.ok(behind.includes('重启 DSH'), '要说清怎么才能换过去：\n' + behind)
+
+  // 没给版本号时不多一行噪音（老调用点、以及"读不到自己版本"的极端情况）
+  assert.ok(!formatStatusText({ channelOn: true }).includes('插件'), '不传就不显示')
+})
+
 await t('入参全空也不崩（防御性：session/list 返回空 items）', () => {
   const text = formatStatusText()
   assert.ok(text.startsWith('📊 现在的状态'), text)

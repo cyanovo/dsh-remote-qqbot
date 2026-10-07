@@ -12,7 +12,10 @@
  *   6. 子进程输出必须**重定向到文件**（`stdio` 里不许出现 `'pipe'`：Windows 沙箱下会 EPERM）；
  *   7. 重启脚本（10 秒延迟 / 按路径杀 / 等它真死 / 清掉 ELECTRON_RUN_AS_NODE /
  *      三种启动方式兜底 / 3 次重试 / 追加日志）；
- *   8. 面向用户的每一句文案（主人明确规定了措辞）。
+ *   8. 面向用户的每一句文案（主人明确规定了措辞）；
+ *   9. **下载下来的包必须本地校验 sha256**（2026-10-07 加：索引与 tgz 同时被换的
+ *      第二道防线）—— 缺校验位/对不上/长度不符一律拒绝安装，且不留临时文件；
+ *      索引地址与包地址只认 https（唯一例外是本机回环）。
  *
  * 设计纪律：**跑函数验行为，不正则扫源码**；网络 / 进程 / 文件系统全部走注入的假实现。
  *
@@ -20,25 +23,33 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import {
   DEFAULT_UPDATE_SOURCE, ERROR_TAIL_CHARS, RESTART_DELAY_SECONDS,
-  RESTART_RETRIES, UPDATE_INSTALL_TIMEOUT_MS,
-  buildAddCommand, buildRestartScript, bundledPnpmEntry, compareVersions, fetchLatestVersion,
+  RESTART_RETRIES, SHA256_PREVIEW_CHARS, UPDATE_INSTALL_TIMEOUT_MS,
+  UPDATE_NOTES_MAX_CHARS,
+  buildAddCommand, buildRestartScript, bundledPnpmEntry, compareVersions,
+  fetchAndVerifyPackage, fetchLatestVersion,
   RESTART_POISON_ENV,
-  findOnPath, formatAlreadyLatest, formatCheckFailed, formatRemoteOlder, formatRestartDone,
+  findOnPath, formatAlreadyLatest, formatCheckFailed, formatNothingToSkip, formatPendingRestart,
+  formatRemoteOlder,
+  formatRestartDone,
   formatUpdateAvailable, formatUpdateBusy, formatUpdateCheck, formatUpdateDone,
-  formatUpdateFailed, formatUpdateMisconfigured, formatUpdateNoChange, formatUpdating,
+  formatUpdateNotes,
+  formatUpdateFailed, formatUpdateMisconfigured, formatUpdateNoChange, formatUpdateSkipped,
+  formatUpdating,
   isNewerVersion, isProfileDir, launchRestartScript, normalizeVersion, parseDesktopRuntime,
-  parseUpdateSource, pluginRootFromFile, readPackageVersion, resolveProfileFromPluginFile,
+  parseUpdateSource, pluginRootFromFile, readPackageVersion, removeVerifiedPackage,
+  resolveProfileFromPluginFile,
   restartLogSize, runProcess, tailText, verifyRestartLaunched, versionFromGitHubResponse,
   versionFromManifestResponse, versionFromNpmResponse, writeRestartLauncher, writeRestartScript,
 } from '../src/update.js'
-import { HELP_TEXT, routeIncoming } from '../src/qqbridge.js'
+import { HELP_TEXT, buildUpdateNoticeKeyboard, routeIncoming } from '../src/qqbridge.js'
 
 let pass = 0
 let fail = 0
@@ -176,6 +187,35 @@ await t('索引源：装的是索引里给的压缩包地址，不是索引地�
   assert.equal(got.spec, url, 'pnpm add 要用索引里的 url 字段')
   assert.equal(got.sha256, 'a'.repeat(64))
   assert.equal(f.calls[0].options.headers['cache-control'], 'no-cache', '索引必须每次拿最新的')
+})
+
+await t('★ 索引里的 notes（这版改了什么）要跟着查新结果回到插件（1.0.23）', async () => {
+  // 提醒正文要用它，所以 fetchLatestVersion 必须把它带出来；缺字段/非字符串都当"没有"。
+  const url = 'https://cyanovo.top/plugins/dsh-remote-qqbot/dsh-remote-qqbot-9.9.9.tgz'
+  const withNotes = await fetchLatestVersion({
+    source: DEFAULT_UPDATE_SOURCE,
+    fetchImpl: fakeFetch({ body: { version: '9.9.9', url, sha256: 'a'.repeat(64), notes: '  修提醒里的发布说明  ' } }),
+  })
+  assert.equal(withNotes.notes, '修提醒里的发布说明', '首尾空白要去掉')
+
+  const without = await fetchLatestVersion({
+    source: DEFAULT_UPDATE_SOURCE,
+    fetchImpl: fakeFetch({ body: { version: '9.9.9', url } }),
+  })
+  assert.equal(without.notes, '', '老索引没有 notes 时是空串，不是 undefined')
+
+  const weird = await fetchLatestVersion({
+    source: DEFAULT_UPDATE_SOURCE,
+    fetchImpl: fakeFetch({ body: { version: '9.9.9', url, notes: { nope: true } } }),
+  })
+  assert.equal(weird.notes, '', '字段类型不对也不许把提醒搞崩')
+
+  // github / npm 这两种源没有"发布说明"这个概念 → 永远是空串
+  const gh = await fetchLatestVersion({
+    source: 'github:cyanovo/dsh-remote-qqbot',
+    fetchImpl: fakeFetch({ body: { content: Buffer.from(JSON.stringify({ version: '9.9.9' })).toString('base64'), encoding: 'base64' } }),
+  })
+  assert.equal(gh.notes, '')
 })
 
 await t('索引地址打错（远端回的其实是首页 HTML）⇒ 报人话，绝不装作查到了版本', async () => {
@@ -921,14 +961,56 @@ await t('拉不起来重启脚本时返回 false 而不是抛', () => {
 // ── [8] 面向用户的文案 ──────────────────────────────────────────────────────
 console.log('[8] 文案（措辞是硬要求）')
 
-await t('发现新版本：说清版本差异 + 会重启 + 中间连不上', () => {
+await t('发现新版本：说清版本差异 + 会重启 + 中间连不上（并说明下面有按钮）', () => {
   const text = formatUpdateAvailable({ latest: '1.0.7', current: '1.0.6' })
-  assert.equal(text, '🔔 插件有新版本 1.0.7（现在跑的是 1.0.6）。发 /update 我就装上 —— 装完会自动重启 DSH，中间有十几秒连不上。')
+  assert.equal(text, '🔔 插件有新版本 1.0.7（现在跑的是 1.0.6）。点下面的按钮，或者发 /update 我就装上 —— 装完会自动重启 DSH，中间有十几秒连不上。')
+})
+
+await t('★ 提醒里要写清「这版改了什么」（索引带 notes 时）—— 只有版本号只能盲选', () => {
+  // 主人 2026-10-07 17:3x：「我需要有提醒。而且下边有按键可以选择立即更新」。
+  // 提醒本来就带两个按钮，但正文只有版本号时，"立即更新 / 忽略本次"其实没法判断 ——
+  // 发布时写进索引的 notes 要跟着进提醒（1.0.23）。
+  const withNotes = formatUpdateAvailable({ latest: '1.0.23', current: '1.0.22', notes: '修提醒里的发布说明' })
+  assert.equal(withNotes,
+    '🔔 插件有新版本 1.0.23（现在跑的是 1.0.22）。点下面的按钮，或者发 /update 我就装上 —— 装完会自动重启 DSH，中间有十几秒连不上。\n这版改了什么：修提醒里的发布说明')
+
+  // 索引里没有 notes（老索引 / 手写的索引）→ 一个字都不多，正文与 1.0.17 起完全一致
+  assert.equal(formatUpdateAvailable({ latest: '1.0.7', current: '1.0.6', notes: '' }),
+    formatUpdateAvailable({ latest: '1.0.7', current: '1.0.6' }))
+  assert.equal(formatUpdateAvailable({ latest: '1.0.7', current: '1.0.6', notes: '   \n ' }),
+    formatUpdateAvailable({ latest: '1.0.7', current: '1.0.6' }))
+
+  // 换行/连续空格要压平（QQ 正文里蹦出十几行会把按钮顶下去），超长按码点截断
+  assert.equal(formatUpdateNotes('第一行\n第二行   第三行'), '第一行 第二行 第三行')
+  assert.equal(formatUpdateNotes('x'.repeat(200)).length, UPDATE_NOTES_MAX_CHARS + 1, '截断后带一个省略号')
+  assert.ok(formatUpdateNotes('x'.repeat(200)).endsWith('…'))
+  // 表情符号不能被切成半个码点（按码点截断，不是按 UTF-16 单元）
+  assert.equal(formatUpdateNotes('🔔🔔🔔', 2), '🔔🔔…')
+
+  // 手动查一次（/update check）也带同一句，跟自动提醒口径一致
+  assert.ok(formatUpdateCheck({ latest: '1.0.23', current: '1.0.22', notes: '修提醒里的发布说明' })
+    .includes('\n这版改了什么：修提醒里的发布说明'))
+})
+
+await t('忽略本次 / 没有可忽略的版本：两句文案都说得清下一步', () => {
+  assert.match(formatUpdateSkipped({ version: '1.0.7' }), /1\.0\.7/)
+  assert.match(formatUpdateSkipped({ version: '1.0.7' }), /\/update/, '要告诉主人想装还能装')
+  assert.match(formatNothingToSkip({ current: '1.0.6' }), /1\.0\.6/)
+  assert.match(formatNothingToSkip({ current: '1.0.6' }), /没有等你处理的新版本/)
 })
 
 await t('开始更新 / 已是最新 / 远端更旧 / 正在忙', () => {
   assert.equal(formatUpdating({ version: '1.0.7' }), '正在更新到 1.0.7…')
-  assert.equal(formatAlreadyLatest({ current: '1.0.6' }), '已经是最新版 1.0.6，不用更新')
+  // 1.0.22 起这句必须带上"跑的是/装的是"两边的版本号：主人 2026-10-07 就是被
+  // 「已经是最新版 X」这个**孤立结论**骗了一整天（磁盘 1.0.20、内存 1.0.18）。
+  assert.equal(formatAlreadyLatest({ current: '1.0.6', installed: '1.0.6' }),
+    '已经是最新版 1.0.6，不用更新（现在跑的是 1.0.6，磁盘上装的也是 1.0.6）')
+  assert.equal(formatAlreadyLatest({ current: '1.0.6' }),
+    '已经是最新版 1.0.6，不用更新（现在跑的是 1.0.6，磁盘上装的也是 1.0.6）',
+    '没给磁盘版本时也要说清"现在跑的是哪一版"')
+  assert.equal(formatAlreadyLatest({ current: '1.0.6', installed: '1.0.5' }),
+    '已经是最新版 1.0.6，不用更新（现在跑的是 1.0.6，但磁盘上装的是 1.0.5）',
+    '磁盘与内存不一致必须如实区分，不许含糊过去')
   assert.equal(formatRemoteOlder({ latest: '1.0.5', current: '1.0.6' }), '远端还是 1.0.5，比本机（1.0.6）旧，不用更新')
   assert.match(formatUpdateBusy(), /正在更新中/)
   assert.match(formatUpdateCheck({ latest: '1.0.7', current: '1.0.6' }), /^有新版本 1\.0\.7/)
@@ -1030,7 +1112,8 @@ await t('qqruntime：轮询定时器 unref 且 stop() 里清掉（不吊着进�
 await t('index.js：四个键进了 DEFAULTS、settings schema 与归一化', () => {
   const src = readSrc('index.js')
   for (const key of ['qqUpdateEnabled', 'qqUpdateSource', 'qqUpdateAutoRestart', 'qqUpdateCheckHours']) {
-    assert.match(src, new RegExp(`${key}: (true|false|'[^']+'|6),`), `${key} 要在 DEFAULTS 里`)
+    // 数值型那个（多久查一次）默认是 1 小时 —— 见下面 [7] 组里那条专门守间隔的断言。
+    assert.match(src, new RegExp(`${key}: (true|false|'[^']+'|1),`), `${key} 要在 DEFAULTS 里`)
     assert.match(src, new RegExp(`${key}: z\\.(boolean|string|number)\\(\\)`), `${key} 要在 Config schema 里`)
     assert.match(src, new RegExp(`${key}: `), `${key} 要在归一化块里`)
   }
@@ -1078,7 +1161,433 @@ await t('重启目标是**从命令行认出来的**主程序，不写死任何�
 await t('src/update.js 不引任何外部依赖（宿主要求零依赖，构建脚本也只放行两个）', () => {
   const src = readSrc('update.js')
   const imports = [...src.matchAll(/^import .*from '([^']+)'/gm)].map((m) => m[1])
-  assert.deepEqual(imports.sort(), ['node:child_process', 'node:fs', 'node:os', 'node:path'])
+  // `node:crypto` 是 2026-10-07 新增的：下载安装包后必须**本地**算 sha256
+  // （createHash / randomBytes），仍然是 node 内建，零外部依赖不变。
+  assert.deepEqual(imports.sort(), ['node:child_process', 'node:crypto', 'node:fs', 'node:os', 'node:path'])
+})
+
+// ── [7] 新版本提醒要"推得到、也手动要得着"（1.0.20）─────────────────────────
+// 现场（2026-10-07）：主人 11:14 之后知道有 1.0.19，但 QQ 一条提醒都没收到，也没处点
+// 「忽略本次 / 立即更新」。根因不是提醒坏了，是**时机**：自动提醒只发生在"启动时 +
+// 每 qqUpdateCheckHours 小时"两个时刻，而那天 10:22 启动时线上还是 1.0.18（相等 ⇒ 静默），
+// 1.0.19 是 52 分钟之后才发出去的，下一次检查排在 6 小时以后（16:22）。
+// 所以这一组守两件事：①间隔默认改成 1 小时；②手动 `/update check` 必须把同一条提醒
+// **连同那两个按钮**回给你 —— 等不及的时候有个立刻能要到的办法。
+console.log('\n[7] 新版本提醒：推得到，也手动要得着')
+
+await t('提醒正文说清了「点按钮」和「发 /update」，不能只给一句话', () => {
+  const txt = formatUpdateAvailable({ latest: '1.0.20', current: '1.0.19' })
+  assert.match(txt, /1\.0\.20/)
+  assert.match(txt, /1\.0\.19/, '要说清现在跑的是哪一版')
+  assert.match(txt, /按钮/)
+  assert.match(txt, /\/update/)
+  assert.match(txt, /重启/, '装完要重启这件事必须提前说明白')
+})
+
+await t('提醒底下确实是那两个按钮（忽略本次 / 立即更新），而且点了真能执行', () => {
+  const kb = buildUpdateNoticeKeyboard()
+  const all = kb.content.rows.flatMap((r) => r.buttons)
+  assert.equal(all.length, 2)
+  assert.equal(all[0].render_data.label, '忽略本次')
+  assert.equal(all[1].render_data.label, '立即更新')
+  assert.equal(routeIncoming(all[0].action.data).kind, 'update_skip')
+  assert.equal(routeIncoming(all[1].action.data).kind, 'update')
+})
+
+await t('★ `/update check` 发现新版时，回的就是**带两个按钮的提醒**（不是一句干话）', () => {
+  // 行为跑不动（要真起 DSH 接口 + 真去查远端），所以钉**调用形状**：
+  // 光匹配常量名不够 —— 名字在注释里也出现过（这条纪律踩过坑）。
+  const src = readSrc('qqruntime.js')
+  const at = src.indexOf('if (checkOnly) {')
+  assert.ok(at > 0, 'handleUpdate 里要有 checkOnly 分支')
+  const body = src.slice(at, src.indexOf('if (updating) {', at))
+  assert.match(body, /formatUpdateAvailable\(\{ latest: got\.version, current: env\.version, notes: got\.notes \}\)/,
+    '手动查也要用同一条提醒正文（含"这版改了什么"）')
+  assert.match(body, /buildUpdateNoticeKeyboard\(\)/,
+    '🔴 手动查必须把两个按钮带上 —— 主人 2026-10-07 说的"没办法选择立即更新，或者忽略此版本"就是这条')
+  assert.match(body, /state\.set\(\{ updateNotified: got\.version \}\)/,
+    '手动看过就算提醒过了，几小时后的自动检查别再重复推一遍')
+  assert.match(body, /updateSkipped/, '这一版被忽略过时要说清"这是你手动查的，照样给你看"')
+  assert.doesNotMatch(body, /fetchLatestVersion/, '这一段只负责回执，查版本在分支之前就做完了')
+})
+
+await t('★ 查新版本的默认间隔是 1 小时（6 小时会让新版本最长晾半天）', () => {
+  // 两处必须一起改：DEFAULTS（真正生效的默认值）与 startUpdateCheck 里的兜底。
+  const idx = readSrc('index.js')
+  assert.match(idx, /qqUpdateCheckHours: 1,/, 'DEFAULTS 里必须是 1 —— 这是配置没给值时的真值')
+  assert.doesNotMatch(idx, /qqUpdateCheckHours: 6,/, '别再退回 6 小时')
+  const rt = readSrc('qqruntime.js')
+  const at = rt.indexOf('function startUpdateCheck()')
+  const body = rt.slice(at, rt.indexOf('stopUpdateCheck', at))
+  assert.match(body, /\n      : 1\n/, 'startUpdateCheck 的兜底值也要是 1（否则配置丢了又变回 6）')
+})
+
+await t('帮助里能查到 `/update check`（等不及的时候要知道有这条路）', () => {
+  assert.match(HELP_TEXT, /\/update check/, '帮助里要有这条')
+  assert.equal(routeIncoming('/update check').kind, 'update')
+  assert.equal(routeIncoming('/update check').check, true)
+  assert.equal(routeIncoming('/update').check, false, '不写 check 时仍然是"直接装"')
+})
+
+console.log('\n[8] 「装上了」不等于「在跑」：版本号必须钉在加载那一刻')
+
+await t('提醒文案必须把「装的是 X / 跑的是 Y / 重启才生效」三件事一起说清', () => {
+  const auto = formatPendingRestart({
+    running: '1.0.18', installed: '1.0.20', autoRestart: true, scheduled: true,
+  })
+  assert.match(auto, /装了 1\.0\.20/)
+  assert.match(auto, /跑着的还是 1\.0\.18/, '必须点明内存里跑的是旧的')
+  assert.match(auto, /插件热重载/, '要说出"为什么重启才生效"')
+  assert.match(auto, /重启/)
+  const off = formatPendingRestart({ running: '1.0.18', installed: '1.0.20', autoRestart: false })
+  assert.match(off, /关掉 DSH 再重新打开/, '自动重启关着时要给出人能照做的动作')
+  const failed = formatPendingRestart({
+    running: '1.0.18', installed: '1.0.20', autoRestart: true, scheduled: false,
+  })
+  assert.match(failed, /自动重启没能排上/)
+  // 🔴 三种口径都不许出现「已经是最新版」—— 那正是把主人卡了一整天的句子
+  for (const txt of [auto, off, failed]) assert.doesNotMatch(txt, /已经是最新版/)
+})
+
+await t('★ 版本号在**模块加载时**就钉死：磁盘换新版之后，它必须仍说"跑的是旧的"', async () => {
+  // 在临时目录里造出"一个装在 profile 里的插件"：
+  //   <tmp>/profiles/desktop/node_modules/dsh-remote-qqbot/{package.json, lib/}
+  // 拷的是本仓库**真实的** lib/，只把 package.json 写成 9.9.9 —— import 它
+  // == "9.9.9 这一版被加载进了内存"。这条断言是 1.0.21 的核心，旧代码（第一次用到时现读）
+  // 在这里必红：主人跑 1.0.18、磁盘已是 1.0.20 时，旧代码回答"已是最新版 1.0.20"。
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rev-runtime-'))
+  const modDir = path.join(root, 'profiles', 'desktop', 'node_modules', 'dsh-remote-qqbot')
+  fs.cpSync(path.join(pluginDir, 'lib'), path.join(modDir, 'lib'), { recursive: true })
+  const pkgFile = path.join(modDir, 'package.json')
+  const writePkg = (v) => fs.writeFileSync(pkgFile, JSON.stringify({ name: 'dsh-remote-qqbot', version: v }), 'utf8')
+  try {
+    writePkg('9.9.9')
+    const url = `${pathToFileURL(path.join(modDir, 'lib', 'qqruntime.js')).href}?t=${Date.now()}`
+    const copy = await import(url)
+    const rt = copy.createQqRuntime({ liveConfig: () => ({ qqEnabled: false }), log: () => {} })
+    assert.equal(rt.runningVersion(), '9.9.9', '加载时读到的就是当时磁盘上的版本号')
+    assert.equal(rt.installedVersion(), '9.9.9', '此刻磁盘与内存一致')
+
+    // 模拟"从外面把它升到 9.9.10（CLI 装的），进程没重启"
+    writePkg('9.9.10')
+    assert.equal(rt.runningVersion(), '9.9.9',
+      '🔴 磁盘换成 9.9.10 后，**内存里跑着的**必须仍然是 9.9.9 —— 现读磁盘就会在这里骗人')
+    assert.equal(rt.installedVersion(), '9.9.10', '磁盘上装的那份要如实报告成 9.9.10')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+await t('★ `/update` 先比「磁盘 vs 内存」，再比线上（顺序反了就会回"已经是最新版"）', () => {
+  // 这一段要真联网（查线上版本）才跑得动，所以钉**调用形状**；行为那一面由上一条覆盖。
+  const src = readSrc('qqruntime.js')
+  const at = src.indexOf('async function handleUpdate(')
+  assert.ok(at > 0, '找不到 handleUpdate')
+  const body = src.slice(at, src.indexOf('// 三个分支必须分清', at))
+  assert.match(body, /installedVersionOnDisk\(env\.profile\.profileDir\)/, '要读磁盘上装的那一份')
+  assert.match(body, /compareVersions\(diskVersion, env\.version\) > 0/, '磁盘比内存新就走这一格')
+  assert.match(body, /replyPendingRestart\(/, '这一格必须回人话，不能回"已是最新"')
+  // 顺序才是重点：磁盘那份**将要生效**，所以必须在"去查线上"之前就判掉 ——
+  // 反过来的话，先算版本比较就已经回「已经是最新版」了，根本走不到这一步。
+  const diskAt = body.indexOf('installedVersionOnDisk(')
+  const fetchAt = body.indexOf('fetchLatestVersion(')
+  assert.ok(fetchAt > 0, '这一格后面应当还有查线上版本')
+  assert.ok(diskAt < fetchAt, '🔴 磁盘 vs 内存的判断必须排在查线上之前')
+
+  // `ownVersion()` 不许再"用到的时候现读"
+  const ov = src.slice(src.indexOf('function ownVersion()'), src.indexOf('function updateEnv()'))
+  assert.doesNotMatch(ov, /readPackageVersion/, '🔴 现读磁盘就会在"装完没重启"的窗口里读成新版')
+  assert.match(ov, /RUNNING_VERSION/, '跑的版本号只能来自模块加载时那一次读取')
+})
+
+await t('★ 更新轮询不能塞在 `if (qqEnabled)` 里面（配置没就绪就整块跳过，新版本永远不提醒）', () => {
+  const idx = readSrc('index.js')
+  const guard = idx.indexOf('if (liveConfig().qqEnabled) {')
+  assert.ok(guard > 0, '找不到 QQ 通道的启动块')
+  const blockEnd = idx.indexOf('\n  }\n', guard)
+  assert.ok(blockEnd > guard, '找不到启动块的结尾')
+  assert.doesNotMatch(idx.slice(guard, blockEnd), /startUpdateCheck/,
+    '🔴 一次跳过就再也没有机会：没有启动检查、没有定时器 —— 主人 2026-10-07 报的"不推送通知"')
+  assert.match(idx.slice(blockEnd), /qq\.startUpdateCheck\(\)/, '要挪到 if 外面**无条件**启动')
+
+  // 启动那一刻配置可能还没就绪（checkUpdate 直接返回 qq-disabled），必须隔一会儿补查
+  const rt = readSrc('qqruntime.js')
+  const sc = rt.slice(rt.indexOf('function startUpdateCheck()'), rt.indexOf('stopUpdateCheck'))
+  assert.match(sc, /UPDATE_LATE_RETRY_MS/, '要有补查间隔，不能白等一整个轮询周期')
+  assert.match(sc, /reason === 'qq-disabled'/, '只在"配置还没就绪"这一种情况下补查')
+})
+
+console.log('\n[9] 下载下来的包必须本地校验 sha256（索引与 tgz 同时被换的第二道防线）')
+//
+// 为什么单开一组：审查发现索引里给的 `sha256` 以前只被**发布机**用过，客户端拿到
+// `spec` 就直接 `pnpm add` —— 索引和 tgz 一起被换掉时，地面上没有任何东西会发现。
+// 这一组守四件事：①没有/畸形 sha256 直接拒绝；②对不上就拒绝且不留临时文件；
+// ③索引地址与包地址都只认 https（仅本机回环例外）；④下载失败永不抛。
+
+/** 本地算 sha256（量具与被测量**独立**：测试自己算，不复用被测代码的任何输出）。 */
+const shaOf = (buf) => createHash('sha256').update(buf).digest('hex')
+
+/** 造一个"下载包"的假 fetch：返回给定字节，并记下请求。 */
+function fakePackageFetch({ status = 200, bytes = Buffer.alloc(0), reject = null, noArrayBuffer = false } = {}) {
+  const calls = []
+  const impl = async (url, options) => {
+    calls.push({ url, options })
+    if (reject) throw reject
+    const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      ...(noArrayBuffer ? {} : { arrayBuffer: async () => ab }),
+    }
+  }
+  impl.calls = calls
+  return impl
+}
+
+/** 每次用例一个独立临时目录，收尾整棵删掉（绝不往真临时目录里漏文件）。 */
+const pkgTmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'rev-pkg-'))
+
+const PKG_URL = 'https://cyanovo.top/plugins/dsh-remote-qqbot/dsh-remote-qqbot-9.9.9.tgz'
+
+await t('★ sha256 对得上 ⇒ ok:true，且临时文件里的字节与喂进去的**完全一致**', async () => {
+  const bytes = Buffer.from('这是 tgz 的替身\x00\x01\x02\xff', 'utf8')
+  const sha = shaOf(bytes)
+  const dir = pkgTmpDir()
+  try {
+    const f = fakePackageFetch({ bytes })
+    const got = await fetchAndVerifyPackage({
+      url: PKG_URL, sha256: sha, size: bytes.length, fetchImpl: f, tmpDir: dir,
+    })
+    assert.equal(got.ok, true, got.error)
+    assert.equal(got.bytes, bytes.length)
+    assert.equal(got.sha256, sha)
+    assert.ok(path.isAbsolute(got.file), '要返回绝对路径')
+    assert.match(got.file, /\.tgz$/, '临时文件名必须以 .tgz 结尾（安装命令按扩展名认）')
+    assert.equal(norm(path.dirname(got.file)), norm(dir), '要落在指定的临时目录里')
+    assert.deepEqual(fs.readFileSync(got.file), bytes, '磁盘上的字节必须与喂进去的一模一样')
+    assert.equal(f.calls[0].url, PKG_URL)
+    assert.equal(f.calls[0].options.headers['cache-control'], 'no-cache', '包也不能被中间层缓存住')
+    // 装完之后要能清掉；`removeVerifiedPackage` 不许抛。
+    assert.equal(removeVerifiedPackage(got.file), true)
+    assert.equal(fs.existsSync(got.file), false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+
+  // 不给 tmpDir 时落在系统临时目录
+  const dflt = await fetchAndVerifyPackage({ url: PKG_URL, sha256: sha, fetchImpl: fakePackageFetch({ bytes }) })
+  try {
+    assert.equal(dflt.ok, true, dflt.error)
+    assert.equal(norm(path.dirname(dflt.file)), norm(os.tmpdir()))
+  } finally {
+    removeVerifiedPackage(dflt.file)
+  }
+})
+
+await t('★ sha256 对不上 ⇒ 拒绝安装、文案点出 sha256（期望+实际前几位），且临时文件不留下', async () => {
+  const bytes = Buffer.from('真的包')
+  const wrong = shaOf(Buffer.from('另一个包'))
+  const dir = pkgTmpDir()
+  try {
+    const got = await fetchAndVerifyPackage({
+      url: PKG_URL, sha256: wrong, fetchImpl: fakePackageFetch({ bytes }), tmpDir: dir,
+    })
+    assert.equal(got.ok, false)
+    assert.match(got.error, /sha256/, '错误文案必须含 sha256 —— 让人一眼看出是校验问题')
+    assert.match(got.error, /校验不通过，已拒绝安装/)
+    assert.ok(got.error.includes(wrong.slice(0, SHA256_PREVIEW_CHARS)), '要给期望的摘要前若干位')
+    assert.ok(got.error.includes(shaOf(bytes).slice(0, SHA256_PREVIEW_CHARS)), '也要给实际算出来的前若干位')
+    assert.deepEqual(fs.readdirSync(dir), [], '🔴 拒绝安装后临时目录必须是空的（半个包也不能留）')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await t('★ 索引缺 sha256 ⇒ 直接拒绝，**连请求都不发**（这是我们自己的发布通道，索引必须带校验位）', async () => {
+  for (const missing of ['', '   ', undefined, null]) {
+    const f = fakePackageFetch({ bytes: Buffer.from('x') })
+    const got = await fetchAndVerifyPackage({ url: PKG_URL, sha256: missing, fetchImpl: f })
+    assert.equal(got.ok, false, `sha256=${JSON.stringify(missing)} 必须被拒`)
+    assert.match(got.error, /sha256/, '文案里必须出现 sha256')
+    assert.match(got.error, /没有 sha256/)
+    assert.equal(f.calls.length, 0, '校验位都没有，不该发请求')
+  }
+})
+
+await t('★ sha256 不是 64 位十六进制 ⇒ 拒绝（大小写都认，长度/字符错都拒）', async () => {
+  for (const bad of ['abc', 'z'.repeat(64), 'a'.repeat(63), 'a'.repeat(65), `${'a'.repeat(63)}!`]) {
+    const f = fakePackageFetch({ bytes: Buffer.from('x') })
+    const got = await fetchAndVerifyPackage({ url: PKG_URL, sha256: bad, fetchImpl: f })
+    assert.equal(got.ok, false, `${bad.slice(0, 8)}… 必须被拒`)
+    assert.match(got.error, /sha256/)
+    assert.match(got.error, /64 位十六进制/)
+    assert.equal(f.calls.length, 0, '格式就不对，不该发请求')
+  }
+  // 大写写法是合法的十六进制，必须放行（否则从别处复制来的索引会被误杀）
+  const bytes = Buffer.from('大写摘要')
+  const upper = shaOf(bytes).toUpperCase()
+  const ok = await fetchAndVerifyPackage({ url: PKG_URL, sha256: upper, fetchImpl: fakePackageFetch({ bytes }) })
+  try {
+    assert.equal(ok.ok, true, ok.error)
+    assert.equal(ok.sha256, shaOf(bytes), '返回的摘要统一是小写')
+  } finally {
+    removeVerifiedPackage(ok.file)
+  }
+})
+
+await t('★ http:// 索引默认拒绝，只有本机回环放行（http://example.com 与伪装回环的域名都要拒）', () => {
+  const bad = parseUpdateSource('http://example.com/update.json')
+  assert.equal(bad.ok, false)
+  assert.match(bad.error, /https/)
+  assert.match(bad.error, /回环/, '要告诉用户为什么 http 不行、例外是什么')
+  assert.equal(parseUpdateSource('https://example.com/update.json').ok, true, 'https 照旧')
+
+  for (const host of ['127.0.0.1:8080', 'localhost:8080', '[::1]:8080']) {
+    const r = parseUpdateSource(`http://${host}/update.json`)
+    assert.equal(r.ok, true, `${host} 是本机回环，应当放行`)
+    assert.equal(r.kind, 'manifest')
+  }
+
+  // 主机名必须精确匹配：`localhost.evil.com` 这种"看起来像回环"的外网域名一个字都不能放过
+  for (const evil of ['http://127.0.0.1.evil.com/update.json', 'http://localhost.evil.com/update.json']) {
+    assert.equal(parseUpdateSource(evil).ok, false, `${evil} 不是回环地址`)
+  }
+})
+
+await t('★ 索引里的 url 是 http://example.com/x.tgz ⇒ versionFromManifestResponse 抛错（回环仍放行）', () => {
+  assert.throws(
+    () => versionFromManifestResponse({ version: '1.0.9', url: 'http://example.com/x.tgz' }),
+    /不是 https/,
+  )
+  assert.throws(
+    () => versionFromManifestResponse({ version: '1.0.9', url: 'http://example.com/x.tgz' }),
+    /https/,
+  )
+  assert.equal(
+    versionFromManifestResponse({ version: '1.0.9', url: 'https://example.com/x.tgz' }),
+    '1.0.9',
+  )
+  assert.equal(
+    versionFromManifestResponse({ version: '1.0.9', url: 'http://127.0.0.1:8080/x.tgz' }),
+    '1.0.9',
+    '本机回环允许走 http（本地测试源）',
+  )
+})
+
+await t('★ 索引给的 size 与实际字节数不符 ⇒ 拒绝安装，且临时文件不留下（size=0 表示不比对）', async () => {
+  const bytes = Buffer.from('1234567890')
+  const sha = shaOf(bytes)
+  const dir = pkgTmpDir()
+  try {
+    const got = await fetchAndVerifyPackage({
+      url: PKG_URL, sha256: sha, size: bytes.length + 1, fetchImpl: fakePackageFetch({ bytes }), tmpDir: dir,
+    })
+    assert.equal(got.ok, false)
+    assert.match(got.error, /已拒绝安装/)
+    assert.match(got.error, new RegExp(String(bytes.length + 1)), '要说清索引说的字节数')
+    assert.match(got.error, new RegExp(`实际 ${bytes.length} 字节`), '也要说清实际拿到多少字节')
+    assert.deepEqual(fs.readdirSync(dir), [], '长度不符同样不许留临时文件')
+
+    // size 缺省 / 0（老索引没有这个字段）⇒ 跳过长度比对，别把好包误杀
+    for (const none of [0, undefined, '']) {
+      const r = await fetchAndVerifyPackage({
+        url: PKG_URL, sha256: sha, size: none, fetchImpl: fakePackageFetch({ bytes }), tmpDir: dir,
+      })
+      assert.equal(r.ok, true, `size=${JSON.stringify(none)} 时应当只比 sha256`)
+      removeVerifiedPackage(r.file)
+    }
+    assert.deepEqual(fs.readdirSync(dir), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await t('★ 下载失败**永不抛**：网络错 / 超时 / 缺 arrayBuffer / HTTP 4xx / 地址不对，一律 {ok:false}', async () => {
+  const bytes = Buffer.from('x')
+  const sha = shaOf(bytes)
+
+  const logs = []
+  const net = await fetchAndVerifyPackage({
+    url: PKG_URL,
+    sha256: sha,
+    fetchImpl: fakePackageFetch({ reject: Object.assign(new Error('socket hang up'), { name: 'FetchError' }) }),
+    log: (m) => logs.push(m),
+  })
+  assert.equal(net.ok, false)
+  assert.match(net.error, /socket hang up/)
+  assert.equal(logs.length, 1, '下载失败要留一条日志')
+  assert.match(logs[0], /下载安装包失败/)
+
+  const timeout = await fetchAndVerifyPackage({
+    url: PKG_URL,
+    sha256: sha,
+    timeoutMs: 5000,
+    fetchImpl: fakePackageFetch({ reject: Object.assign(new Error('timed out'), { name: 'TimeoutError' }) }),
+  })
+  assert.equal(timeout.ok, false)
+  assert.match(timeout.error, /下载超时（5 秒）/, '超时文案要与查版本那次同风格，不能把 AbortError 原文抛出去')
+
+  const noAb = await fetchAndVerifyPackage({ url: PKG_URL, sha256: sha, fetchImpl: fakePackageFetch({ bytes, noArrayBuffer: true }) })
+  assert.equal(noAb.ok, false)
+  assert.match(noAb.error, /arrayBuffer/)
+  assert.match(noAb.error, /已拒绝安装/, '拿不到字节就是校验不了，不能硬猜')
+
+  const http404 = await fetchAndVerifyPackage({ url: PKG_URL, sha256: sha, fetchImpl: fakePackageFetch({ status: 404, bytes }) })
+  assert.equal(http404.ok, false)
+  assert.match(http404.error, /HTTP 404/)
+
+  const notUrl = fakePackageFetch({ bytes })
+  const badUrl = await fetchAndVerifyPackage({ url: 'file:///x.tgz', sha256: sha, fetchImpl: notUrl })
+  assert.equal(badUrl.ok, false)
+  assert.match(badUrl.error, /不是 http\(s\)/)
+  assert.equal(notUrl.calls.length, 0, '地址就不合法，不该发请求')
+
+  const evilHttp = fakePackageFetch({ bytes })
+  const plainHttp = await fetchAndVerifyPackage({ url: 'http://example.com/x.tgz', sha256: sha, fetchImpl: evilHttp })
+  assert.equal(plainHttp.ok, false)
+  assert.match(plainHttp.error, /回环/)
+  assert.equal(evilHttp.calls.length, 0, '公网 http 地址不许发请求（与索引同口径）')
+})
+
+await t('★ fetchLatestVersion 要把索引里的 size 带回来（缺了是 0，既有字段一个不少）', async () => {
+  const url = 'https://cyanovo.top/plugins/dsh-remote-qqbot/dsh-remote-qqbot-9.9.9.tgz'
+  const body = { version: '9.9.9', url, sha256: 'a'.repeat(64) }
+
+  const got = await fetchLatestVersion({
+    source: DEFAULT_UPDATE_SOURCE,
+    fetchImpl: fakeFetch({ body: { ...body, size: 200700, notes: '补校验' } }),
+  })
+  assert.equal(got.ok, true)
+  assert.equal(got.size, 200700, '下载校验要用它当长度证据')
+  assert.equal(got.spec, url, '既有字段一个都不能变')
+  assert.equal(got.sha256, 'a'.repeat(64))
+  assert.equal(got.notes, '补校验')
+  assert.equal(got.version, '9.9.9')
+  assert.equal(got.kind, 'manifest')
+  assert.equal(got.url, DEFAULT_UPDATE_SOURCE)
+
+  const none = await fetchLatestVersion({ source: DEFAULT_UPDATE_SOURCE, fetchImpl: fakeFetch({ body }) })
+  assert.equal(none.size, 0, '老索引没有 size ⇒ 0（= 不比对长度），不是 undefined 崩掉调用方')
+
+  const junk = await fetchLatestVersion({ source: DEFAULT_UPDATE_SOURCE, fetchImpl: fakeFetch({ body: { ...body, size: '很大' } }) })
+  assert.equal(junk.size, 0, '类型不对也当没给')
+
+  const npm = await fetchLatestVersion({ source: 'dsh-remote-qqbot', fetchImpl: fakeFetch({ body: { version: '9.9.9' } }) })
+  assert.equal(npm.size, 0, 'github / npm 源没有这个概念')
+})
+
+await t('removeVerifiedPackage 尽力而为：不存在的文件 / 空路径都只返回 false，绝不抛', () => {
+  assert.equal(removeVerifiedPackage(''), false)
+  assert.equal(removeVerifiedPackage(path.join(os.tmpdir(), 'rev-绝对不存在的包-9.9.9.tgz')), false)
+  const dir = pkgTmpDir()
+  try {
+    const file = path.join(dir, 'x.tgz')
+    fs.writeFileSync(file, 'x')
+    assert.equal(removeVerifiedPackage(file), true)
+    assert.equal(removeVerifiedPackage(file), false, '删过一次之后再删就是 false')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} update 组：${pass} 通过 / ${fail} 失败`)

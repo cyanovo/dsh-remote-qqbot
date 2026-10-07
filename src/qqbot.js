@@ -203,9 +203,16 @@ export class QqBotClient {
    * 客户端/平台侧可能不被接受（权限、内容、长度），所以**失败会自动退回纯文本重发**：
    * 通知必须送到，折叠只是锦上添花。
    *
+   * [keyboard] 是「消息按钮」（QQ 里那种可点的文字，见 docs/ARCHITECTURE.md 6.8）。
+   * ⚠️ 按钮**只能挂在 markdown 消息上**（官方：在 markdown 消息的基础上挂按钮），
+   * 所以传了 keyboard 就强制走 markdown 通路；markdown 发失败退回纯文本时
+   * **按钮一起丢**（宁可少两个按钮，也不能让整条消息发不出去）—— 会在日志里写明。
+   *
+   * @param {{msgId?: string, msgSeq?: number, isWakeup?: boolean, markdown?: boolean,
+   *   keyboard?: object|null}} [opts]
    * @returns {Promise<{id: string, timestamp: string}>}
    */
-  async sendC2C(openId, content, { msgId, msgSeq, isWakeup, markdown } = {}) {
+  async sendC2C(openId, content, { msgId, msgSeq, isWakeup, markdown, keyboard } = {}) {
     const extra = {}
     if (msgId) {
       extra.msg_id = msgId
@@ -214,11 +221,23 @@ export class QqBotClient {
       extra.is_wakeup = true
     }
 
-    if (markdown === true && String(content).length <= MARKDOWN_MAX_CHARS) {
+    // 带按钮 ⇒ 必须 markdown（msg_type=2）；内容超长时按钮只能放弃。
+    const wantKeyboard = keyboard !== undefined && keyboard !== null
+    const fits = String(content).length <= MARKDOWN_MAX_CHARS
+    if (wantKeyboard && !fits) {
+      this.log('info', `内容 ${String(content).length} 字超过 markdown 上限 ${MARKDOWN_MAX_CHARS}，`
+        + '这条不带按钮发（按钮只能挂在 markdown 消息上）')
+    }
+    const useKeyboard = wantKeyboard && fits
+
+    if ((markdown === true || wantKeyboard) && fits) {
       try {
-        return await this.postC2C(openId, { msg_type: 2, markdown: { content }, ...extra })
+        const body = { msg_type: 2, markdown: { content }, ...extra }
+        if (useKeyboard) body.keyboard = keyboard
+        return await this.postC2C(openId, body)
       } catch (err) {
-        this.log('info', `markdown 消息发送失败（${logSafe(err?.message ?? err)}），改用纯文本重发`)
+        this.log('info', `markdown 消息发送失败（${logSafe(err?.message ?? err)}），改用纯文本重发`
+          + (useKeyboard ? '（按钮一并丢掉）' : ''))
       }
     }
     return this.postC2C(openId, { content, msg_type: 0, ...extra })

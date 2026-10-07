@@ -24,7 +24,7 @@ import path from 'node:path'
 
 import {
   BotState, PICKER_DEFAULT_COUNT, PICK_WINDOW_MS, formatPickAck,
-  formatSessionPickerText, formatStatusText, isPickerFresh, routeMessage, summarizeSession,
+  formatSessionPickerText, formatStatusText, isPickerFresh, pickerAge, routeMessage, summarizeSession,
 } from '../src/qqbridge.js'
 
 let pass = 0
@@ -73,7 +73,7 @@ console.log('\n[1] formatSessionPickerText —— 列表怎么排，编号就是
 await t('编号从 1 开始、条数正好 6、顺序照传入（已按最近活动倒序）', () => {
   const text = formatSessionPickerText({ sessions: SIX })
   const lines = text.split('\n')
-  assert.equal(lines[0], '🗂 最近在聊的 6 个会话（回个数字切过去）', lines[0])
+  assert.equal(lines[0], '🗂 最近在聊的 6 个会话（点下面的按钮，或者发 /use 数字）', lines[0])
   for (let i = 1; i <= 6; i += 1) {
     assert.ok(lines.some((l) => l.startsWith(`${i}. `)), `缺少第 ${i} 行：\n${text}`)
   }
@@ -160,8 +160,20 @@ await t('刚发过名单 + 在时间窗内 → 有效', () => {
   assert.equal(isPickerFresh({ pickerAt: NOW - 1000, ids: ['a', 'b'] }, NOW), true)
 })
 
-await t(`超过 ${PICK_WINDOW_MS / 60000} 分钟 → 失效（此后数字恢复成普通文本）`, () => {
+await t(`超过 ${PICK_WINDOW_MS / 60000} 分钟 → 失效（此后数字**不再**被当成选会话）`, () => {
   assert.equal(isPickerFresh({ pickerAt: NOW - PICK_WINDOW_MS - 1, ids: ['a'] }, NOW), false)
+})
+
+await t('pickerAge：区分"没有名单"（null）和"名单太老"（毫秒数）', () => {
+  // 这两种情况要给不一样的回话 —— 前者"先发 /task"，后者"你回的数字对上了
+  // N 分钟前那份名单，它作废了"。混成一种就会让主人以为是自己记错了。
+  assert.equal(pickerAge({ pickerAt: NOW, ids: [] }, NOW), null, '空名单 = 没有名单')
+  assert.equal(pickerAge({ pickerAt: 0, ids: ['a'] }, NOW), null, '没有发榜时刻 = 没有名单')
+  assert.equal(pickerAge({}, NOW), null)
+  assert.equal(pickerAge(null, NOW), null)
+  assert.equal(pickerAge({ pickerAt: NOW - 24 * 60 * 1000, ids: ['a'] }, NOW), 24 * 60 * 1000)
+  // 时钟回拨（pickerAt 在未来）不许算出负数 —— 负数会让"多久前"说成"负 N 分钟前"。
+  assert.equal(pickerAge({ pickerAt: NOW + 60000, ids: ['a'] }, NOW), 0)
 })
 
 await t('没发过名单 / 名单是空的 → 失效（名单与时刻缺一不可）', () => {
@@ -171,56 +183,91 @@ await t('没发过名单 / 名单是空的 → 失效（名单与时刻缺一不
   assert.equal(isPickerFresh(null, NOW), false)
 })
 
-console.log('\n[3] routeMessage 优先级 —— 这里是整条链路最容易出错的地方')
+console.log('\n[3] routeMessage —— 只认三件事：`/` 指令、引用、其余一律闲聊（1.0.24）')
 
-await t('★ 有提问在等 + 回「1」→ 作答，**不是**选会话', () => {
-  const r = routeMessage({
-    text: '1', refIdx: '', hasPendingQuestion: true, refTarget: null, pickerActive: true,
-  })
-  assert.equal(r.kind, 'answer', 'agent 卡在提问上等这个 1，绝不能拿去切会话')
-  assert.equal(r.text, '1')
+// ⚠️ 这一节 2026-10-07 被**整节重写**过。以前这里有三种"抢消息"的规则（有提问在等就当作答、
+//    刚看过名单的纯数字就是选择、别的纯数字拦下来问一句）。主人当天明确要求
+//    「只要我不引用信息或者信息前边不带 / 的命令就是闲聊，无论任何情况」，三条全删。
+//    所以这里的断言方向**反过来了**：数字必须落到 chat，而不是 stray_number/answer/pick。
+await t('★ 不引用、不带 / → 一律闲聊：纯数字、带 @机器人 前缀的、什么怪话都算', () => {
+  for (const text of ['2', '0', '12', '2026', '在吗', '派 2', '-1', '@机器人 你好']) {
+    const r = routeMessage({ text, refIdx: '', refTarget: null })
+    assert.equal(r.kind, 'chat', `「${text}」必须当闲聊`)
+    assert.equal(r.text, text, '正文原样带上')
+  }
 })
 
-await t('★ 有引用 + 回「2」→ 回到被引用的那个会话，选会话让位', () => {
+await t('★ 有提问在等 + 回「1」→ 也是闲聊（不再自动当作答）；要回答得**引用**或发 /answer', () => {
+  const plain = routeMessage({ text: '1', refIdx: '', hasPendingQuestion: true, refTarget: null })
+  assert.equal(plain.kind, 'chat', '1.0.24 起"有提问在等"不再抢消息 —— agent 可能多等一轮，这条是主人拍板的代价')
+
+  // 引用那条提问 → 仍然是作答（精确到 askId）
+  const quoted = routeMessage({
+    text: '1', refIdx: 'REFIDX_ask', hasPendingQuestion: true,
+    refTarget: { kind: 'question', askId: 'ask-1', sessionId: 's1', session: '主' },
+  })
+  assert.equal(quoted.kind, 'answer')
+  assert.equal(quoted.askId, 'ask-1')
+
+  // 显式指令 → 也是作答（提问下面的按钮发的就是它）
+  const explicit = routeMessage({ text: '/answer 1', hasPendingQuestion: true })
+  assert.equal(explicit.kind, 'answer')
+  assert.equal(explicit.text, '1')
+})
+
+await t('★ 刚发过名单 + 纯数字 → 还是闲聊；选名单改用按钮或 /pick、/open', () => {
+  const r = routeMessage({ text: '3', refIdx: '', hasPendingQuestion: false, refTarget: null })
+  assert.equal(r.kind, 'chat', '数字不再被解释成"选名单里的第 3 个"')
+  // 那三条路都还在，只是必须显式说出来
+  assert.equal(routeMessage({ text: '/pick 3' }).kind, 'pick_workspace')
+  assert.equal(routeMessage({ text: '/pick 3' }).index, 3)
+  assert.equal(routeMessage({ text: '/open 3' }).kind, 'pick_task_session')
+  assert.equal(routeMessage({ text: '/use 3' }).kind, 'pick_session')
+})
+
+await t('★ 老的三个"名单新鲜"开关已经不生效了（传进来也只当没看见）', () => {
+  // 这三个参数是 1.0.23 及以前的抢消息依据。留着它们的原因是防止"悄悄回退" ——
+  // 谁要是哪天把规则加回来，这条断言会先报红。
   const r = routeMessage({
-    text: '2',
-    refIdx: 'REFIDX_x',
-    hasPendingQuestion: false,
+    text: '2', refIdx: '', hasPendingQuestion: false, refTarget: null,
+    pickerActive: true, workspacePickerActive: true, taskSessionPickerActive: true,
+  })
+  assert.equal(r.kind, 'chat', '名单新鲜也不能把一句闲聊变成"选项"')
+})
+
+await t('★ 有引用 → 回到被引用的那个会话（这条永远在闲聊之前）', () => {
+  const r = routeMessage({
+    text: '2', refIdx: 'REFIDX_x', hasPendingQuestion: false,
     refTarget: { sessionId: 's9', session: '主会话', kind: 'prompt' },
-    pickerActive: true,
   })
   assert.equal(r.kind, 'prompt')
   assert.equal(r.sessionId, 's9')
+  // hasQuote 单独给 true 时也要走引用那条路（引用到了、但索引没拿到）
+  const noIdx = routeMessage({
+    text: '接着说', refIdx: '', hasQuote: true, refTarget: { sessionId: 's8', kind: 'prompt' },
+  })
+  assert.equal(noIdx.kind, 'prompt')
+  assert.equal(noIdx.sessionId, 's8')
 })
 
-await t('刚看过名单 + 回「3」→ 选第 3 个会话', () => {
-  const r = routeMessage({
-    text: '3', refIdx: '', hasPendingQuestion: false, refTarget: null, pickerActive: true,
-  })
-  assert.equal(r.kind, 'pick_session')
-  assert.equal(r.index, 3)
+await t('★ 引用我的截图 / 认不出的消息 → 各有一句人话，绝不静默进会话', () => {
+  assert.equal(routeMessage({
+    text: '看这个', refIdx: 'R', hasQuote: true, refTarget: { kind: 'screen' },
+  }).kind, 'screen_ref')
+  assert.equal(routeMessage({
+    text: '看这个', refIdx: 'R', hasQuote: true, refTarget: null,
+  }).kind, 'unknown_ref')
 })
 
-await t('回「0」→ 也是一次选择（0 = 取消指定）', () => {
-  const r = routeMessage({
-    text: '0', refIdx: '', hasPendingQuestion: false, refTarget: null, pickerActive: true,
-  })
-  assert.equal(r.kind, 'pick_session')
-  assert.equal(r.index, 0)
+await t('显式指令最优先，压过引用与提问', () => {
+  const r = routeMessage({ text: '/task', refIdx: 'REFIDX_a', hasPendingQuestion: true, hasQuote: true })
+  assert.equal(r.kind, 'task_workspaces', '/task 不能被引用或提问带偏')
 })
 
-await t('没看过名单时回「3」→ 还是闲聊（数字不能凭空变成选会话）', () => {
-  const r = routeMessage({
-    text: '3', refIdx: '', hasPendingQuestion: false, refTarget: null, pickerActive: false,
-  })
-  assert.equal(r.kind, 'chat')
-})
-
-await t('名单有效期内回一句非数字 → 仍然是闲聊', () => {
-  const r = routeMessage({
-    text: '在吗', refIdx: '', hasPendingQuestion: false, refTarget: null, pickerActive: true,
-  })
-  assert.equal(r.kind, 'chat')
+await t('空消息 / 只有空白 → ignore（不投递、也不回话）', () => {
+  assert.equal(routeMessage({ text: '' }).kind, 'ignore')
+  assert.equal(routeMessage({ text: '   ' }).kind, 'ignore')
+  assert.equal(routeMessage({}).kind, 'ignore')
 })
 
 await t('/sessions → 列名单；/sessions 3 与 /use 3 等价；都不是"闲聊"', () => {

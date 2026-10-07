@@ -43,6 +43,12 @@ for (const s of ['登录 / 注册', '直接发到 QQ', '只存服务器', '100 �
   check(`首页写了「${s}」`, ov.includes(s))
 }
 check('额度/模式/兑换卡都在账号页里', /id="quotaCard"/.test(acc) && /id="modesCard"/.test(acc) && /id="payCard"/.test(acc))
+/* 2026-10-05 补：首页「怎么装」以前写的是"插件没有发布到 npm，安装命令见教程第 2 章"，
+   而插件其实早已上了 GitHub（还能让 DSH 自己装）。这条钉住"首页必须给出真实可照做的两种装法"，
+   防止首页再次落后于教程。 */
+check('★ 首页「怎么装」给了 GitHub 一条命令', ov.includes('dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot'))
+check('★ 首页「怎么装」指向教程第 2 章（复制给 DSH 的一键安装在那里）', /href="#docs\/install"/.test(ov))
+check('★ 首页「怎么装」说了装完要重启', /重启 DSH/.test(ov))
 
 // 2026-10-04 新增：教程文档页（第五个视图）。线上必须有这一栏的骨架，
 // 否则「教程文档」点下去就是空白 —— 这是它最低限度的存在性证明。
@@ -52,6 +58,22 @@ check('★ 教程文档那一段切出来了（左章节/中正文/右目录）'
   docs.length > 300 && /id="docsNav"/.test(docs) && /id="docsBody"/.test(docs) && /id="docsToc"/.test(docs),
   `实际 ${docs.length} 字`)
 check('教程页的样式与脚本都挂上了', /href="\/docs\.css"/.test(html) && /src="\/docs\.js"/.test(html) && /src="\/docs-figs\.js"/.test(html))
+
+/* 2026-10-07 补：官网上必须有**插件仓库**的入口。
+   在这之前三处 GitHub 文字指的都是个人主页 @cyanovo，访客看不到插件源码；
+   而首页「怎么装」里那条命令本身就是从这个仓库装的。
+   三处分别是：首页「怎么装」、说明页「联系方式」、页脚（窄屏下侧栏是抽屉，只有页脚各视口都在）。 */
+const REPO = 'https://github.com/cyanovo/dsh-remote-qqbot'
+const about = seg('about')
+const foot = (html.match(/<footer[\s\S]*?<\/footer>/) || [''])[0]
+check('★ 首页「怎么装」里有插件仓库地址', ov.includes(REPO))
+check('★ 说明页「联系方式」里有插件仓库地址', about.includes(REPO))
+check('★ 页脚有插件源码入口', foot.includes(REPO))
+const repoAnchors = [...html.matchAll(/<a [^>]*github\.com\/cyanovo\/dsh-remote-qqbot[^>]*>/g)].map((m) => m[0])
+check('★ 仓库链接在整份首页里出现 3 处（怎么装 / 联系方式 / 页脚）', repoAnchors.length >= 3, `实际 ${repoAnchors.length} 处`)
+check('每处仓库链接都是新窗口打开且带 rel=noopener（不把访客顶出本站）',
+  repoAnchors.length > 0 && repoAnchors.every((a) => a.includes('target="_blank"') && a.includes('rel="noopener')),
+  JSON.stringify(repoAnchors))
 
 // 静态资源：线上那份必须与本地**逐字节一致**
 for (const [url, rel] of [

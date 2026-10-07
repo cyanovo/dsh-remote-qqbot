@@ -240,12 +240,13 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 文本/数字/密码输入行。 */
-    function TextField({ spec, value, onChange, secretSet }) {
+    /** 文本/数字/密码输入行。`readOnly` 用于「只能手改配置文件」的字段（见 config-api 的安全说明）。 */
+    function TextField({ spec, value, onChange, secretSet, readOnly }) {
       const isSecret = spec.type === 'secret'
       return h('input', {
         type: isSecret ? 'password' : (spec.type === 'number' ? 'number' : 'text'),
         value: value ?? '',
+        readOnly: readOnly === true,
         placeholder: isSecret && secretSet ? '已设置（留空表示不修改）' : (spec.placeholder ?? ''),
         onChange: (event) => onChange(spec.type === 'number' ? event.target.value : event.target.value),
         autoComplete: 'off',
@@ -254,11 +255,12 @@ window.__ModuleLoader__.load({
           width: '100%',
           padding: '7px 10px',
           fontSize: 13,
-          color: T.text,
-          background: T.surfaceSoft,
+          color: readOnly === true ? T.textDim : T.text,
+          background: readOnly === true ? 'transparent' : T.surfaceSoft,
           border: `1px solid ${T.border}`,
           borderRadius: 8,
           outline: 'none',
+          cursor: readOnly === true ? 'not-allowed' : 'text',
         }),
       })
     }
@@ -291,8 +293,20 @@ window.__ModuleLoader__.load({
         try {
           const result = await save(draft)
           setDraft({})
-          setStatus(result?.applied?.length ? `已保存（${result.applied.length} 项）` : '没有改动')
+          const rejected = Array.isArray(result?.rejected) ? result.rejected : []
+          if (rejected.length > 0) {
+            // 被拒的键（cloudUrl / hubUrl / qqUpdateSource 只能手改配置文件）：
+            // 必须说出来。后端拒了、界面却报「已保存」，等于让用户以为自己改成功了。
+            setStatus(`已保存 ${result?.applied?.length ?? 0} 项；另有 ${rejected.length} 项没改`
+              + `（${rejected.map((row) => row.key).join('、')} 只能手改配置文件）`)
+          } else {
+            setStatus(result?.applied?.length ? `已保存（${result.applied.length} 项）` : '没有改动')
+          }
         } catch (error) {
+          // 失败时**必须把草稿丢掉**：留着草稿就是"界面显示你点的那个值、后端还是旧值"，
+          // 开关会停在你点的那一侧而与真实配置相反。save() 失败时已经 publish 了服务端视图，
+          // 清掉草稿正好让界面回到真值。
+          setDraft({})
           setStatus(`保存失败：${String(error?.message ?? error)}`)
         } finally {
           setBusy(false)
@@ -312,6 +326,8 @@ window.__ModuleLoader__.load({
       const groups = spec.groups ?? []
       const fields = spec.fields ?? []
       const statusRows = Array.isArray(spec.status) ? spec.status : []
+      const pushField = fields.find((field) => field.key === 'qqNotifyEnabled')
+      const pushOn = valueOf('qqNotifyEnabled') !== false
 
       return h('div', { style: style({ maxWidth: 720, padding: '4px 2px 24px' }) },
         h('div', { style: style({ marginBottom: 18 }) },
@@ -319,6 +335,42 @@ window.__ModuleLoader__.load({
           h('div', { style: style({ marginTop: 4, fontSize: 12.5, color: T.textDim, lineHeight: 1.6 }) },
             '手机 QQ 上的完成/提问/出错提醒，以及 agentmd 操作日志与上下文注入。'),
         ),
+
+        // ── 接收 QQ 推送（主人 2026-10-07 点名要的那个开关）─────────────────
+        // 它本来就在下面「QQ 机器人通道」分组里（键 qqNotifyEnabled），但排在 qqEnabled
+        // 后面、混在二十多个字段中间，不好找。这里把它单独提到最上面一张卡 ——
+        // 「要不要收推送」是抬手就要按的决定，不该让人在字段表里翻。
+        // 同时下面分组里不再重复渲染同一个键（同一个开关在一屏里出现两次最容易让人困惑）。
+        pushField
+          ? h('section', { key: 'push-switch', style: style({ marginBottom: 22 }) },
+            h('div', {
+              style: style({
+                display: 'flex', alignItems: 'center', gap: 16, padding: '14px 16px',
+                border: `1px solid ${T.border}`, borderRadius: 12, background: T.surface,
+              }),
+            },
+            h('div', { style: style({ flex: '1 1 auto', minWidth: 0 }) },
+              h('div', { style: style({ fontSize: 14, fontWeight: 600, color: T.text }) }, pushField.label),
+              h('div', { style: style({ marginTop: 4, fontSize: 12, color: T.textDim, lineHeight: 1.6 }) },
+                pushField.description),
+              state.status === 'ready' && !pushOn
+                ? h('div', { style: style({ marginTop: 6, fontSize: 12, color: T.warn }) },
+                  '现在是关的：我不会主动推任何消息给你（QQ 长连接与反向对话照旧）。')
+                : null,
+            ),
+            h(Toggle, {
+              // ⚠️ 这里**不能**写成 `=== true`：host 侧没给值时 configView 回的是 null，
+              //    那样界面会显示成"关"，而插件实际按"缺省视为开"在推（runtime 与运行状态
+              //    那行用的都是 `=== false` 才关）。开关的显示必须跟行为用同一条判据。
+              checked: pushOn,
+              label: pushField.label,
+              onChange: (next) => setField('qqNotifyEnabled', next),
+            }),
+            ),
+            h('div', { style: style({ marginTop: 6, fontSize: 11.5, color: T.textFaint }) },
+              '输入框旁边那个「QQ 提醒已开 / 已关」是同一个开关，两处任一处改了立刻生效。'),
+          )
+          : null,
 
         // ── 运行状态（只读）───────────────────────────────────────────────
         // 主人 2026-10-03：「除了 QQ 提醒已开、协作已开，剩下的放到设置里就行」。
@@ -351,7 +403,9 @@ window.__ModuleLoader__.load({
           : null,
 
         ...groups.map((group) => {
-          const rows = fields.filter((field) => field.group === group.id)
+          // `qqNotifyEnabled` 已经在最上面那张「接收 QQ 推送」卡里渲染过了 ——
+          // 同一个开关在一屏里出现两次最容易让人以为"改了没生效"。
+          const rows = fields.filter((field) => field.group === group.id && field.key !== 'qqNotifyEnabled')
           if (rows.length === 0) return null
           return h('section', { key: group.id, style: style({ marginBottom: 22 }) },
             h('div', { style: style({ fontSize: 13, fontWeight: 600, color: T.text }) }, group.title),
@@ -379,7 +433,18 @@ window.__ModuleLoader__.load({
               h('div', {
                 style: style({ fontSize: 13, color: T.text }),
                 title: `settings.yaml 字段：${field.key}`,
-              }, field.label),
+              }, field.label,
+              // 「只能手改配置文件」的字段（cloudUrl / hubUrl / qqUpdateSource）：
+              // 这是一条**安全边界**，不是权限偏好 —— 见 config-api.js 文件头「越权防护」。
+              // 界面上照样显示当前值，但输入框只读、保存时不带它。
+              field.manualOnly === true
+                ? h('span', {
+                  style: style({
+                    marginLeft: 8, padding: '1px 6px', fontSize: 11, borderRadius: 6,
+                    color: T.warn, border: `1px solid ${T.warn}`, whiteSpace: 'nowrap',
+                  }),
+                }, '只能手改配置文件')
+                : null),
               field.description
                 ? h('div', { style: style({ marginTop: 3, fontSize: 11.5, color: T.textFaint, lineHeight: 1.55 }) }, field.description)
                 : null,
@@ -395,6 +460,7 @@ window.__ModuleLoader__.load({
                   spec: field,
                   value: valueOf(field.key),
                   secretSet: spec.secretsSet?.[field.key] === true,
+                  readOnly: field.manualOnly === true,
                   onChange: (next) => setField(field.key, next),
                 }),
             ),

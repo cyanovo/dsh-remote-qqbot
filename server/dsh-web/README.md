@@ -300,7 +300,9 @@ node verify-captcha.mjs       # 19 条：人机验证（签发/强制/一次性/
 node verify-dom-ids.mjs       #  9 条：app.js 要用的每个元素 id 都有人提供（补无头桩的盲区）
 node verify-deeplink.mjs      # 16 条：`/n/<id>` 深链（无头 DOM 桩跑真 app.js）
 node verify-account-ui.mjs    # 55 条：首页能渲染 + 账号页设备码/令牌 + 登录页的验证码（同一个桩，真浏览器语义）
-node verify-landing.mjs       # 33 条：**线上**首页落地页 + 三个静态文件逐字节一致
+node verify-landing.mjs       # 41 条：**线上**首页落地页 + 六个静态文件逐字节一致 + 插件仓库链接（三处：怎么装/联系方式/页脚）
+node verify-docs.mjs          # 118 条：教程文档页（真浏览器 headless Edge；默认起本地临时实例，--url 打线上、--dir 打副本）
+node _reverse-docs.mjs        # 反向校验：把 public/ 拷一份切 7 刀 → 每一刀都让预期那几条红、退出码都是 1（含"第 2 章仓库地址"）
 node verify-live-429.mjs      #  7 条：被限流时脚本要"说清 + 退出码 3"，不许级联变红
 node verify-live.mjs          # 31 条（没给 ADMIN_TOKEN 则 30 条 + 1 条显式跳过）：打公网入口，全程真链路，收尾自删临时账号
                               # 给了 ADMIN_TOKEN 才能验"账号数/记录数回到开跑前"（走 /health/detail），

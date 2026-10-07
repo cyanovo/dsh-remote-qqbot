@@ -261,6 +261,55 @@ await test('★ secret 的值绝不回显：只报"有没有设"', () => {
     'secret 明文出现在视图里了 —— 前端会把它渲染进 input.value')
 })
 
+// ── 接收 QQ 推送这一个开关（1.0.20）────────────────────────────────────────
+// 主人 2026-10-07：「我希望在 DSH 的设置里面，也有插件是否接收推送功能的开关」。
+// 这个开关本来就存在（键 `qqNotifyEnabled`，标签叫「远程提醒」），但它排在
+// `qqEnabled` 后面、混在二十多个字段中间 —— 主人翻不到。所以这一组守两件事：
+// ①字段表里它必须是**显眼的那个名字**并且说明白"关掉会怎样"；②设置页把它单独提到最上面一张卡。
+
+await test('★ 设置字段表里有「接收 QQ 推送」这个开关（不是让人去猜「远程提醒」是它）', () => {
+  const view = configView(noNamespace(), NS, hostConfig)
+  const spec = view.fields.find((f) => f.key === 'qqNotifyEnabled')
+  assert.ok(spec, 'FIELD_SPECS 里缺 qqNotifyEnabled —— 设置页就没有这个开关')
+  assert.equal(spec.type, 'boolean', '必须是个开关，不是输入框')
+  assert.equal(spec.group, 'qq')
+  assert.equal(spec.label, '接收 QQ 推送')
+  assert.match(spec.description, /新版本/, '光说"任务完成/提问/出错"不够 —— 新版本提醒也归这个开关管')
+  assert.match(spec.description, /长连接|反向对话/, '要说清关掉之后什么还照旧（否则人会怕关了收不到自己的话）')
+  assert.match(spec.description, /输入框旁边|小开关/, '要说明它和输入框旁边那个小开关是同一个东西')
+})
+
+await test('★ host 说推送关着 → 视图里就是关着（界面据此显示"关"，不能自己猜成开）', async () => {
+  const off = configView(noNamespace(), NS, () => ({ qqEnabled: true, qqNotifyEnabled: false }))
+  assert.equal(off.values.qqNotifyEnabled, false)
+  const on = configView(noNamespace(), NS, () => ({ qqEnabled: true, qqNotifyEnabled: true }))
+  assert.equal(on.values.qqNotifyEnabled, true)
+  // host 侧连这个键都没给时，configView 只能回 null（字段表没有 default 一说）。
+  // 那种情况下界面**必须**按插件真正的判据 "=== false 才关" 显示 —— 否则会显示成"关"、
+  // 而插件其实在推（运行状态那一行用的也是 `=== false`）。所以钉住 client 的写法。
+  const missing = configView(noNamespace(), NS, () => ({ qqEnabled: true }))
+  assert.equal(missing.values.qqNotifyEnabled, null)
+  const client = await import('node:fs').then((fs) => fs.readFileSync(
+    new URL('../src/client.js', import.meta.url), 'utf8',
+  ))
+  assert.match(client, /const pushOn = valueOf\('qqNotifyEnabled'\) !== false/,
+    '缺省视为开 —— 与 runtime / 运行状态同一判据')
+  assert.match(client, /checked: pushOn/, '开关的显示要跟行为用同一条判据，不能写成 === true')
+})
+
+await test('★ 设置页把「接收 QQ 推送」提到最上面那张卡，且分组表里不重复渲染同一个键', async () => {
+  const client = await import('node:fs').then((fs) => fs.readFileSync(
+    new URL('../src/client.js', import.meta.url), 'utf8',
+  ))
+  assert.match(client, /field\.key === 'qqNotifyEnabled'/, '要按这个键把卡片挑出来')
+  assert.match(client, /key: 'push-switch'/, '卡片本体（排在最前面的那一块）')
+  assert.match(client, /field\.key !== 'qqNotifyEnabled'/, '🔴 分组表里必须排掉它 —— 同一个开关一屏出现两次，最容易让人以为"改了没生效"')
+  // 卡片必须是"有字段才渲染"：字段表里删了它，卡片不能还硬写着一份自己的文案。
+  assert.match(client, /pushField\s*\n?\s*\? h\('section', \{ key: 'push-switch'/, '缺字段时整块不渲染')
+  assert.match(client, /pushField\.label/, '标题取字段表里的标签（单一真源），不另写一份')
+  assert.match(client, /pushField\.description/, '说明也取字段表里的（单一真源）')
+})
+
 // ── 运行状态（2026-10-03）：启动日志只留两行，其余挪到设置面板 ──────────────
 
 await test('★ 「运行状态」会出现在配置视图里（启动日志不再刷的那些）', () => {

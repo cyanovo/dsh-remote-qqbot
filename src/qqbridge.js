@@ -355,8 +355,26 @@ export const PICKER_DEFAULT_COUNT = 6
  * 为什么需要这个窗：列表发出去之后，你随时可能再发一句普通的话。
  * 如果「2」永远被解释成"切到第 2 个会话"，那你就没法正常说数字了；
  * 而"刚看完列表就回数字"这个场景里，数字几乎没有别的解释。
+ *
+ * 会话列表保持短窗：会话是易变对象（随时新建/改名），隔久了编号虽然不会错位
+ * （名单是真的存下来了），但你自己已经记不清哪个是第 3 个了 —— 想慢慢挑就发 `/use 3`。
  */
 export const PICK_WINDOW_MS = 5 * 60 * 1000
+
+/**
+ * 「工作区列表」的有效期（`/task` 发的那份）—— **故意比会话名单长得多**。
+ *
+ * 2026-10-07 的实测：08:45:15 发名单 → 09:09:18 回「2」（隔 24 分钟）→ 名单早已作废
+ * → 路由判定"这不是在选名单" → 那个「2」被当成一句派活正文**注入了会话**：
+ * 选择没生效，还白白跑了一轮（转录里 `user/message` 的正文就是 `"2"`）。
+ *
+ * 根因不是"窗口设短了"，而是**过期之后的降级方式错了**：数字不该变成派活正文。
+ * 所以这一版两件事一起改：
+ *   ① 工作区名单放宽到 24 小时（手机上从看到名单到想好选哪个，24 分钟都算快的）；
+ *   ② 裸数字在**没有任何有效名单**时一律不当派活正文，改成问一句（见 routeMessage ⑤）。
+ * 光有 ① 不够 —— 窗口再长也会过期；光有 ② 也不够 —— 那会让你白等一天才被拦。
+ */
+export const WORKSPACE_PICK_WINDOW_MS = 24 * 60 * 60 * 1000
 
 /** `at` 距现在多久：`刚刚` / `12 分钟前` / `3 小时前` / `2 天前`。 */
 function shortAgo(at, now = Date.now()) {
@@ -367,6 +385,40 @@ function shortAgo(at, now = Date.now()) {
   const hr = Math.floor(min / 60)
   if (hr < 24) return `${hr} 小时前`
   return `${Math.floor(hr / 24)} 天前`
+}
+
+/**
+ * 一段时长说成人话：`24 分钟` / `3 小时` / `2 天`（**不含"前"字**，给拼句子用）。
+ *
+ * 不足 1 分钟按 1 分钟算 —— 这一步只会用在"名单明明已经过期"的场合，
+ * 说「0 分钟前」会让人以为是自己看错了时间。
+ */
+function ageText(ms) {
+  const min = Math.max(1, Math.floor(Math.max(0, Number(ms) || 0) / 60000))
+  if (min < 60) return `${min} 分钟`
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr} 小时`
+  return `${Math.floor(hr / 24)} 天`
+}
+
+/**
+ * 名单发出至今多久了 —— **纯函数**。
+ *
+ * @param {{pickerAt?: number, ids?: string[], pickerIds?: string[]}} picker - 状态文件里记的那一份。
+ * @param {number} [now] - 当前时刻（测试可注入）。
+ * @returns {number|null} 毫秒数；**`null` = 压根没有名单**（从没发过，或被重启清掉了）。
+ *   有名单时不会返回负数（时钟回拨按 0 算）。
+ *
+ * 为什么要区分"没有名单"和"名单太老"：这两种情况要给**不一样**的回话 ——
+ * 前者是"先发 /task 我列一份"，后者是"你回的数字对上了 24 分钟前那份名单，它作废了"。
+ */
+export function pickerAge(picker, now = Date.now()) {
+  const src = picker ?? {}
+  const pickerAt = src.pickerAt ?? 0
+  const ids = src.ids ?? src.pickerIds ?? []
+  if (!Array.isArray(ids) || ids.length === 0) return null
+  if (!Number.isFinite(pickerAt) || pickerAt <= 0) return null
+  return Math.max(0, now - pickerAt)
 }
 
 /**
@@ -383,12 +435,8 @@ function shortAgo(at, now = Date.now()) {
  * @returns {boolean}
  */
 export function isPickerFresh(picker, now = Date.now(), windowMs = PICK_WINDOW_MS) {
-  const src = picker ?? {}
-  const pickerAt = src.pickerAt ?? 0
-  const ids = src.ids ?? src.pickerIds ?? []
-  if (!Array.isArray(ids) || ids.length === 0) return false
-  if (!Number.isFinite(pickerAt) || pickerAt <= 0) return false
-  return now - pickerAt <= windowMs
+  const age = pickerAge(picker, now)
+  return age !== null && age <= windowMs
 }
 
 /**
@@ -404,7 +452,7 @@ export function isPickerFresh(picker, now = Date.now(), windowMs = PICK_WINDOW_M
  * 其中老会话可能没有 `sessionStats`（turns 为 undefined），标题也可能为 null。
  *
  * @param {object} item - `session/list` 的一条。
- * @returns {{id: string, title: string, project: string, turns: number|null, running: boolean, updatedAt: number}}
+ * @returns {{id: string, title: string, project: string, cwd: string, turns: number|null, running: boolean, updatedAt: number}}
  */
 export function summarizeSession(item) {
   const vals = item?.projections?.values ?? {}
@@ -421,6 +469,9 @@ export function summarizeSession(item) {
     title,
     // 只取目录最后一段：完整路径在手机上会把行撑爆，而"哪个项目"才是要区分的东西。
     project: shortPath(item?.cwd),
+    // ⚠️ 完整路径也要留着：`project` 只是给人看的短名，而"按工作区派活"必须
+    //    拿完整 cwd 去 `session/create`（见 qqruntime 的 ensureTaskSession）。
+    cwd: String(item?.cwd ?? '').trim(),
     turns: Number.isFinite(turns) ? turns : null,
     running: item?.running === true,
     updatedAt: Number.isFinite(item?.updatedAt) ? item.updatedAt : 0,
@@ -428,7 +479,7 @@ export function summarizeSession(item) {
 }
 
 /** `D:\a\b\c` / `/srv/a/b` → `c` / `b`（只留最后一段，空值返回空串）。 */
-function shortPath(p) {
+export function shortPath(p) {
   const s = String(p ?? '').trim().replace(/[\\/]+$/, '')
   if (s === '') return ''
   const parts = s.split(/[\\/]/)
@@ -474,11 +525,14 @@ function slotLine(slotId, sessions, listError) {
  *   2026-10-04 那次「引用消息没办法回答」就是这条腿断了（出站推送不需要它，所以状态里
  *   只报 QQ 连着会显得一切正常）。它必须在 /status 里可见。
  * @param {string} [p.injectNote] - 已经做过的补救动作（例如"补回了签名记录，重启后生效"）。
+ * @param {string} [p.runningVersion] - **内存里跑着的**插件版本；没给就不显示这一行。
+ * @param {string} [p.installedVersion] - **磁盘上装着的**插件版本。
+ *   两者不一致 = "装完还没重启"，那是 2026-10-07 主人被卡住的坑，必须在 /status 里看得见。
  * @returns {string} 可直接发到 QQ 的文案。
  */
 export function formatStatusText({
   channelOn = false, pending = 0, sessions = [], taskId = '', chatId = '', activeId = '', listError = '',
-  injectError = '', injectNote = '',
+  injectError = '', injectNote = '', runningVersion = '', installedVersion = '',
 } = {}) {
   const list = Array.isArray(sessions) ? sessions.filter(Boolean) : []
   const running = list.filter((s) => s.running === true)
@@ -494,6 +548,17 @@ export function formatStatusText({
     pending > 0 ? `有 ${pending} 个问题在等你回答` : '没有在等你回答的问题',
   ]
   if (injectNote) lines.push(`（${injectNote}）`)
+
+  // 插件版本：主人 2026-10-07 反复问"为什么新功能没有、它却说已经是最新"——
+  // 根因就是这条看不见的错位（磁盘上装了新版、内存里跑的还是旧版）。放进 /status，
+  // 让"我在跑哪一版"一句话就能问到，不必再翻设置页或找日志。
+  const runningVer = String(runningVersion ?? '').trim()
+  const diskVer = String(installedVersion ?? '').trim()
+  if (runningVer !== '') {
+    lines.push(diskVer !== '' && diskVer !== runningVer
+      ? `⚠️ 插件：跑的是 ${runningVer}，磁盘上装的已经是 ${diskVer} —— 重启 DSH 才会换过去`
+      : `🧩 插件 ${runningVer}（磁盘上装的也是 ${diskVer || runningVer}）`)
+  }
 
   if (listError) {
     // 拿不到列表时**必须说出来**：显示"没有在跑的会话"是错的，会让人误以为机器闲着。
@@ -558,7 +623,7 @@ export function formatSessionPickerText({
     return ['🗂 还没有可以挑的会话', '', '你在 DSH 里开一个会话之后，这里就会出现它。'].join('\n')
   }
 
-  const lines = [`🗂 最近在聊的 ${picked.length} 个会话（回个数字切过去）`, '']
+  const lines = [`🗂 最近在聊的 ${picked.length} 个会话（点下面的按钮，或者发 /use 数字）`, '']
   picked.forEach((s, i) => {
     const bits = [s.title || '未命名会话']
     if (s.project) bits.push(s.project)
@@ -595,6 +660,447 @@ export function formatPickAck(outcome, { title = '', index = 0, count = 0 } = {}
         : '我这边还没有会话列表 —— 先发 /sessions 看看有哪些。'
     default:
       return '没听懂，发 /sessions 看看有哪些会话。'
+  }
+}
+
+/**
+ * 剥掉「消息按钮」点出来时带的 `@机器人` 前缀 —— **纯函数**。
+ *
+ * 官方：指令按钮（`action.type=2`）点击后「自动在输入框插入 `@bot data`」。
+ * 也就是说点一下「看状态」发过来可能是 `@机器人 /status`，而不是干净的 `/status`。
+ * 不剥掉这段前缀，按钮点了等于发了一句普通消息 —— 整个按钮功能就是白做的。
+ *
+ * ⚠️ **只在 `@某段` 后面紧跟 `/` 时才剥**：以 `@` 开头的正常内容（`@张三 你好`）
+ * 一个字都不动，避免为了按钮去改普通消息的含义。
+ *
+ * @param {string} text - 原始消息正文。
+ * @returns {string} 可用于判指令的文本。
+ */
+export function stripBotMention(text) {
+  return String(text ?? '').replace(/^@[^\s/]{1,32}\s+(?=\/)/, '')
+}
+
+/** 按钮文字上限（官方：`render_data.label` 最多 10 字符）。 */
+export const BUTTON_LABEL_MAX = 10
+/** 一个 keyboard 最多几行、每行最多几个按钮（官方：最多 5 行、每行最多 5 个）。 */
+export const KEYBOARD_MAX_ROWS = 5
+export const KEYBOARD_MAX_PER_ROW = 5
+
+/** 按码点截断到 n 个字符（中文一字算一个；不要用 slice，会把 emoji 切半个）。 */
+function cutChars(text, n) {
+  const chars = [...String(text ?? '').replace(/\s+/g, ' ').trim()]
+  return chars.slice(0, Math.max(1, n)).join('')
+}
+
+/**
+ * 一个「指令按钮」—— **纯函数**。
+ *
+ * `render_data.label` 是**显示**在按钮上的文字，`action.data` 才是点下去发回来的内容。
+ * 所以显示文字可以写得像人话（「立即更新」），而 data 是命令（`/update`）。
+ * 两者都受官方限制：label ≤10 字符。
+ *
+ * @param {string} label - 按钮上显示的文字。
+ * @param {string} data - 点下去发回来的内容（一般是一条 `/命令`）。
+ * @param {{style?: number, visited?: string}} [opts] - style：0 灰框 / 1 蓝框 / 3 白底红字 / 4 蓝底白字。
+ * @returns {object} 可直接放进 `keyboard.content.rows[].buttons[]` 的对象。
+ */
+export function makeCmdButton(label, data, { style = 1, visited = '' } = {}) {
+  const text = cutChars(label, BUTTON_LABEL_MAX)
+  const cmd = String(data ?? '').trim()
+  return {
+    id: (cmd || text).slice(0, 20),
+    render_data: {
+      label: text,
+      visited_label: visited ? cutChars(visited, BUTTON_LABEL_MAX) : cutChars(`✓ ${text}`, BUTTON_LABEL_MAX),
+      style,
+    },
+    action: {
+      type: 2,                  // 指令按钮：点了把 data 当一条消息发回来
+      permission: { type: 2 },  // 所有人可点
+      data: cmd,
+      enter: true,              // 单聊可用：点一下直接发送，不用再按一次
+      reply: false,
+      unsupport_tips: '你的 QQ 版本不支持按钮，把这条命令打到输入框发给我也行',
+    },
+  }
+}
+
+/**
+ * 把「若干行按钮」拼成消息的 `keyboard` 字段 —— **纯函数**。
+ *
+ * 官方上限：最多 5 行、每行最多 5 个按钮。**超限就整个不装**（宁可没有按钮，
+ * 也不要发一条平台会拒的消息 —— 那会把整条通知一起弄丢）。
+ *
+ * @param {Array<Array<object>>} rows - 二维数组，每个元素是一行按钮。
+ * @returns {{content: {rows: Array}}|null}
+ */
+export function buildKeyboard(rows) {
+  const list = (Array.isArray(rows) ? rows : [])
+    .filter((r) => Array.isArray(r) && r.length > 0)
+  if (list.length === 0 || list.length > KEYBOARD_MAX_ROWS) return null
+  if (list.some((r) => r.length > KEYBOARD_MAX_PER_ROW)) return null
+  return { content: { rows: list.map((r) => ({ buttons: r })) } }
+}
+
+/** 「有新版本」提醒下面那排按钮：忽略本次 / 立即更新。 */
+export function buildUpdateNoticeKeyboard() {
+  return buildKeyboard([[
+    makeCmdButton('忽略本次', '/skip'),
+    makeCmdButton('立即更新', '/update', { style: 4 }),
+  ]])
+}
+
+/**
+ * 「名单选一个」那排数字按钮 —— **纯函数**。
+ *
+ * 为什么给名单配按钮：名单下面那些编号，在手机上要手打一个数字发回来；而只要你是
+ * 手打的，就受时间窗限制（见 {@link WORKSPACE_PICK_WINDOW_MS}）。点按钮发回来的是一条
+ * **显式指令**（`/pick 3`），显式指令不查时间窗 —— 只要名单还在状态文件里就能选。
+ *
+ * 按钮上只印数字：名单就在上面几行，编号与内容挨着看最省事；印名字会挤到 10 字符上限
+ * （见 {@link BUTTON_LABEL_MAX}），截成半个词反而认不出。
+ *
+ * @param {string} prefix - 指令前缀，形如 `'/pick '`、`'/use '`、`'/open '`。
+ * @param {number} count - 发几个（= 名单里实际有几条）。**0 条就一个都不装**（含 extra）——
+ *   没有编号行的"新对话"会让人以为刚发过一份名单。
+ * @param {{extra?: Array<object>}} [opts] - 追加在最后一行的按钮（如「新对话」）。
+ *   单独占一行，免得跟编号混在一起；行数超上限时整个返回 null。
+ * @returns {{content: {rows: Array}}|null} 超过 5 行时返回 null（名单太长就不装按钮）。
+ */
+export function buildNumberButtons(prefix, count, { extra = [] } = {}) {
+  const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0
+  const tail = (Array.isArray(extra) ? extra : []).filter(Boolean)
+  // 0 条 = 没有名单可点：这时**一个按钮都不装**，连「新对话」也不装 ——
+  // 没有编号行的"新对话"会让人以为刚发过一份名单。
+  if (n === 0) return null
+  const buttons = []
+  for (let i = 1; i <= n; i += 1) {
+    buttons.push(makeCmdButton(String(i), `${prefix}${i}`))
+  }
+  const rows = []
+  for (let i = 0; i < buttons.length; i += KEYBOARD_MAX_PER_ROW) {
+    rows.push(buttons.slice(i, i + KEYBOARD_MAX_PER_ROW))
+  }
+  if (tail.length > 0) rows.push(tail)
+  return buildKeyboard(rows)
+}
+
+/** `/help` 回复下面那排按钮：把主要命令变成可点的。 */
+export function buildHelpKeyboard() {
+  return buildKeyboard([
+    [
+      makeCmdButton('看状态', '/status'),
+      makeCmdButton('挑工作区', '/task'),
+      makeCmdButton('会话', '/sessions'),
+    ],
+    [
+      makeCmdButton('屏幕', '/screen'),
+      makeCmdButton('新对话', '/new'),
+      makeCmdButton('更新', '/update'),
+      makeCmdButton('帮助', '/help'),
+    ],
+  ])
+}
+
+/**
+ * 按钮上**留给选项文字**几个字（`N.` 那部分之外的余量）—— **纯函数**。
+ *
+ * 单独抽出来是为了「正文要不要补一句」和「按钮写什么」用**同一个口径**：
+ * 正文那边靠它判断"这个选项名在按钮上会不会被切"（见 `formatQuestionBody`）。
+ *
+ * @param {number} index - 选项序号（0 起）。
+ * @param {{max?: number}} [opts] - 按钮文字上限（官方 10 字符）。
+ * @returns {number} 还能放几个字（≥0）。
+ */
+export function optionLabelRoom(index, { max = BUTTON_LABEL_MAX } = {}) {
+  const num = String((Number.isFinite(index) ? Math.max(0, Math.floor(index)) : 0) + 1)
+  const limit = Number.isFinite(max) && max > 0 ? Math.floor(max) : BUTTON_LABEL_MAX
+  return Math.max(0, limit - num.length - 1)
+}
+
+/**
+ * 选项文字 → 按钮上那点地方能放下的**短标签**（`1.方案A`）—— **纯函数**。
+ *
+ * 只做三件事：剥掉模型自己加的编号前缀、剥掉「（推荐）」这种装饰、按码点截断。
+ * 剥掉的都是**重复信息**：编号由按钮给（正文那条说明也按同一个编号），「推荐」标在正文那行上。
+ *
+ * @param {string} label - 原始选项文字（DSH 里那个 `label`）。
+ * @param {number} index - 选项序号（0 起）。
+ * @param {{max?: number}} [opts] - 按钮文字上限（官方 10 字符）。
+ * @returns {string} 形如 `1.方案A`；放不下正文时只留序号。
+ */
+export function optionButtonLabel(label, index, { max = BUTTON_LABEL_MAX } = {}) {
+  const num = String((Number.isFinite(index) ? Math.max(0, Math.floor(index)) : 0) + 1)
+  const room = optionLabelRoom(index, { max })
+  const clean = cleanOptionText(label)
+  if (room < 2 || clean === '') return num
+  return `${num}.${cutChars(clean, room)}`
+}
+
+/**
+ * 选项文字里那些**不该再进按钮**的东西 —— **纯函数**。
+ *
+ * 为什么必须剥：
+ *   - 「A.」「1、」「B)」这类前缀是模型自己编的序号，而按钮左边已经印了 `N.`；
+ *     10 字上限里多留一个"1."，真正能看的内容就少两个字。
+ *   - 「（推荐）」是**元信息**不是选项名。它在 10 字上限里极容易把括号切成半个
+ *     （`1.A. 一行一个按钮（推` 这种半截括号，2026-10-07 主人原话："我根本看不见是什么东西"）；
+ *     而正文那行会单独标「（推荐）」，剥掉不丢信息。
+ */
+export function cleanOptionText(label) {
+  return String(label ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[A-Za-z][.)、．:：]\s*/, '')
+    .replace(/^\d+\s*[.)、．:：]\s*/, '')
+    .replace(/\s*[（(]\s*(?:推荐|recommended)\s*[）)]\s*$/i, '')
+    .trim()
+}
+
+/** 这个选项是不是被标了「（推荐）」—— 正文那行要靠它标回来。 */
+export function isRecommendedLabel(label) {
+  return /\s*[（(]\s*(?:推荐|recommended)\s*[）)]\s*$/i.test(String(label ?? ''))
+}
+
+/**
+ * 把「一个单选提问」的选项变成消息按钮（QQ 里那种可点的蓝色文字）—— **纯函数**。
+ *
+ * 为什么是「恰好一个问题 + 单选」才装按钮：
+ *   - 多个问题时，一次点击没办法把 N 个问题都答完（`relayAsk` 要求一行一个答案），
+ *     点了只会答掉其中一个，反而更乱；
+ *   - 多选同理（本来就要点好几个），按钮不比打字省事。
+ *
+ * 🔴 **一行一个按钮**（1.0.26 改；以前是 5 个挤一行）。主人 2026-10-07 的原话：
+ *    「按钮里的字还是挺多的，你一行放 4 个按钮，我根本看不见是什么东西」——
+ *    一行 4~5 个时每个按钮只分到 1/5 宽度，10 字上限里塞「2.A + 顺带把名单」这种被硬切
+ *    的文字，手机上等于看不清。一行一个后每个按钮占满整行，标签才真的能读。
+ *    代价：行数上限 5 = 选项数上限 5（与旧版的一行 5 个**同一个上限**，没有变少）。
+ *
+ * `action.data` 放的是**显式指令** `/answer N`（不是裸数字）：1.0.24 起"不引用、不带 / 的消息
+ * 一律当闲聊"，裸数字不再被当作答 —— 按钮要是还发裸数字，点了就等于白发一句闲聊。
+ * 解析答案那条路本来就认数字（`buildOneAnswer` 里 `labels[Number(p) - 1]`），
+ * 所以 `/answer N` 与"引用提问后回一个数字"走的是**同一条**解析路。
+ *
+ * @param {Array<object>} questions - DSH 的提问列表（`{id, options:[{label}], multiSelect}`）。
+ * @param {{labelMax?: number}} [opts]
+ * @returns {{content: {rows: Array}}|null} 可直接放进消息 `keyboard` 字段的对象；不装按钮时 null。
+ */
+export function buildOptionKeyboard(questions, { labelMax = BUTTON_LABEL_MAX } = {}) {
+  const list = Array.isArray(questions) ? questions.filter(Boolean) : []
+  if (list.length !== 1) return null
+  const q = list[0]
+  if (q.multiSelect === true) return null
+  const options = Array.isArray(q.options)
+    ? q.options.filter((o) => o && typeof o.label === 'string')
+    : []
+  if (options.length === 0 || options.length > KEYBOARD_MAX_ROWS) return null
+
+  const rows = options.map((o, i) => [makeCmdButton(
+    optionButtonLabel(o.label, i, { max: labelMax }),
+    `/answer ${i + 1}`,
+    { visited: `✓ ${i + 1}` },
+  )])
+  return buildKeyboard(rows)
+}
+
+/**
+ * 组装「挑工作区」的名单 —— **纯函数**。
+ *
+ * `/task` 不带内容时发这一份：先挑工作区，再发要做的事。工作区就是 DSH 会话的工作目录
+ * （`cwd`），所以名单直接由会话列表归并而来：同一个目录下的会话算一个工作区，
+ * 按最近活动倒序。
+ *
+ * @param {object} p
+ * @param {Array<{cwd: string, name: string, sessions: number, updatedAt: number}>} [p.workspaces]
+ *   已按"最近活动倒序"排好的工作区。
+ * @param {string} [p.currentCwd] - 上次选过的工作区（那一行标"就是它"）。
+ * @param {number} [p.count] - 最多列几个。
+ * @param {string} [p.listError] - 拉列表失败的原因；非空时如实说明，绝不假装"没有工作区"。
+ * @returns {string} 可直接发到 QQ 的文案。
+ */
+export function formatWorkspacePickerText({
+  workspaces = [], currentCwd = '', count = PICKER_DEFAULT_COUNT, listError = '',
+} = {}) {
+  if (listError) {
+    return [
+      '🗂 工作区列表这次没读出来', '',
+      `⚠️ ${listError}`, '',
+      '稍等一下再发一次 /task 试试。',
+    ].join('\n')
+  }
+  const list = Array.isArray(workspaces) ? workspaces.filter((w) => w && w.cwd) : []
+  const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : PICKER_DEFAULT_COUNT
+  const picked = list.slice(0, n)
+  if (picked.length === 0) {
+    return [
+      '🗂 还没有可以挑的工作区', '',
+      '你在 DSH 里开一个会话之后，这里就会出现它的目录。',
+      '也可以直接发 `/task 要做的事` —— 那会进默认工作区。',
+    ].join('\n')
+  }
+  const lines = ['🗂 挑个工作区，再把你的事发给我 —— 点下面的按钮，或者发 /pick 数字', '']
+  picked.forEach((w, i) => {
+    const bits = [w.name || shortPath(w.cwd)]
+    if (w.sessions > 0) bits.push(`${w.sessions} 个会话`)
+    bits.push(shortAgo(w.updatedAt))
+    lines.push(`${i + 1}. ${bits.join(' · ')}${w.cwd === currentCwd ? ' ← 就是它' : ''}`)
+  })
+  lines.push('', '选好工作区之后，我再列出它里面的会话 —— 挑一个，或者开个新对话。')
+  lines.push('这份名单留 24 小时，慢慢想 —— 过期了重发 /task 就行。')
+  lines.push('直接派给上次那个工作区：`/task 要做的事`')
+  return lines.join('\n')
+}
+
+/**
+ * 挑工作区之后的回执 —— **纯函数**。
+ *
+ * 🔴 失败的三支都**不能静默回落**：选中的那个不在了就明说，悄悄换一个工作区
+ *    等于把你的活派进了你不知道的目录。
+ *
+ * @param {'ok'|'out-of-range'|'gone'|'usage'} outcome
+ * @param {{name?: string, cwd?: string, session?: string, index?: number, count?: number}} [info]
+ * @returns {string}
+ */
+export function formatWorkspacePickAck(outcome, {
+  name = '', cwd = '', session = '', index = 0, count = 0,
+} = {}) {
+  switch (outcome) {
+    case 'ok':
+      return [
+        `✅ 工作区已选：${name || shortPath(cwd)}`,
+        cwd,
+        '',
+        `接下来你发的话都派进${session ? `「${session}」` : '这个工作区的专属会话'}。`,
+        '要换工作区：再发一次 /task',
+      ].join('\n')
+    case 'gone':
+      return `⚠️ 第 ${index} 个（${name}）已经不在了 —— 再发一次 /task 重新挑。`
+    case 'out-of-range':
+      return count > 0
+        ? `列表里只有 ${count} 个工作区，没有第 ${index} 个 —— 再发一次 /task 看看。`
+        : '我这边还没有工作区列表 —— 先发 /task 看看有哪些。'
+    // 名单本身没了（重启清了状态，或者从没发过）：**不许**悄悄拿"此刻的列表"顶上 ——
+    // 你没看过那份列表，编号对你没有任何意义，选出来大概率是别的目录。
+    case 'no-list':
+      return [
+        '我这边没有在等你选的工作区名单 —— 先发 /task，我列一份给你。',
+        '（名单会跟着状态文件留着，重发一份也不费事。）',
+      ].join('\n')
+    default:
+      return '没听懂，发 /task 看看有哪些工作区。'
+  }
+}
+
+/**
+ * 派活第二步：列出**某个工作区里**的会话，让你挑一个或者开新对话 —— **纯函数**。
+ *
+ * 为什么要第二步（主人 2026-10-07 提的需求）：
+ *   以前 `/task` 是"一个工作区一个固定专属会话"，你没法在同一个工作区里接着**别的**会话
+ *   说话，也没法明确地"从零开始一个新对话"。现在挑完工作区先列它里面的会话，
+ *   由你决定这次是接着聊还是开新的。
+ *
+ * 编号规则（和会话名单故意不同）：**0 = 开新对话**。
+ *   会话名单里 0 是"取消指定"，但这里不存在"不指定"—— 你既然挑了这个工作区，
+ *   下一步总要落到某个会话上；0 留给"新对话"这件最常用的事。
+ *
+ * @param {object} p
+ * @param {string} [p.cwd] - 工作区目录（列表为空时显示用）。
+ * @param {string} [p.name] - 工作区名（优先显示）。
+ * @param {Array<{id: string, title: string, running: boolean, updatedAt: number}>} [p.sessions]
+ *   已按最近活动倒序排好的会话。
+ * @param {string} [p.currentId] - 现在派活用的会话（那一行标"就是它"）。
+ * @param {string} [p.lastUsedId] - 这个工作区上次用过的会话（标"上次用的"）。
+ * @param {number} [p.count] - 最多列几个。
+ * @param {string} [p.listError] - 拉列表失败的原因；非空时如实说明，绝不假装"没有会话"。
+ * @returns {string}
+ */
+export function formatTaskSessionPickerText({
+  cwd = '', name = '', sessions = [], currentId = '', lastUsedId = '',
+  count = PICKER_DEFAULT_COUNT, listError = '',
+} = {}) {
+  const where = name || shortPath(cwd) || '这个工作区'
+  if (listError) {
+    return [
+      '🗂 这个工作区里的会话这次没读出来', '',
+      `⚠️ ${listError}`, '',
+      '稍等一下再发一次 /task 试试。',
+    ].join('\n')
+  }
+  const list = Array.isArray(sessions) ? sessions.filter(Boolean) : []
+  const n = Number.isFinite(count) && count > 0 ? Math.floor(count) : PICKER_DEFAULT_COUNT
+  const picked = list.slice(0, n)
+  if (picked.length === 0) {
+    // 兜底：正常情况下调用方会发现"一个会话都没有"并直接开新对话，不会发这条。
+    return [
+      `🗂 ${where} 里还没有会话`, '',
+      '回 0 或者点下面的「新对话」按钮，我就在这个工作区开一个。',
+    ].join('\n')
+  }
+  const lines = [`🗂 ${where} 里的会话（点下面的按钮，或者发 /open 数字）`, '']
+  picked.forEach((s, i) => {
+    const bits = [s.title || '未命名会话']
+    bits.push(s.running ? '正在跑' : '闲着')
+    bits.push(shortAgo(s.updatedAt))
+    const mark = s.id === currentId
+      ? ' ← 现在就是它'
+      : (s.id === lastUsedId ? ' ← 上次派活用的' : '')
+    lines.push(`${i + 1}. ${bits.join(' · ')}${mark}`)
+  })
+  lines.push('', '回 0 = 在这个工作区开一个新对话')
+  lines.push('选好之后，你发的话就派进那个会话；要换工作区：再发一次 /task')
+  return lines.join('\n')
+}
+
+/**
+ * 派活第二步之后的回执 —— **纯函数**。
+ *
+ * 🔴 `gone` 与 `no-list` 两支都**不能静默回落**：会话不在了、名单没了，都明说让你重挑。
+ *    悄悄把你换到另一个会话（尤其另一个工作区的会话），是这个功能最坏的失败方式。
+ *
+ * @param {'ok'|'new'|'gone'|'out-of-range'|'no-list'|'no-workspace'} outcome
+ * @param {{name?: string, cwd?: string, session?: string, index?: number, count?: number}} [info]
+ * @returns {string}
+ */
+export function formatTaskSessionPickAck(outcome, {
+  name = '', cwd = '', session = '', index = 0, count = 0,
+} = {}) {
+  const where = name || shortPath(cwd)
+  switch (outcome) {
+    case 'ok':
+      return [
+        `✅ 派活会话已选：${session || '那个会话'}`,
+        cwd || where,
+        '',
+        '接下来你发的话都进它。要换：再发一次 /task 重新挑。',
+      ].join('\n')
+    case 'new':
+      return [
+        `✅ 已经开了个新对话：${session || '新会话'}`,
+        cwd || where,
+        '',
+        '接下来你发的话都进这个新对话（原来那些会话都还在，随时能再挑）。',
+      ].join('\n')
+    case 'gone':
+      return `⚠️ 第 ${index} 个（${session || '那个会话'}）已经不在了 —— 再发一次 /task 重新挑。`
+    case 'out-of-range':
+      return count > 0
+        ? `这个工作区里只有 ${count} 个会话，没有第 ${index} 个 —— 再发一次 /task 看看。`
+        : '这个工作区里现在没有会话 —— 回 0 或者点「新对话」我开一个给你。'
+    // 名单没了（重启清了状态、或者压根没走到那一步）：**不许**拿"此刻的列表"顶上 ——
+    // 那个编号你没看过，选出来大概率是别的会话。
+    case 'no-list':
+      return [
+        '我这边没有在等你选的工作区会话名单 —— 先发 /task，我列一份给你。',
+        '（只是想开个新对话的话，直接发 /new 也行。）',
+      ].join('\n')
+    // 连工作区都没挑过：不知道在哪儿建会话，绝不猜一个目录。
+    case 'no-workspace':
+      return [
+        '我还不确定你说的是哪个工作区 —— 先发 /task 挑一个。',
+        '（挑过工作区之后，这里回 0 就是开新对话。）',
+      ].join('\n')
+    default:
+      return '没听懂，发 /task 看看有哪些工作区。'
   }
 }
 
@@ -653,10 +1159,22 @@ export function formatNotification(event) {
  * 也不含结尾「引用这条消息回复…」的提示。因此它既能拼进中继消息，
  * 也能被 push 兜底直接当正文用 —— 两处共用一套编号规则，不会各写各的。
  *
+ * 🔴 `buttonsShown: true` 时**不再重复列选项文字**（1.0.26）。主人 2026-10-07：
+ *    「你按钮里面也要写 A. 一行一个按钮 这样的文字，那不如直接用按钮替代掉正文里面的
+ *      这个文字，然后让它独立占一行」——按钮已经把选项文字承担了，正文再写一遍就是
+ *    同一条信息出现两次；正文只留「编号 + 说明」，编号与下面的按钮一一对应。
+ *    唯一例外：某个选项**既没有说明、名字又会被按钮切成半截**（见循环里的 ③），
+ *    那行就把完整选项名补回来 —— 那时它是唯一的答案依据，不算重复。
+ *
+ * ⚠️ 只有"确实装了按钮"时才敢省（`formatQuestion` 会把 `buildOptionKeyboard` 的结果传进来）：
+ *    多选、多个问题、超过 5 个选项时按钮不装，那时正文里的选项文字**是唯一的答案依据**，
+ *    少一个字，主人就答不出来。
+ *
  * @param {Array<object>} questions - DSH 的 AskUserQuestionItem 列表。
+ * @param {{buttonsShown?: boolean}} [options] - 下面是否真装了选项按钮。
  * @returns {string} 多行正文。
  */
-export function formatQuestionBody(questions) {
+export function formatQuestionBody(questions, { buttonsShown = false } = {}) {
   const list = Array.isArray(questions) ? questions : []
   if (list.length === 0) return '有个问题在等你回答'
   const many = list.length > 1
@@ -671,14 +1189,32 @@ export function formatQuestionBody(questions) {
     else out.push(header ? `【${header}】${text}` : text)
 
     const opts = Array.isArray(q?.options) ? q.options : []
+    // 按钮承担选项文字的前提，与 buildOptionKeyboard 装按钮的条件**必须一致**：
+    // 恰好一问、单选、有选项（选项数上限由它那边把关）。
+    const labelsInBody = !(buttonsShown && !many && q?.multiSelect !== true && opts.length > 0)
     for (const [oi, o] of opts.entries()) {
-      out.push(`  ${oi + 1}. ${String(o?.label ?? '')}`)
-      // 选项自带的说明也带上：多这一行，回复时更有把握。
+      const label = String(o?.label ?? '')
       const desc = typeof o?.description === 'string' ? o.description.trim() : ''
-      if (desc !== '') out.push(`     ${desc}`)
+      const rec = isRecommendedLabel(label)
+      if (labelsInBody) {
+        out.push(`  ${oi + 1}. ${label}`)
+        // 选项自带的说明也带上：多这一行，回复时更有把握。
+        if (desc !== '') out.push(`     ${desc}`)
+      } else {
+        // 按钮上有选项名，这里只补"按钮上放不下的那部分"：
+        //   ① 有说明 → 发说明（带不带「推荐」标记）；
+        //   ② 没说明、且选项名**能在按钮上完整显示** → 一个字都不写（信息在按钮上，
+        //      这一行就是主人说的"正文里重复的那遍文字"）；
+        //   ③ 没说明、但选项名会被按钮切成半截 → 正文补全文，否则只能对着
+        //      「1.一个特别」猜（口径与 optionLabelRoom 同一个来源）。
+        const clean = cleanOptionText(label)
+        const full = [...clean].length > optionLabelRoom(oi)
+        const line = desc !== '' ? desc : (full ? clean : '')
+        if (line !== '' || rec) out.push(`  ${oi + 1}. ${rec ? '（推荐）' : ''}${line}`)
+      }
     }
-    if (opts.length === 0) out.push('  （这题没有选项，你直接回一句话就行）')
-    else if (q?.multiSelect) out.push('  （可以多选，像「1 3」这样回）')
+    if (opts.length === 0) out.push('  （这题没有选项：**引用这条消息**回一句话就行）')
+    else if (q?.multiSelect) out.push('  （可以多选：**引用这条消息**回，像「1 3」这样）')
   })
 
   return out.join('\n')
@@ -687,31 +1223,53 @@ export function formatQuestionBody(questions) {
 export function formatQuestion(questions, { project, session } = {}) {
   const list = Array.isArray(questions) ? questions : []
   const name = actorOf({ session, project })
+  // 1.0.24 起"不引用、不带 / 的消息一律当闲聊"，所以**必须**在这里说清怎么才算回答 ——
+  // 否则主人顺手回一句「1」，那句会进闲聊会话，agent 一直等下去（他 2026-10-07 18:1x
+  // 明确要求"不引用就是闲聊，无论任何情况"）。有按钮时按钮发的是 /answer N，也算显式指令。
+  const keyboard = buildOptionKeyboard(list)
+  const hasButtons = Boolean(keyboard)
+  const hasOptions = list.some((q) => Array.isArray(q?.options) && q.options.length > 0)
+  const how = hasButtons
+    ? '要回答：点下面的按钮；或者**引用这条消息**回我一句（回数字比如 1，也可以直接写你的答案）。'
+    : hasOptions
+      ? '要回答：**引用这条消息**回我一句（回数字比如 1，也可以直接写你的答案）。'
+      : '要回答：**引用这条消息**回我一句，直接写你的答案就行。'
   return [
     name ? `❓ ${name} 想问你个事` : '❓ 想问你个事',
     '',
-    formatQuestionBody(list),
+    // 正文里的选项文字由按钮承担了（见 formatQuestionBody 的说明），把"装没装按钮"传下去。
+    formatQuestionBody(list, { buttonsShown: hasButtons }),
     '',
     list.length > 1
-      ? `引用这条消息回我就行：${list.length} 个问题分 ${list.length} 行答，每行回数字（比如 1），也可以直接写你的答案。`
-      : '引用这条消息回我就行：想选哪个就回数字（比如 1），也可以直接写你的答案。',
+      ? `${how}（${list.length} 个问题分 ${list.length} 行答）`
+      : how,
   ].join('\n')
 }
 
 export const HELP_TEXT = [
-  '🤖 我是 DSH 助手，这些是我能听懂的',
+  '🤖 我是 DSH 助手，点下面的按钮，或者把这些命令发给我',
+  '',
+  '🔴 只要**不引用我的消息**、又**不带 / 开头**，你说的话一律当闲聊 —— 不管我是不是',
+  '在看名单、也不管我是不是正有问题等你答。想派活、想选名单、想作答，都用下面这些',
+  '显式指令或按钮。',
   '',
   '引用我的某条通知再说话 → 接着那个会话继续',
-  '直接发一句话 → 进你用 /sessions 指定的会话（没指定就是闲聊）',
-  '我正有问题等你答的时候直接回 → 那就是在回答它',
+  '引用我的某条提问再说话 → 那就是在回答它（点它下面的按钮也一样）',
+  '直接发一句话 → 当闲聊，进你用 /sessions 指定的会话（没指定就是闲聊会话）',
   '',
-  '/task 内容   当成一件新活派给我',
-  '/answer 内容 当成对我提问的回答',
+  '/task        列出工作区；点按钮或发 /pick 3 选它，再挑工作区里的会话或开新对话',
+  '/task 内容   直接派给当前工作区，当成一件新活',
+  '/pick 3      选 /task 名单里第 3 个工作区（名单 24 小时内有效，这里不受限）',
+  '/open 2      选当前工作区里第 2 个会话（0 = 开一个新对话）',
+  '/new         在当前工作区开一个新对话',
+  '/answer 答案 回答我的提问（回答自由作答的提问时用它，或引用那条提问）',
   '/status      看看现在在忙什么',
-  '/sessions    列出最近在聊的几个会话，回个数字就切过去',
+  '/sessions    列出最近在聊的几个会话；点按钮或发 /use 3 切过去',
   '/use 3       切到 /sessions 列表里第 3 个（0 = 取消指定）',
   '/screen      给我截一张你电脑的屏幕',
   '/update      把插件更新到最新版（会自动重启 DSH）',
+  '/update check 只查一下有没有新版；有的话把「忽略本次 / 立即更新」两个按钮回给你',
+  '/skip        这次的新版本先不提醒（想装还是发 /update）',
   '/help        看这条说明',
 ].join('\n')
 
@@ -799,16 +1357,22 @@ export function buildAnswers(text, questions) {
 // ── 来消息路由 ─────────────────────────────────────────────────────────────
 
 /**
- * 判断一条 QQ 消息是什么。
+ * 判断一条 QQ 消息是**哪条显式指令**（只处理以 `/` 开头的话）。
  *
- * 规则（简单可预期，用户不用记）：
- *   - 有提问在等 → 默认当回答
- *   - 没有提问   → 默认当新任务
- *   - 以 / 开头 → 显式指令，用来打破默认
+ * 规则（1.0.24 起，主人拍板，简单到不用记）：
+ *   - 以 `/` 开头（前面可以带 `@机器人 ` 前缀）→ 显式指令
+ *   - 不是 `/` 开头的文本 → 这里**没有别的意思**，一律按闲聊原样交回去
+ *
+ * 🔴 别再在这里加"有提问在等就当回答""没有提问就当新任务"之类的默认判断 ——
+ *    那两条正是 1.0.24 删掉的东西：一句话去哪，只由「有没有引用」和「带不带 /」决定。
+ *    真正的分流在 {@link routeMessage}，这里是它的第 ① 步。
  */
 export function routeIncoming(text, { hasPendingQuestion = false } = {}) {
-  const raw = String(text ?? '').trim()
-  if (!raw) return { kind: 'ignore' }
+  const trimmed = String(text ?? '').trim()
+  if (!trimmed) return { kind: 'ignore' }
+  // 消息按钮（指令按钮）点出来会带 `@机器人 ` 前缀，先剥掉再判指令。
+  // 非指令那两条路仍用 trimmed —— 普通消息的内容一个字都不改。
+  const raw = stripBotMention(trimmed)
 
   if (raw.startsWith('/')) {
     const m = /^\/([A-Za-z\u4e00-\u9fa5]+)\s*([\s\S]*)$/.exec(raw)
@@ -816,7 +1380,8 @@ export function routeIncoming(text, { hasPendingQuestion = false } = {}) {
     const rest = (m?.[2] ?? '').trim()
     switch (cmd) {
       case 'task': case 't': case '任务':
-        return rest ? { kind: 'task', text: rest } : { kind: 'usage', text: '用法：/task 要做的事' }
+        // 不带内容 = 先挑工作区（两步派活的第一步）；带了就直接派给当前工作区。
+        return rest ? { kind: 'task', text: rest } : { kind: 'task_workspaces' }
       case 'answer': case 'a': case '回答':
         if (!hasPendingQuestion) return { kind: 'no_question' }
         return rest ? { kind: 'answer', text: rest } : { kind: 'usage', text: '用法：/answer 你的回答' }
@@ -831,6 +1396,25 @@ export function routeIncoming(text, { hasPendingQuestion = false } = {}) {
       case 'use': case 'switch': case '切': case '切换':
         if (/^\d+$/.test(rest)) return { kind: 'pick_session', index: Number(rest), text: raw }
         return { kind: 'usage', text: '用法：/use 3 —— 切到 /sessions 列表里第 3 个（/use 0 取消指定）' }
+      // 挑工作区（`/task` 名单下面那些数字按钮发的就是它）。
+      //
+      // 🔴 为什么要有这条显式指令：裸数字那条路只在名单"新鲜"时才认（见 PICK_WINDOW_MS），
+      //    而手机上从看到名单到回一个数字很容易超时 —— 2026-10-07 实测超时 24 分钟，
+      //    那个「2」于是被当成派活正文注入了会话（选择没生效、还污染了一轮）。
+      //    显式 `/pick 3` 不受窗口限制，名单在状态文件里就一直能选。
+      case 'pick': case 'choose': case '选': case '选择':
+        if (/^\d+$/.test(rest)) return { kind: 'pick_workspace', index: Number(rest), text: raw }
+        return { kind: 'usage', text: '用法：/pick 3 —— 选 /task 名单里第 3 个（也可以直接点名单下面的按钮）' }
+      // 第二步：在已选的工作区里挑一个会话（`/task` 第二步那份名单下面的数字按钮发的就是它）。
+      // 与 `/use` 的区别是**作用域**：`/use` 是全局最近会话，`/open` 只认"当前工作区里"那份名单，
+      // 所以它需要 `taskSessionIds` 真的存在（那份名单你看过，编号才有意义）。
+      case 'open': case '开': case '打开':
+        if (/^\d+$/.test(rest)) return { kind: 'pick_task_session', index: Number(rest), text: raw }
+        return { kind: 'usage', text: '用法：/open 2 —— 选当前工作区里第 2 个会话（/open 0 = 开一个新对话）' }
+      // 在这个工作区开一个新对话（`/task` 第二步那个「新对话」按钮发的就是它）。
+      // 与 `/task 内容` 的区别：这条只建会话、不改派活内容，建完你直接说要做什么就行。
+      case 'new': case '新': case '新对话':
+        return { kind: 'new_task_session' }
       // 截图：远控不方便时，点 QQ 菜单的「屏幕」= 发一条 /screen 过来。
       // 顺带认英文同义词，主人手打 /shot 也能用。
       case 'screen': case 'screenshot': case 'shot': case '截图': case '屏幕':
@@ -838,7 +1422,12 @@ export function routeIncoming(text, { hasPendingQuestion = false } = {}) {
       // 远程更新：`/update` 直接装，`/update check` 只查不装。
       // 装完会重启 DSH（这一条只在这里说没用 —— 回执里也必须说清，见 update.js 的文案）。
       case 'update': case '更新':
+        // 「忽略本次」按钮也可以写成 `/update skip`，两种写法都认。
+        if (rest === 'skip' || rest === '忽略') return { kind: 'update_skip' }
         return { kind: 'update', check: rest === 'check' || rest === '检查' }
+      // `忽略本次` 按钮（新版本提醒下面那个）＝ `/skip`：这一版先不提醒，随时可以 /update 装上。
+      case 'skip': case '忽略': case 'ignore':
+        return { kind: 'update_skip' }
       case 'help': case 'h': case '?': case '帮助':
         return { kind: 'help' }
       default:
@@ -846,9 +1435,9 @@ export function routeIncoming(text, { hasPendingQuestion = false } = {}) {
     }
   }
 
-  return hasPendingQuestion
-    ? { kind: 'answer', text: raw }
-    : { kind: 'task', text: raw }
+  // 不是 `/` 开头 ⇒ 不是指令，交给 routeMessage 的 ③ 当闲聊（1.0.24 起这里不再"猜"）。
+  // 注意 `hasPendingQuestion` 只影响 `/answer` 那条指令有没有人等着答，绝不影响这段话的去向。
+  return { kind: 'chat', text: trimmed }
 }
 
 /** 任务正在跑时，把消息当作"追加指令"给同一会话（steer），否则排队（queue）。 */
@@ -899,6 +1488,26 @@ export class BotState {
       pickerAt: 0,
       /** 上次那份名单的会话 id，顺序与列表里显示的编号一一对应。 */
       pickerIds: [],
+      /**
+       * `/task` 先挑工作区用的那份名单：`taskPickerAt` 是发榜时刻，`taskPickerCwds`
+       * 是完整工作目录，顺序与显示编号一一对应。
+       *
+       * 为什么与 `pickerAt` / `pickerIds` 分开存：两份名单都用裸数字回复，
+       * 必须靠"谁后发"来消除歧义（见 routeMessage 的第 ④ 步）。
+       */
+      taskPickerAt: 0,
+      taskPickerCwds: [],
+      /**
+       * 当前选定的**工作区**（完整目录）。空串 = 还没选过，`/task 内容` 走老的「专属会话」。
+       */
+      activeTaskCwd: '',
+      /**
+       * `{ [cwd]: sessionId }` —— 每个工作区一个专属派活会话。
+       *
+       * 一个工作区一个会话（而不是每次都新建）：重复派活能接着上下文，
+       * 也避免在 DSH 里堆出一串同名空会话。
+       */
+      taskSessions: {},
       lastSeq: null, seen: [], sentRefs: {}, recent: [],
       /**
        * 已经提醒过新版本的版本号（空串 = 还没提醒过）。
@@ -908,6 +1517,14 @@ export class BotState {
        */
       updateNotified: '',
       /**
+       * 主人点了「忽略本次」的那个版本号（空串 = 没忽略过）。
+       *
+       * 与 `updateNotified` 的区别：那个记的是"**提醒过**哪个版本"（防重复打扰），
+       * 这个记的是"主人**明确说过**这版先别管"。分两个字段是为了让日志能说清是哪种静默，
+       * 也为了以后想改口径（比如忽略过的版本还偶尔提一次）时不用猜历史状态。
+       */
+      updateSkipped: '',
+      /**
        * 重启标记：`{ version, at }`，在「装完新版本、即将重启 DSH」时写，重启后读到就回一条确认。
        *
        * 为什么要落盘而不是留在内存里：写它的进程**正是接下来要被杀掉的那个**，
@@ -915,6 +1532,14 @@ export class BotState {
        * `at` 是写标记的时刻，用来算"重启用了多少秒"。
        */
       updateRestart: null,
+      /**
+       * `{ [agentId]: { s: 'running' | 'idle', at } }` —— 每个 agent 上次已知的状态。
+       *
+       * 为什么要落盘：判断"这一轮跑完了"用的是 `running → idle` 这个**边**，只看内存的话，
+       * 插件在回合中途重装/宿主中途重启就会把边弄丢，完成通知与 agentmd 日志一起静默消失
+       * （2026-10-05 事故）。见 {@link BotState.markAgentStatus}。
+       */
+      agentStatus: {},
     }
     this._load()
   }
@@ -930,6 +1555,18 @@ export class BotState {
     if (!Array.isArray(this.data.recent)) this.data.recent = []
     if (!Array.isArray(this.data.pickerIds)) this.data.pickerIds = []
     if (!Number.isFinite(this.data.pickerAt)) this.data.pickerAt = 0
+    if (!Array.isArray(this.data.taskPickerCwds)) this.data.taskPickerCwds = []
+    if (!Number.isFinite(this.data.taskPickerAt)) this.data.taskPickerAt = 0
+    if (typeof this.data.activeTaskCwd !== 'string') this.data.activeTaskCwd = ''
+    if (typeof this.data.updateSkipped !== 'string') this.data.updateSkipped = ''
+    if (this.data.taskSessions === null || typeof this.data.taskSessions !== 'object'
+        || Array.isArray(this.data.taskSessions)) {
+      this.data.taskSessions = {}
+    }
+    if (this.data.agentStatus === null || typeof this.data.agentStatus !== 'object'
+        || Array.isArray(this.data.agentStatus)) {
+      this.data.agentStatus = {}
+    }
   }
 
   save() {
@@ -974,6 +1611,50 @@ export class BotState {
       for (const k of keys.slice(0, keys.length - max)) delete this.data.sentRefs[k]
     }
     this.save()
+  }
+
+  /**
+   * 记下「每个 agent 上次已知的状态」（`running` / `idle`），落盘。
+   *
+   * 为什么要落盘：插件判断"这一轮跑完了"靠的是**内存里**那张状态表的
+   * `running → idle` 这个边。插件在回合中途被重装、DSH 中途重启，内存里的表就没了，
+   * 于是"跑完了"既不发 QQ 通知、也不写 agentmd 日志，**整段逻辑静默跳过**
+   * （2026-10-05 主人报的故障）。落盘之后，重新加载时能把 `running` 读回来，
+   * 那个边就还在。
+   *
+   * ⚠️ 只记 `running` / `idle` 两种 —— 别的状态（如果宿主将来发了）会盖掉"它正在跑"
+   * 这个事实，反而不如不记。
+   *
+   * @param {string} agentId
+   * @param {string} status
+   * @param {number} [max] - 最多留多少个 agent。
+   * @param {number} [ttlMs] - 超过这个时长没更新的条目算过期（默认 24 小时）。
+   */
+  markAgentStatus(agentId, status, max = 50, ttlMs = 24 * 60 * 60 * 1000) {
+    if (!agentId) return
+    if (status !== 'running' && status !== 'idle') return
+    if (this.data.agentStatus === null || typeof this.data.agentStatus !== 'object'
+        || Array.isArray(this.data.agentStatus)) {
+      this.data.agentStatus = {}
+    }
+    const now = Date.now()
+    this.data.agentStatus[String(agentId)] = { s: status, at: now }
+    const map = this.data.agentStatus
+    for (const k of Object.keys(map)) {
+      if (!(Number(map[k]?.at) > now - ttlMs)) delete map[k]
+    }
+    const keys = Object.keys(map)
+    if (keys.length > max) {
+      keys.sort((a, b) => (Number(map[a]?.at) ?? 0) - (Number(map[b]?.at) ?? 0))
+      for (const k of keys.slice(0, keys.length - max)) delete map[k]
+    }
+    this.save()
+  }
+
+  /** 读回 `{ agentId: {s, at} }`（可能为空对象）。 */
+  agentStatusMap() {
+    const m = this.data.agentStatus
+    return (m && typeof m === 'object' && !Array.isArray(m)) ? { ...m } : {}
   }
 
   /** 按 `ref_msg_idx` 反查这条被引用消息属于哪个会话。 */
@@ -1053,45 +1734,219 @@ export class BotState {
  */
 export function extractRefIdx(data) {
   const ext = data?.message_scene?.ext
+  if (Array.isArray(ext)) {
+    for (const item of ext) {
+      const m = /^ref_msg_idx=(.+)$/.exec(String(item ?? '').trim())
+      if (m) return m[1].trim()
+    }
+  }
+  // 兜底（2026-10-05）：`ext` 里没有 `ref_msg_idx` 时，事件里的被引用消息元素带的
+  // `msg_idx` 与它是**同一个索引**。少这一条的话，官方一旦调整 ext 的组成，
+  // 引用识别会**静默**失效 —— 又变成"认不出这是哪次通知"。
+  const el = Array.isArray(data?.msg_elements) ? data.msg_elements[0] : null
+  return String(el?.msg_idx ?? '').trim()
+}
+
+/**
+ * 取出**这条新消息自己的**索引（`message_scene.ext` 里的 `msg_idx`）。
+ *
+ * 官方在「单聊消息事件」里说：同一个 `msg_id` 可能重复推送，建议结合 `msg_idx` 去重。
+ * ⚠️ 我们**先只拿它做观测、不据此丢消息**：万一 `msg_idx` 不是"每条消息唯一"，
+ * 按它去重会把正常消息**永久**丢掉 —— 那比偶尔重复进一次严重得多。见 qqruntime 里的用法。
+ *
+ * @param {object} data - C2C_MESSAGE_CREATE 的事件体。
+ * @returns {string} 本条消息的 msg_idx；没有则空串。
+ */
+export function extractMsgIdx(data) {
+  const ext = data?.message_scene?.ext
   if (!Array.isArray(ext)) return ''
   for (const item of ext) {
-    const m = /^ref_msg_idx=(.+)$/.exec(String(item ?? '').trim())
+    const m = /^msg_idx=(.+)$/.exec(String(item ?? '').trim())
     if (m) return m[1].trim()
   }
   return ''
 }
 
 /**
+ * 从 C2C_MESSAGE_CREATE 事件里取出**被引用那条消息本身**（正文 + 作者）。
+ *
+ * 🔴 2026-10-05 主人问了一句把我说醒的话：「我引用的消息，QQ 机器人那里不是可以
+ *    正确获取吗？应该有对应的接口吧？」—— **对，而且不用调任何接口**：
+ *    官方事件里就带着被引用消息的正文，我们以前只读了索引、把正文扔掉了。
+ *
+ * 官方「单聊消息事件」文档（message_type=103 引用消息）：
+ *   `msg_elements[0]` 就是被引用那条：
+ *     .msg_idx        —— 被引用消息的索引（与 `ext` 里的 `ref_msg_idx` 同值）
+ *     .content        —— 被引用消息的**正文**
+ *     .author.bot     —— 那条是不是机器人自己发的
+ *     .author.user_openid —— 发那条的人
+ *
+ * 有了正文，引用反查就多了一条**完全不依赖状态文件**的路：我发出去的每条消息里
+ * 都写着会话名（通知是「✅ main 跑完了」，回执是「✅ 收到…（main）」），
+ * 于是从正文里就能把会话认出来（见 {@link inferSessionFromQuote}）。
+ * 状态文件被清、sentRefs 被挤出 300 条上限、我压根没登记过——都还能认得。
+ *
+ * @param {object} data - C2C_MESSAGE_CREATE 的事件体。
+ * @param {string} [refIdx] - 已知的被引用索引；有就按它挑元素（理论上只有一个元素，这是防御）。
+ * @returns {{idx: string, content: string, bot: boolean, authorId: string}|null}
+ */
+export function extractQuoted(data, refIdx = '') {
+  const list = Array.isArray(data?.msg_elements) ? data.msg_elements : []
+  const els = list.filter((el) => el && typeof el === 'object')
+  if (els.length === 0) return null
+  const want = String(refIdx ?? '').trim()
+  const el = (want && els.find((e) => String(e.msg_idx ?? '').trim() === want)) || els[0]
+
+  const idx = String(el.msg_idx ?? '').trim()
+  const content = String(el.content ?? '').trim()
+  if (idx === '' && content === '') return null
+  const author = el.author && typeof el.author === 'object' ? el.author : {}
+  return {
+    idx,
+    content,
+    // 只有明确的 true 才算"我发的"：字段缺失时宁可当作别人发的（那只是少一条路，不会投错会话）
+    bot: author.bot === true,
+    authorId: String(author.user_openid ?? author.id ?? '').trim(),
+  }
+}
+
+/**
+ * 我方通知开头那一行：「✅ main 跑完了」「❓ main 想问你个事」「⚠️ main 出错了」。
+ * 见 {@link formatNotification} —— 会话名就在这儿。
+ */
+const QUOTE_HEAD_RE = /^[✅❓⚠️ℹ️]\s*(.+?)\s*(?:跑完了|想问你个事|出错了)$/gm
+/** 我方回执/尾巴里的会话名：「✅ 收到，我这就开始（main）」。 */
+const QUOTE_LABEL_RE = /（([^（）\n]{1,60})）/g
+
+/**
+ * 从**被引用消息的正文**里认出它属于哪个会话 —— 不需要 ref_idx 反查表。
+ *
+ * 两条判据，从严到宽：
+ *   ① 我方格式里的会话名：通知首行「✅ <会话> 跑完了」、回执括号「（<会话>）」。
+ *      只认**与现有会话标题完全相等**的候选 —— 猜错会话比认不出更糟（话会进错地方）。
+ *   ② 退一步：只有**我发的**消息才按首行猜（用户自己发的话里出现会话名，不代表那是话题）。
+ *      同一行里有多个标题时取**最长**的（"前端重构" 比 "前端" 更具体）。
+ *
+ * @param {{content?: string, bot?: boolean}|null} quote - {@link extractQuoted} 的结果。
+ * @param {Array<{id: string, title: string}>} sessions - 现有会话列表。
+ * @returns {{sessionId: string, session: string, how: string}|null}
+ */
+export function inferSessionFromQuote(quote, sessions) {
+  const content = String(quote?.content ?? '').trim()
+  if (content === '') return null
+  const known = (Array.isArray(sessions) ? sessions : [])
+    .map((s) => ({ id: String(s?.id ?? '').trim(), title: String(s?.title ?? '').trim() }))
+    .filter((s) => s.id !== '' && s.title !== '')
+  if (known.length === 0) return null
+  const byTitle = new Map(known.map((s) => [s.title, s]))
+
+  // ① 我方格式里的会话名（高置信）
+  const candidates = []
+  for (const m of content.matchAll(QUOTE_HEAD_RE)) candidates.push(m[1])
+  for (const m of content.matchAll(QUOTE_LABEL_RE)) candidates.push(m[1])
+  for (const c of candidates) {
+    const hit = byTitle.get(String(c).trim())
+    if (hit) return { sessionId: hit.id, session: hit.title, how: '引用正文里我方格式的会话名' }
+  }
+
+  // ② 我发的消息，按首行猜（低一档置信）
+  if (quote?.bot === true) {
+    const firstLine = content.split('\n')[0].trim()
+    let best = null
+    for (const s of known) {
+      // 单字标题（比如「主」）太容易撞上，不猜
+      if (s.title.length < 2 || !firstLine.includes(s.title)) continue
+      if (!best || s.title.length > best.title.length) best = s
+    }
+    if (best) return { sessionId: best.id, session: best.title, how: '引用正文首行里的会话名' }
+  }
+  return null
+}
+
+/**
+ * 决定「引用的这条消息算哪个会话」—— 三级兜底的**纯函数**部分（好测、好读）。
+ *
+ * 顺序（从确定到不确定，不能反）：
+ *   ① `exact`   —— `ref_idx` 精确命中登记表；
+ *   ② 引用**正文**里认出的会话 —— 见 {@link inferSessionFromQuote}；
+ *   ③ `recent`  —— 调用方给的"最近一条知道属于哪个会话的消息"（见 BotState.recentTarget）。
+ *
+ * ②还管一件**语义**上的事：如果认出来的会话**正卡在提问上等回答**（`pending.sessionId`
+ * 与之相同），那这条引用就得按**作答**处理（`kind: 'question'` + `askId`）——
+ * 否则它会被当成普通消息注入会话，而 agent 还在等那个答案，两边都僵住。
+ *
+ * @param {object} opts
+ * @param {object|null} [opts.exact] - `ref_idx` 精确反查结果。
+ * @param {{content?: string, bot?: boolean}|null} [opts.quoted] - {@link extractQuoted} 的结果。
+ * @param {Array<{id: string, title: string}>} [opts.sessions] - 现有会话列表。
+ * @param {{askId?: string, sessionId?: string}|null} [opts.pending] - 正在等回答的提问。
+ * @param {object|null} [opts.recent] - 最近一条兜底目标。
+ * @returns {object|null} 目标（内容认出来的会带 `viaContent` / `how` / `quoted`）。
+ */
+export function resolveQuoteTarget({ exact = null, quoted = null, sessions = [], pending = null, recent = null }) {
+  if (exact) return exact
+  const hit = inferSessionFromQuote(quoted, sessions)
+  if (hit) {
+    const isAsk = Boolean(pending && pending.sessionId === hit.sessionId)
+    return {
+      sessionId: hit.sessionId,
+      session: hit.session,
+      kind: isAsk ? 'question' : 'quote-content',
+      ...(isAsk ? { askId: pending.askId } : {}),
+      viaContent: true,
+      how: hit.how,
+      quoted: String(quoted?.content ?? ''),
+    }
+  }
+  return recent ?? null
+}
+
+/**
  * 决定一条 QQ 消息该往哪去。
  *
- * 规则（用户拍板）：
- *   - **引用**了我发的某条通知 → 回到**那条通知对应的会话**接着聊
- *   - **不引用** → 当作「跟机器人闲聊」，进闲聊会话
- *   - 例外：**有提问在等**时不引用也当作答 —— 否则 agent 会一直卡在等回答，
- *     而这条规则是"防卡死"的安全兜底，比严格照字面执行更重要
- *   - 例外：**刚看过 /sessions 列表**时回一个纯数字 → 切到列表里那个会话
- *     （但上面那条"有提问在等"仍然优先 —— 回「1」是在回答提问）
- *   - `/task` 等显式指令优先级最高，压过上面全部
+ * 🔴 规则只剩三条（主人 2026-10-07 18:1x 拍板：「只要我不引用信息或者信息前边不带 / 的命令
+ *    就是闲聊，**无论任何情况**」）：
+ *
+ *   ① 以 `/` 开头（前面可以带 `@机器人 ` 前缀）→ 显式指令，见 {@link routeIncoming}
+ *   ② 引用了我的某条消息 → 回到**那条消息对应的会话**（引用提问 = 作答）
+ *   ③ 其余**一律**当闲聊 → 进当前会话（`/sessions` 指定的那个，没指定就是闲聊会话）
+ *
+ *   1.0.24 起**没有例外**了。以前有两条"抢消息"的规则，都被这条要求删掉：
+ *     · 有提问在等时不引用也当作答 —— 现在要去**引用那条提问**（或点提问下面的按钮，
+ *       按钮发的是 `/answer N` 显式指令）。代价：agent 可能多等一轮，见 qqruntime 里
+ *       那两句提示（消息照投，只是顺带告诉你该怎么回答）。
+ *     · 刚看过名单时回一个纯数字 = 选名单 —— 现在一律当闲聊；选名单请点按钮或发
+ *       `/pick N`、`/open N`，这些本来就是显式指令。
+ *
+ *   代价知情的部分：一个光秃秃的数字现在会真的进会话（2026-10-07 09:09 那次「2」被
+ *   当成派活正文的现场就是这么来的）。主人明确选了"可预测"而不是"帮我猜"，所以这里
+ *   不再拦。qqruntime 会在"有提问在等 / 刚发过名单"时回一句提示，但**不改投递**。
  *
  * @param {object} opts
  * @param {string} opts.text - 消息正文。
  * @param {string} opts.refIdx - {@link extractRefIdx} 的结果。
- * @param {boolean} opts.hasPendingQuestion - 当前是否有提问在等回答。
+ * @param {boolean} opts.hasPendingQuestion - 当前是否有提问在等回答（只影响 `/answer` 那条指令）。
  * @param {object|null} opts.refTarget - {@link BotState.refTarget} 的结果。
- * @param {boolean} [opts.pickerActive] - 会话列表还在有效期内（见 {@link isPickerFresh}）。
+ * @param {boolean} [opts.hasQuote] - 这条消息引用了别的消息（默认按 `refIdx` 是否非空判断）。
+ *   单独给这个开关，是因为「引用了，但索引没拿到」也会发生（官方结构变动 / 异常事件）：
+ *   那时不该把它当成"没引用的闲聊"，该走引用那条路。
  * @returns {{kind: string, reason: string, text?: string, sessionId?: string, askId?: string}}
  */
-export function routeMessage({ text, refIdx, hasPendingQuestion, refTarget, pickerActive = false }) {
+export function routeMessage({
+  text, refIdx, hasPendingQuestion, refTarget, hasQuote = Boolean(refIdx),
+}) {
   const raw = String(text ?? '').trim()
   if (raw === '') return { kind: 'ignore', reason: '空消息' }
 
-  // ① 显式指令最优先：用户打了 `/task` 就是要覆盖默认判断
-  if (raw.startsWith('/')) {
-    return { ...routeIncoming(raw, { hasPendingQuestion }), reason: '显式指令' }
+  // ① 显式指令最优先：用户打了 `/task` 就是要覆盖默认判断。
+  //    ⚠️ 判之前先剥掉 `@机器人 ` 前缀 —— 消息按钮点出来的指令长这样。
+  const cmdText = stripBotMention(raw)
+  if (cmdText.startsWith('/')) {
+    return { ...routeIncoming(cmdText, { hasPendingQuestion }), reason: '显式指令' }
   }
 
   // ② 引用了我发的消息 → 回到那条消息对应的会话
-  if (refIdx) {
+  if (hasQuote) {
     // 引用的是我刚发的**截图**：它不属于任何会话，别硬塞进某个会话里。
     // 单独回一句更清楚（否则会落到下面 unknown_ref 的"认不出"上，误导成"太久被清理了"）。
     if (refTarget?.kind === 'screen') {
@@ -1117,19 +1972,18 @@ export function routeMessage({ text, refIdx, hasPendingQuestion, refTarget, pick
     return { kind: 'unknown_ref', text: raw, reason: '引用的消息认不出来' }
   }
 
-  // ③ 没引用：有提问在等就先作答（防 agent 卡死），否则当闲聊
+  // ③ 其余**一律**闲聊（1.0.24 起没有例外）。
   //
-  // 🔴 作答**优先于**选会话：agent 卡在提问上等你回「1」的时候，
-  //    那个「1」是在回答它，不是在说"切到第 1 个会话"。
-  //    顺序反了会让 agent 永远等不到答案 —— 这是最不能犯的错。
-  if (hasPendingQuestion) return { kind: 'answer', text: raw, reason: '有提问在等，按作答处理' }
-
-  // ④ 刚看过 /sessions 的名单，回一个纯数字 = 选会话。
-  //    只在名单还有效的那几分钟内生效（见 PICK_WINDOW_MS），
-  //    否则你很久以后随口说的「2」会被解释成"切会话"。
-  if (pickerActive && /^\d+$/.test(raw)) {
-    return { kind: 'pick_session', index: Number(raw), text: raw, reason: '刚发过会话列表，按选择处理' }
-  }
-
-  return { kind: 'chat', text: raw, reason: '闲聊' }
+  // 🔴 这里以前还有三条分支：有提问在等就当作答、刚看过名单的纯数字就当选择、
+  //    以及"哪个名单都解释不了"的纯数字被拦下来问一句。主人 2026-10-07 明确要求
+  //    「只要我不引用信息或者信息前边不带 / 的命令就是闲聊，无论任何情况」——
+  //    三条全删。理由是他要的是**可预测**：一句话去哪，只由"有没有引用"和
+  //    "带不带 /"决定，不再看他刚才看过什么名单、agent 是不是在等回答。
+  //
+  //    代价写在明处（这是我们主动交换掉的）：
+  //      · agent 卡在提问上时，普通消息不再当答案 —— 要回答就**引用那条提问**
+  //        （或点它下面的按钮，按钮发的是 `/answer N`）。qqruntime 会在这种时候
+  //        补一句提示，否则 agent 会一直等。
+  //      · 手打一个「2」不再等于选名单 —— 选名单请点按钮或发 `/pick 2` / `/open 2`。
+  return { kind: 'chat', text: raw, reason: '闲聊（不引用、不带 / 就是闲聊）' }
 }

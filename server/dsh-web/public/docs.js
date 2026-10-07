@@ -17,7 +17,7 @@
 
 (function () {
   const F = window.DOCS_FIGS || {};
-  const V = '1.0.0';   // 教程对应的插件版本（每次发版要跟着改）
+  const V = '1.0.13';   // 教程对应的插件版本（每次发版要跟着改）
 
   /** 真截图（图片文件在 /docs-img/，由 _docs-shots.mjs 真跑出来） */
   function shot(name, alt) {
@@ -27,6 +27,39 @@
   const fig = (k) => F[k] || '';
   function code(text) {
     return '<pre class="doc-code"><code>' + text + '</code></pre>';
+  }
+  const esc = (s) => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  /* ── 一键安装：把这段文字复制给 DSH ──────────────────────────────────────
+     这段文字与 GitHub README 里那段是同一条（改一处就要改另一处）：
+     它是给**另一个 AI**读的指令，所以写成"请你执行 + 装完核对 + 提醒我重启"三件事。
+     ⚠️ 复制按钮不能用 navigator.clipboard 一条路：
+       本站跑在 http 上（QQ 内置浏览器只认 http + 大写域名）⇒ 非安全上下文里
+       navigator.clipboard 是 undefined，必须留 execCommand 兜底；
+       兜底也可能被 WebView 拦 ⇒ 最后一步把文字**选中**并明说"长按复制"，绝不静默失败。 */
+  const INSTALL_PROMPT =
+    '帮我把 dsh-remote-qqbot 装到 DSH 里。\n'
+    + '\n'
+    + '请执行这条命令，源是 GitHub，仓库里带了构建好的 lib/，装完即可用：\n'
+    + 'dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot\n'
+    + '\n'
+    + '如果你这台是 dsh web 起的，把 --profile desktop 换成 --profile web。\n'
+    + '\n'
+    + '装完核对一次结果（版本号、profile 的 bundles 里有没有 dsh-remote-qqbot），\n'
+    + '然后提醒我：要重启 DSH 才会生效。';
+
+  let copySeq = 0;
+  /** 一个可复制的文本块 + 复制按钮（按钮靠事件委托接线，见 bind()） */
+  function copyBox(text, hint) {
+    const id = 'docCopy' + (++copySeq);
+    return '<div class="doc-copy">'
+      + '<div class="doc-copy-head">'
+      + '<button type="button" class="doc-copy-btn" data-copy="' + id + '">复制这段文字</button>'
+      + '<span class="doc-copy-hint">' + (hint || '复制后粘进 DSH 的输入框发出去') + '</span>'
+      + '</div>'
+      + '<pre class="doc-code doc-copy-text" id="' + id + '"><code>' + esc(text) + '</code></pre>'
+      + '</div>';
   }
 
   /* ═════════════════════ 章节内容 ═════════════════════ */
@@ -46,13 +79,15 @@
         + '<li><b>查看屏幕</b>：在菜单里选「屏幕」，手机会收到一张电脑桌面截图。</li>'
         + '<li><b>完整回答存在服务器</b>：QQ 里带一条链接，点开是排版好的原文（标题、表格、代码块）。</li>'
         + '<li><b>跨会话记忆</b>：不同会话共用一份记忆，换会话不需要重新交代背景。</li>'
+        + '<li><b>远程更新</b>：QQ 里发 <code>/update</code> 就装上插件的新版本，装完自动重启 DSH。</li>'
         + '</ul>'
         + '<p>默认方式最保守：正文<b>只发到 QQ，不经过服务器</b>。'
         + '要存到服务器，需要先打开上传开关。</p>'
         + fig('arch')
         + '<h2 id="%ID%-b">三步开始使用</h2>'
         + '<div class="doc-steps">'
-        + '<div class="doc-step"><b>①</b><div><b>装插件</b><span>一条命令装进 desktop profile。'
+        + '<div class="doc-step"><b>①</b><div><b>装插件</b><span>让 DSH 自己装（把第 2 章那段文字发给它），'
+        + '或自己执行一条命令。'
         + '<a href="#docs/install">见第 2 章</a></span></div></div>'
         + '<div class="doc-step"><b>②</b><div><b>接 QQ 机器人</b><span>填入 AppID 与密钥，把机器人加为好友。'
         + '<b>这两步做完即可使用</b>。'
@@ -76,18 +111,30 @@
     {
       id: 'install',
       nav: '装上插件',
-      lead: '插件<b>没有发布到 npm</b>。需要安装包可以加 QQ <b>1103416608</b> 索取 tgz，'
-        + '有源码也可以自己打包；两种方式都用一条命令装进 desktop profile。',
+      lead: '插件<b>没有发布到 npm</b>。两种装法：让 DSH 自己装（最省事），或手动执行一条命令。'
+        + '装完都要<b>重启 DSH</b> 才会生效。',
       html:
-        '<h2 id="%ID%-a">安装步骤</h2>'
+        '<h2 id="%ID%-a">一、让 DSH 自己装</h2>'
+        + '<p>DSH 自己能装插件。点下面的按钮复制这段文字，粘进 DSH 的输入框发出去，'
+        + '它会自己安装、核对版本，再提醒你重启。</p>'
+        + copyBox(INSTALL_PROMPT)
+        + '<div class="doc-callout">这台机器连不上 GitHub 时（公司网络、代理、被墙），'
+        + '让 DSH 装它会失败。那就用下面第二种方式，从本地安装包装。</div>'
+        + '<h2 id="%ID%-b">二、手动安装</h2>'
         + fig('install')
-        + '<h3 id="%ID%-a1">第 1 步 · 装进 desktop profile</h3>'
+        + '<h3 id="%ID%-b1">方式一 · 从 GitHub 装</h3>'
+        + code('dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot')
+        + '<p>插件仓库：<a href="https://github.com/cyanovo/dsh-remote-qqbot" target="_blank" rel="noopener noreferrer">github.com/cyanovo/dsh-remote-qqbot</a>'
+        + '（想先看代码再装、装完想提问题、或想自己改，都从这里进；上面的命令就是从这个仓库装的）。</p>'
+        + '<p>仓库里带了构建好的 <code>lib/</code>，<b>装完即可使用，不需要本地构建</b>。'
+        + '桌面版用 <code>--profile desktop</code>，<code>dsh web</code> 起的用 <code>--profile web</code>；'
+        + '装到另一个 profile 里不会生效。</p>'
+        + '<h3 id="%ID%-b2">方式二 · 从本地安装包装</h3>'
         + code('npm run pack                                          # 有源码才需要，产出 dsh-remote-qqbot-<版本>.tgz\n'
           + 'dsh plugin --profile desktop add ./dsh-remote-qqbot-<版本>.tgz')
-        + '<p>包内已包含构建好的 <code>lib/</code>，<b>安装后即可使用，不需要本地构建</b>。'
-        + '桌面版用 <code>--profile desktop</code>，<code>dsh web</code> 启动的用 <code>--profile web</code>；'
-        + '装到错误的 profile 不会生效。</p>'
-        + '<div class="doc-warn"><b>安装本地 tgz 时的两个常见错误</b>'
+        + '<p>没有源码、只拿到一个 tgz 文件时，只执行第二条。'
+        + '安装包可以加 QQ <b>1103416608</b> 索取。</p>'
+        + '<div class="doc-warn"><b>装本地 tgz 时的两个常见错误</b>'
         + '<ul>'
         + '<li><b>文件名前必须加 <code>./</code></b>。写成裸文件名，pnpm 会按 npm 上的包名下载，'
         + '报 <code>ERR_PNPM_FETCH_404</code>。</li>'
@@ -97,17 +144,17 @@
         + '安装后回读 <code>dsh.profile.bundles</code> 确认插件仍在列表中（'
         + '<code>remove</code> 会一并移除该条目）。</li>'
         + '</ul></div>'
-        + '<h3 id="%ID%-a2">第 2 步 · 填 QQ 凭证</h3>'
+        + '<h2 id="%ID%-c">三、填 QQ 凭证</h2>'
         + '<p>在 <b>设置 → QQ 远程提醒与跨会话记忆</b> 里打开「QQ 机器人通道」，填入 <b>AppID</b> 与 '
         + '<b>ClientSecret</b>。<b>这是插件的必要条件</b>：不填，提醒、反向对话、'
         + '截图、会话切换都无法使用，网页端不受影响。</p>'
-        + '<h3 id="%ID%-a3">第 3 步 · 重启 DSH</h3>'
+        + '<h2 id="%ID%-d">四、重启 DSH</h2>'
         + '<p><b>不重启则不生效</b>，这是最常见的错误。DSH 是长驻进程，'
         + '插件代码只在启动时加载；磁盘上的文件更新后，内存里运行的仍是旧版本。</p>'
         + '<div class="doc-callout">判断当前运行的是哪一版，比较 '
         + '<b>安装目录里 <code>package.json</code> 的时间</b>与<b>主进程启动时间</b>。'
         + '不要看 <code>lib/*.js</code> 的时间：pnpm 解包不保留安装时刻。</div>'
-        + '<h2 id="%ID%-b">确认安装成功</h2>'
+        + '<h2 id="%ID%-e">五、确认装好了</h2>'
         + '<ul>'
         + '<li>在 QQ 里给机器人发 <code>/status</code>，会回复 QQ 的连接状态。</li>'
         + '<li>设置面板左侧出现「<b>QQ 远程提醒与跨会话记忆</b>」这一项。</li>'
@@ -117,6 +164,7 @@
         + '<li>仓库里附了验收脚本，安装后可以直接核对：'
         + '<code>node scripts/verify-installed.mjs</code>、<code>node scripts/verify-ui-installed.mjs</code>，'
         + '两个脚本都返回 0 才算正常。</li>'
+        + '<li>以后更新版本不用重装：QQ 里发 <code>/update</code>（见第 3 章）。</li>'
         + '</ul>'
         + shot('docs-desktop', '本教程页本身（桌面 1280 宽）：左章节 / 中正文 / 右目录')
     },
@@ -148,9 +196,14 @@
         + '<tr><td><code>/screen</code></td><td>把当前电脑桌面截一张图发到 QQ</td></tr>'
         + '<tr><td><code>/task</code></td><td>把这句话派给专属会话执行</td></tr>'
         + '<tr><td><code>/answer</code></td><td>回答当前挂着的问题</td></tr>'
+        + '<tr><td><code>/update</code></td><td>有新版本时装上，装完自动重启 DSH（中间十几秒连不上）；'
+        + '<code>/update check</code> 只查不装</td></tr>'
         + '<tr><td><code>/help</code></td><td>重新列出以上指令</td></tr>'
         + '</tbody></table>'
-        + '<p>中文别名也认：<code>/会话</code>、<code>/截图</code>、<code>/切</code>…</p>'
+        + '<p>中文别名也认：<code>/会话</code>、<code>/截图</code>、<code>/切</code>、<code>/更新</code>…</p>'
+        + '<p>更新不用重装：插件启动时查一次新版本，之后每 6 小时查一次，'
+        + '发现新版本就在 QQ 里提醒一次（同一个版本只提醒一次）。'
+        + '装完它自己会重启 DSH，重启完成后回一条「已生效」。</p>'
         + '<h2 id="%ID%-c">DSH 界面</h2>'
         + fig('dock')
         + '<p>输入框下方<b>只有这两个开关</b>。关闭 QQ 提醒不影响网页端；'
@@ -164,14 +217,20 @@
       lead: '绑定之后，存在服务器上的完整回答才<b>挂在你的账号下</b>：'
         + '按你的账号计数，按你的档位决定保留期，也只有登录后才能看到。',
       html:
-        '<h2 id="%ID%-a">为什么要绑定</h2>'
+        '<h2 id="%ID%-a">登录与注册</h2>'
+        + '<p>注册只要用户名和密码，另外填一次<b>图里的 4 位验证码</b>（防止脚本批量注册）。'
+        + '登录同样要填一次。看不清就点「换一张」，一张图可以填 3 次；'
+        + '<b>验证码填错不算密码错误</b>，不会累计到锁定账号的计数里。</p>'
+        + '<p>不登录也能读到本站的介绍页；<b>记录正文只有登录后才看得到</b>，'
+        + '插件的发布令牌读不到任何一条正文。</p>'
+        + '<h2 id="%ID%-b">为什么要绑定</h2>'
         + '<ul>'
         + '<li>不绑定：按免费版计，100 次/天、记录保留 5 小时，记录存在公共位置。</li>'
         + '<li>绑定后：按你的账号计数，付费版 1000 次/天、记录保留 48 小时。</li>'
         + '<li>记录正文<b>只认登录 cookie</b>：发布用的令牌读不到任何一条正文。</li>'
         + '</ul>'
         + fig('bind')
-        + '<h2 id="%ID%-b">操作步骤</h2>'
+        + '<h2 id="%ID%-c">操作步骤</h2>'
         + '<div class="doc-steps">'
         + '<div class="doc-step"><b>1</b><div><b>在 DSH 里让 agent 调用 <code>cloud_bind</code></b>'
         + '<span>它会返回一组 8 位码，形如 <code>7QK4-M2PD</code>。</span></div></div>'
@@ -183,7 +242,7 @@
         + '<div class="doc-warn"><b>必须调用两次。</b>第一次只是申请一组码，'
         + '第二次才是换取令牌。中间在浏览器里确认这一步不能少，只有一组码换不到任何权限。</div>'
         + shot('account-bind', '账号页：绑定插件区块（输入 8 位码）与「我的令牌」列表')
-        + '<h2 id="%ID%-c">关于令牌</h2>'
+        + '<h2 id="%ID%-d">关于令牌</h2>'
         + '<ul>'
         + '<li>插件的令牌<b>只显示一次</b>（创建时），服务端只保存 <code>sha256</code>。</li>'
         + '<li>丢失后不用重建账号：在账号页吊销它、再建一个新的，回到 DSH 重新绑定一次即可。</li>'
@@ -304,8 +363,27 @@
         + '它会直接回复 QQ 是否连通。没连上通常是三种原因：'
         + 'AppID 或密钥填错；<b>没有把机器人加为好友并发过消息</b>（拿不到 open_id）；'
         + '安装后没有重启 DSH。</dd>'
+        + '<dt>跑完了，但 QQ 没有收到「跑完了」提醒</dt>'
+        + '<dd>先确认装的是 <b>1.0.13 或更新的版本</b>：'
+        + '旧版本在「插件跑到一半被更新过、而 DSH 没重启」这种情况下，'
+        + '这一轮的完成通知会<b>静默丢掉</b>，日志里也什么都不写。'
+        + '更新命令见下面的「安装与更新」。</dd>'
         + '</dl>'
         + fig('status')
+        + '<h2 id="%ID%-b">安装与更新</h2>'
+        + '<dl class="doc-faq">'
+        + '<dt>把「一键安装」那段文字发给 DSH，它说装不上</dt>'
+        + '<dd>那段文字让它从 GitHub 拉包。拉不动多半是网络原因（代理、公司网络、'
+        + 'GitHub 本身不稳），换成第 2 章「方式二 · 从本地安装包装」即可；'
+        + '没有安装包就加 QQ <b>1103416608</b> 要一个。</dd>'
+        + '<dt>插件怎么更新</dt>'
+        + '<dd>在 QQ 里发 <code>/update</code>（中文 <code>/更新</code>）。'
+        + '插件启动时也会查一次新版，之后每 6 小时查一次，发现新版本在 QQ 里提醒一次'
+        + '（同一个版本只提醒一次，不会反复打扰）。<code>/update check</code> 只查不装。</dd>'
+        + '<dt>更新过了，界面还是旧样子</dt>'
+        + '<dd>没重启就等于没更新。装完插件会自动重启 DSH，'
+        + '自动重启失败时手动重启一次桌面版即可。</dd>'
+        + '</dl>'
         + '<dl class="doc-faq">'
         + '<dt>链接点开是空白 / 提示「如需预览请用浏览器打开」</dt>'
         + '<dd>QQ 按<b>域名信任级别</b>拦截链接。使用消息里那条原文链接（大写域名 + http）即可；'
@@ -317,7 +395,7 @@
         + '<dd>旧版本的缺陷：抓屏脚本缺少一行 DPI 声明，已在 0.8.3 修复。'
         + '仍在旧版本上就安装新版本，并<b>重启 DSH</b>。</dd>'
         + '</dl>'
-        + '<h2 id="%ID%-b">DSH 相关</h2>'
+        + '<h2 id="%ID%-c">DSH 相关</h2>'
         + '<dl class="doc-faq">'
         + '<dt>设置里改了值，过一会儿又变回去了</dt>'
         + '<dd>桌面版对第三方插件的设置写入有限制，插件会退回自己的覆盖文件。'
@@ -330,8 +408,11 @@
         + '<dd>它读取插件实际使用的配置。显示未连接但 QQ 能收消息，'
         + '通常是 QQ 凭证没配齐（缺少 AppID 或密钥）。</dd>'
         + '</dl>'
-        + '<h2 id="%ID%-c">服务器相关</h2>'
+        + '<h2 id="%ID%-d">服务器相关</h2>'
         + '<dl class="doc-faq">'
+        + '<dt>注册或登录时那张验证码图填不对</dt>'
+        + '<dd>点「换一张」重新来。一张图可以填 3 次，超过这张就作废；'
+        + '验证码填错<b>不算密码错误</b>，不会计入登录失败次数。</dd>'
         + '<dt>提示「今天次数用完了」</dt>'
         + '<dd>免费版 100 次/天、付费版 1000 次/天，按<b>自然日</b>重置。'
         + '第 1 档（正文直接发到 QQ）不占额度，不需要计数。</dd>'
@@ -520,11 +601,54 @@
     open(id || CH[0].id);
   }
 
+  /** 复制按钮：三级兜底，任何一级失败都要在界面上说出来（绝不静默） */
+  function doCopy(btn) {
+    const pre = document.getElementById(btn.getAttribute('data-copy') || '');
+    if (!pre) { say('复制失败：找不到那段文字', 'err'); return; }
+    const text = pre.textContent.replace(/^\s*\n/, '').replace(/\s+$/, '');
+    const label = function (s) { btn.textContent = s; };
+    const okDone = function () {
+      label('已复制');
+      btn.classList.add('is-done');
+      clearTimeout(btn._t);
+      btn._t = setTimeout(function () { label('复制这段文字'); btn.classList.remove('is-done'); }, 2200);
+      say('已复制，去 DSH 里粘贴');
+    };
+    /* 兜底一：老 API（http 页面、老 WebView 只有它） */
+    const legacy = function () {
+      try {
+        const r = document.createRange();
+        r.selectNodeContents(pre);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+        return document.execCommand('copy') === true;
+      } catch (e) { return false; }
+    };
+    /* 兜底二：两条路都不通 ⇒ 把文字选中，并明说"长按复制" */
+    const manual = function () {
+      legacy();
+      label('长按选中复制');
+      say('这台设备不让脚本复制：文字已选中，长按选「复制」', 'err');
+      clearTimeout(btn._t);
+      btn._t = setTimeout(function () { label('复制这段文字'); }, 4000);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(okDone, function () { if (!legacy()) manual(); });
+    } else if (!legacy()) { manual(); }
+  }
+  function say(msg, kind) {
+    if (typeof window.toast === 'function') window.toast(msg, kind);
+    else console.log('[docs] ' + msg);
+  }
+
   /* ── 事件（全部用委托，避免内容重渲染后丢监听） ── */
   function bind() {
     document.addEventListener('click', function (ev) {
       const t = ev.target;
       if (!t || !t.closest) return;
+      const copyBtn = t.closest('.doc-copy-btn');
+      if (copyBtn) { ev.preventDefault(); doCopy(copyBtn); return; }
       const tocBtn = t.closest('.docs-toc-link');
       if (tocBtn) { ev.preventDefault(); goSec(tocBtn.getAttribute('data-sec')); return; }
       const navItem = t.closest('.docs-nav-item');

@@ -12,7 +12,7 @@
  */
 
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, copyFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
@@ -603,8 +603,55 @@ await test('回归：两个会话在去重窗口内先后完成，两条都要�
   }
 })
 
-console.log('\n子智能体不打扰（回归）:')
+await test('★ 回归：被打断的那一轮不再推「跑完了」（旧实现会把上一轮回复重复推给 QQ）', async () => {
+  const calls = []
+  const original = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) })
+    return { ok: true, status: 200, text: async () => '{}' }
+  }
+  const root = await mkdtemp(join(tmpdir(), 'plugin-interrupt-'))
+  await writeFile(join(root, 'main.md'), SAMPLE, 'utf8')
+  const lines = []
+  const originalLog = console.log
+  console.log = (...args) => { lines.push(args.map(String).join(' ')) }
+  try {
+    const h = makeCtx({
+      settings: { hubUrl: 'https://example.com/dsh', token: 't', agentmdDir: root, agentmdAppendLog: true },
+    })
+    MOD.apply(h.ctx, {})
+    // 2026-10-07 事故现场的真实形状：上一轮 Q1/A1 已完整落盘，主人发来本轮 Q2
+    // 把上一轮打断 ⇒ 本轮**没有** assistant/message。
+    const session = {
+      header: { id: 'sess-int', cwd: 'D:\\cyanproject\\agenttool' },
+      events: [
+        { type: 'user/message', seq: 1, data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '上一轮的问题' }] } },
+        { type: 'assistant/message', seq: 2, data: { message: { role: 'assistant', content: [{ type: 'text', text: '上一轮的回答' }] } } },
+        { type: 'user/message', seq: 3, data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '这一轮的问题' }] } },
+      ],
+    }
+    const agent = h.makeAgent('a1', session)
+    h.emit('agent/status', { agent, status: 'running' })
+    h.emit('agent/status', { agent, status: 'idle' })
+    await new Promise((r) => setTimeout(r, 300))
 
+    assert.equal(calls.length, 0, `本轮没有回复就不该推「跑完了」，实际推了 ${calls.length} 条`)
+    assert.ok(lines.join('\n').includes('本轮没有助手回复'), `日志要说明为什么跳过：\n${lines.join('\n')}`)
+
+    // 中断也要留痕，但绝不能把上一轮的回答写进这一行。
+    const text = await readFile(join(root, 'main.md'), 'utf8')
+    const row = text.split('\n').find((l) => l.includes('这一轮的问题'))
+    assert.ok(row, `本轮仍应追加一行日志，实际:\n${text}`)
+    assert.ok(!row.includes('上一轮的回答'), `结果列不得出现上一轮的回复：${row}`)
+    assert.ok(row.includes('| 已中断（无回复） |'), `结果列应为「已中断（无回复）」：${row}`)
+  } finally {
+    console.log = originalLog
+    globalThis.fetch = original
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+console.log('\n子智能体不打扰（回归）:')
 await test('子智能体（origin=subagent）跑完时不推中枢', async () => {
   const calls = []
   const original = globalThis.fetch
@@ -813,6 +860,299 @@ await test('提问兜底文案带编号选项：中继彻底接不上时，QQ �
   let reachedNext = false
   h.emit('tools/pre-execute', exec, () => { reachedNext = true })
   assert.equal(reachedNext, true, 'pre-execute 必须继续放行，不能吞掉提问')
+})
+
+console.log('\n跨重载的「跑完了」判定（2026-10-05 主人报的 bug 的回归）:')
+
+/**
+ * 🔴 事故现场（2026-10-05）：主人在 QQ 里派的一轮任务跑完，**一条通知都没有**。
+ *
+ * 取证三件事互相印证：线上 nginx 没有那一轮的 `/api/publish` 请求、状态文件里没有
+ * 新的 turn-complete、`agentmd/main.md` §四 没有对应行 —— 不是"推送失败"，而是
+ * **整段完成逻辑压根没执行**：判断完成只看内存里的 `running → idle` 边，而那一轮跑到
+ * 一半时 desktop profile 里的插件包被替换过（宿主没重启），表被清空，边就永远等不到。
+ *
+ * 下面这几条就是那个场景的回归。反向校验（把 src 回退到修复前）时，前三条必须报红。
+ */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+await test('★ 插件在回合中途被重装：状态文件里的 running 读得回来，idle 到了照样收尾（＝照样通知）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'plugin-reload-'))
+  await writeFile(join(root, 'main.md'), SAMPLE, 'utf8')
+  // ⚠️ 状态文件路径必须显式给：默认路径是**主人真实的** `~/.dsh/qq-bot-state.json`
+  //    （qqruntime 走 os.homedir()，测试里改 DSH_HOME 管不到它）—— 不隔离就会往真文件里写测试数据。
+  const stateA = join(freshDir('reload-state-a'), 'qq-bot-state.json')
+  const stateB = join(freshDir('reload-state-b'), 'qq-bot-state.json')
+  const settings = { agentmdDir: root, agentmdAppendLog: true }
+  const agentId = 'session-reload-1'
+  const session = makeSession({ user: '重启中途也要通知我', assistant: '已做完' })
+
+  // ① 第一个实例：这一轮跑到一半（只看见 running）→ 状态立刻落盘。
+  const a = makeCtx({ settings })
+  MOD.apply(a.ctx, { qqStateFile: stateA })
+  a.emit('agent/status', { agent: a.makeAgent(agentId, session), status: 'running' })
+  assert.ok(existsSync(stateA), 'running 必须立刻落盘，否则重载后就认不出"它正在跑"')
+
+  // ② 插件被重装：把这份状态文件搬到"重启后的位置"，再让一个**全新实例**去读它 ——
+  //    内存里什么都没有（路径变了 ⇒ 新的 BotState，必须真从盘上读）。
+  copyFileSync(stateA, stateB)
+  const b = makeCtx({ settings })
+  MOD.apply(b.ctx, { qqStateFile: stateB })
+  b.emit('agent/status', { agent: b.makeAgent(agentId, session), status: 'idle' })
+  await sleep(300)
+
+  const text = await readFile(join(root, 'main.md'), 'utf8')
+  assert.ok(text.includes('重启中途也要通知我'),
+    `跨重载后这一轮必须照常收尾（通知 + agentmd 日志是同一段代码），实际:\n${text}`)
+  await rm(root, { recursive: true, force: true })
+})
+
+await test('插件刚加载就收到无起点 idle：按启动快照跳过，且**留痕**（不许静默）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'plugin-bootsnap-'))
+  await writeFile(join(root, 'main.md'), SAMPLE, 'utf8')
+  const h = makeCtx({ settings: { agentmdDir: root, agentmdAppendLog: true } })
+  MOD.apply(h.ctx, { qqStateFile: join(freshDir('bootsnap-state'), 'qq-bot-state.json') })
+
+  const logs = []
+  const real = console.log
+  console.log = (...args) => { logs.push(args.map(String).join(' ')) }
+  try {
+    h.emit('agent/status', {
+      agent: h.makeAgent('session-fresh-9', makeSession({ user: 'x', assistant: 'y' })),
+      status: 'idle',
+    })
+    await sleep(200)
+  } finally { console.log = real }
+
+  assert.equal(await readFile(join(root, 'main.md'), 'utf8'), SAMPLE,
+    '刚加载时的无起点 idle 是启动快照，不该写日志、也不该推送')
+  assert.ok(logs.some((l) => l.includes('按启动快照处理')),
+    `必须留下"为什么没推"的痕迹，实际日志：\n${logs.join('\n')}`)
+  await rm(root, { recursive: true, force: true })
+})
+
+await test('★ 过了宽限期还是没看见起点：照常收尾（宁可多推一条，也不静默丢掉"跑完了"）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'plugin-lateidle-'))
+  await writeFile(join(root, 'main.md'), SAMPLE, 'utf8')
+  const h = makeCtx({ settings: { agentmdDir: root, agentmdAppendLog: true } })
+  MOD.apply(h.ctx, { qqStateFile: join(freshDir('lateidle-state'), 'qq-bot-state.json') })
+  const agent = h.makeAgent('session-late-1', makeSession({ user: '起点没看见也要收尾', assistant: '已做完' }))
+
+  // 把时钟拨到"插件已经加载 5 分钟"之后（宽限期是 2 分钟）—— 不能真等两分钟。
+  const realNow = Date.now
+  Date.now = () => realNow() + 5 * 60 * 1000
+  try {
+    h.emit('agent/status', { agent, status: 'idle' })
+    await sleep(300)
+  } finally { Date.now = realNow }
+
+  const text = await readFile(join(root, 'main.md'), 'utf8')
+  assert.ok(text.includes('起点没看见也要收尾'),
+    `过了宽限期的无起点 idle 必须照常收尾，实际:\n${text}`)
+  await rm(root, { recursive: true, force: true })
+})
+
+await test('子智能体走补救路径时照样写 agentmd 日志（对子智能体的抑制只在 push 里做）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'plugin-subagent-'))
+  await writeFile(join(root, 'main.md'), SAMPLE, 'utf8')
+  const h = makeCtx({ settings: { agentmdDir: root, agentmdAppendLog: true } })
+  MOD.apply(h.ctx, { qqStateFile: join(freshDir('subagent-state'), 'qq-bot-state.json') })
+  // 真实形状：子智能体 id 带 teammate 前缀（见 src/index.js 的 isSubagent）。
+  const sub = {
+    id: 'teammate-1',
+    ctx: { effect: () => () => {} },
+    session: makeSession({ user: '子任务也要留日志', assistant: 'done' }),
+    status: 'idle',
+  }
+
+  const realNow = Date.now
+  Date.now = () => realNow() + 5 * 60 * 1000
+  try {
+    h.emit('agent/status', { agent: sub, status: 'idle' })
+    await sleep(300)
+  } finally { Date.now = realNow }
+
+  const text = await readFile(join(root, 'main.md'), 'utf8')
+  assert.ok(text.includes('子任务也要留日志'),
+    `子智能体在补救路径上也要写 agentmd 日志，实际:\n${text}`)
+  await rm(root, { recursive: true, force: true })
+})
+
+/**
+ * 🔴 下面这两节**故意** import `../src/index.js`，而不是像上面那样用 `../lib/index.js`。
+ *
+ * 原因：`lib/` 是 `node scripts/build.mjs` 的产物，而本轮修复只允许改 `src/`；
+ * 不跑 build 的话 lib 还是旧字节，新导出的纯函数在它里面根本不存在。要按本仓库的铁律
+ * 「验行为要跑函数」，就只能直接跑源码。构建之后 `src/` 与 `lib/` 是同一份字节，结论不变。
+ */
+const SRC = await import('../src/index.js')
+
+console.log('\n云端解绑后的正文去向（安全修复 A：绝不回落公开中枢）:')
+
+await test('★ 云令牌被清空（= cloud_unbind）后，正文一个字节都不发 —— 尤其不发公开中枢', async () => {
+  // 事故形状：`cloud_unbind` 只把 cloudToken 置空，而 publishTurnNote 的第一步是
+  // `if (cloudUrl && cloudToken)`，token 一空就掉到「路线二：中枢（公开 markdown 短链）」。
+  // 于是「之后完整回答不再上传」变成了「改发到更公开的地方」—— 用户最不期望的转发。
+  // 这条真跑一轮：配置成"有 cloudUrl、没 cloudToken、有 hubUrl"，然后看有没有请求出去。
+  const calls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), body: init.body ? JSON.parse(init.body) : undefined })
+    return {
+      ok: true, status: 200,
+      text: async () => JSON.stringify({ ok: true, id: 'z', url: 'https://hub.test/dsh/z.md' }),
+      json: async () => ({ ok: true, id: 'z', url: 'https://hub.test/dsh/z.md' }),
+    }
+  }
+  const lines = []
+  const realLog = console.log
+  console.log = (...args) => { lines.push(args.map(String).join(' ')) }
+  try {
+    const h = makeCtx({
+      settings: {
+        cloudEnabled: true, qqFulltextMode: 'note-link', notesEnabled: true,
+        cloudUrl: 'http://cloud.test', cloudToken: '', // ← cloud_unbind 之后就是这个状态
+        hubUrl: 'https://hub.test', token: 'hub-tok',
+        qqEnabled: false, agentmdDir: '',
+      },
+    })
+    SRC.apply(h.ctx, {})
+    const agent = h.makeAgent('a1', makeSession({
+      user: '把这段存下来', assistant: '这是一段足够长的完整回答正文，用来触发"要不要上传"那段路径。',
+    }))
+    h.emit('agent/status', { agent, status: 'running' })
+    h.emit('agent/status', { agent, status: 'idle' })
+    await new Promise((r) => setTimeout(r, 300))
+
+    assert.equal(calls.filter((c) => c.url.includes('/api/notes')).length, 0,
+      `🔴 解绑之后绝不能把正文发到**公开可读**的中枢，实际请求：${calls.map((c) => c.url).join(', ')}`)
+    assert.equal(calls.filter((c) => c.url.includes('/api/publish')).length, 0,
+      '也不该发云端 —— 令牌已经没了')
+    assert.ok(lines.join('\n').includes('云端令牌已解绑，本次不上传（也不改发中枢）'),
+      `必须留一行明确的日志说明"这次不上传"，实际：\n${lines.join('\n')}`)
+    // 通知本身不能因为不上传就丢：这是「少一个链接」，不是「少一条通知」。
+    assert.equal(calls.filter((c) => c.body && c.body.kind === 'turn-complete').length, 1,
+      '推送照发（只是没有正文链接）')
+  } finally {
+    console.log = realLog
+    globalThis.fetch = originalFetch
+  }
+})
+
+console.log('\n闲聊只读（安全修复：失败可见 + 可恢复，2026-10-07）:')
+
+// 下面六条都在跑 `planChatReadOnly` 这个真函数（不是断言源码里出现过某个字符串）。
+await test('planChatReadOnly ①：开关关掉 + 记忆里有原预设 → restore，并带上那个原预设名', () => {
+  const plan = SRC.planChatReadOnly({
+    want: false, presetsAvailable: true, hasSession: true,
+    current: 'read-only', remembered: 'danger-full-access',
+  })
+  assert.equal(plan.action, 'restore')
+  assert.equal(plan.preset, 'danger-full-access', '必须带原预设名，否则恢复不回正确的那个')
+  assert.equal(plan.reason, '')
+})
+
+await test('planChatReadOnly ②：want=true 且已达只读 → ok（不重复 set，别往事件流里刷噪音）', () => {
+  const plan = SRC.planChatReadOnly({
+    want: true, presetsAvailable: true, hasSession: true,
+    current: 'read-only', remembered: '',
+  })
+  assert.equal(plan.action, 'ok')
+  assert.notEqual(plan.action, 'set')
+  assert.equal(plan.preset, 'read-only')
+})
+
+await test('planChatReadOnly ③：want=true 但预设服务不可用 → fail 且 reason 非空', () => {
+  const plan = SRC.planChatReadOnly({ want: true, presetsAvailable: false, hasSession: true })
+  assert.equal(plan.action, 'fail')
+  assert.ok(String(plan.reason).trim().length > 0,
+    '失败必须带原因 —— 界面那行要显示"没能生效：<原因>"，空原因等于又变成静默失败')
+})
+
+await test('planChatReadOnly ④：want=true 但拿不到会话对象 → fail', () => {
+  const plan = SRC.planChatReadOnly({ want: true, presetsAvailable: true, hasSession: false })
+  assert.equal(plan.action, 'fail')
+  assert.ok(String(plan.reason).trim().length > 0)
+})
+
+await test('planChatReadOnly ⑤：服务可用 + current=danger-full-access → set 到 read-only', () => {
+  const plan = SRC.planChatReadOnly({
+    want: true, presetsAvailable: true, hasSession: true,
+    current: 'danger-full-access', remembered: '',
+  })
+  assert.equal(plan.action, 'set')
+  assert.equal(plan.preset, 'read-only')
+})
+
+await test('planChatReadOnly ⑥：第四种失败 —— 预设里没有 read-only 这个名字 → fail（不是硬 set）', () => {
+  const plan = SRC.planChatReadOnly({
+    want: true, presetsAvailable: true, hasSession: true, current: 'default',
+    presetNames: ['default', 'danger-full-access'],
+  })
+  assert.equal(plan.action, 'fail')
+  assert.match(String(plan.reason), /read-only/, '原因里要写清是哪个名字没有')
+})
+
+await test('★ 失败之后 warn 行真的会出现（不是只写 console 日志）', () => {
+  SRC.clearChatReadOnlyFailure()
+  assert.equal(SRC.chatReadOnlyStatusLine(), null, '没失败过就不许有这一行（成功时也不加噪音）')
+
+  // 真跑一遍判断：预设服务不可用 = 四种失败之一。
+  const plan = SRC.planChatReadOnly({ want: true, presetsAvailable: false, hasSession: true, current: '' })
+  assert.equal(plan.action, 'fail')
+  // 这一行就是 ensureChatReadOnly 的 fail 分支里做的事（同一个函数，不是测试自己造状态）。
+  assert.equal(SRC.recordChatReadOnlyFailure(plan.reason), false,
+    '记录失败要返回 false（= 这次没能强制成只读）')
+
+  const line = SRC.chatReadOnlyStatusLine()
+  assert.ok(line, '失败后必须有这一行')
+  assert.equal(line.label, '闲聊只读')
+  assert.equal(line.warn, true, '必须标 warn —— 否则界面上它和普通状态行没区别')
+  assert.match(line.value, /没能生效/)
+  assert.match(line.value, /会话原权限/, '要说清"这次是按会话原权限跑的"')
+
+  // 再走一遍**真实的 apply**：运行状态快照里必须能看到同一行（statusLines 真的接了这条）。
+  const h = makeCtx({ settings: { agentmdDir: '' } })
+  SRC.apply(h.ctx, {})
+  const shown = SRC.lastStatusLines()
+  const hit = shown.find((r) => r.label === '闲聊只读')
+  assert.ok(hit, `statusLines 里应出现「闲聊只读」，实际：${JSON.stringify(shown)}`)
+  assert.equal(hit.warn, true)
+  assert.match(hit.value, /没能生效/)
+
+  // 收尾：这是模块级状态，别污染后面的用例。
+  SRC.clearChatReadOnlyFailure()
+  assert.equal(SRC.chatReadOnlyStatusLine(), null, '清掉之后这行就该消失')
+})
+
+await test('★ 插件停止时把记过的会话恢复回原预设（不是单向棘轮），且失败不抛', async () => {
+  const setCalls = []
+  const session = { events: [], header: { id: 'sess-stop' } }
+  const state = { remembered: new Map([['sess-stop', 'danger-full-access']]) }
+  const restored = SRC.restoreRememberedChatPresets({
+    getPresets: () => ({ names: ['read-only'], set: (s, name) => setCalls.push([s, name]) }),
+    getSession: (id) => (id === 'sess-stop' ? session : undefined),
+    state,
+  })
+  assert.equal(restored, 1)
+  assert.deepEqual(setCalls, [[session, 'danger-full-access']], '必须真的 set 回原预设')
+  assert.equal(state.remembered.size, 0, '恢复过就把记录删掉（只恢复一次）')
+
+  // 拿不到服务时：只记日志、留着记录（下次再试），绝不抛。
+  const state2 = { remembered: new Map([['sess-x', 'read-only']]) }
+  const logs = []
+  const n = SRC.restoreRememberedChatPresets({
+    getPresets: () => undefined, getSession: () => undefined,
+    log: (m) => logs.push(m), state: state2,
+  })
+  assert.equal(n, 0)
+  assert.equal(state2.remembered.size, 1, '恢复不了就留着，别把记录吃掉')
+  assert.ok(logs.length > 0, '恢复失败也必须留日志，不能静默')
+
+  // 光有这个函数、插件停止时没人调它，等于没做 —— 把接线也钉住（行为那半在上面已真跑）。
+  const src = await readFile(join(import.meta.dirname, '..', 'src', 'index.js'), 'utf8')
+  assert.match(src, /ctx\.effect\?\.\(\(\) => \(\) => restoreAllChatPresets\(\)\)/,
+    '插件停止（ctx.effect 清理）里必须真的调用恢复动作')
 })
 
 console.log(`\n通过 ${passed} / 失败 ${failed}`)

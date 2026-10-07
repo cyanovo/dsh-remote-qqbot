@@ -561,6 +561,106 @@ async function main() {
   const h1s = await j(`JSON.stringify([...document.querySelectorAll('h1')].map((h) => h.textContent.trim()).filter(Boolean))`)
   ok('整站仍然只有一个 h1（品牌标题）', h1s.length === 1 && h1s[0].includes('DSH'), JSON.stringify(h1s))
 
+  /* ── 十一、一键安装的「复制给 DSH」─────────────────────────────────────
+     2026-10-05 新增。两层量具：
+       ①行为层 —— 在真浏览器里**真的点一次**按钮，看有没有落地反馈；
+       ②内容层 —— 要复制的那段文字必须就是那条 GitHub 命令（少了它，按钮复制的是空气）。
+     剪贴板读得到时再逐字比一次；读不到（headless 没权限）就只打印一行说明，
+     不做"假装通过"的断言。 */
+  group('十一、一键安装：把这段文字复制给 DSH')
+  await viewport(1440, 900)
+  await gotoCh('install')
+  try {
+    await send('Browser.grantPermissions', {
+      origin: new URL(BASE).origin,
+      permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+    })
+  } catch (e) { console.log('   ℹ️ 授不了剪贴板权限：' + String(e && e.message)) }
+
+  const copyShape = await j(`(() => {
+    const btn = document.querySelector('.doc-copy-btn');
+    const pre = btn ? document.getElementById(btn.getAttribute('data-copy')) : null;
+    const b = btn ? btn.getBoundingClientRect() : null;
+    const inOverflow = (el) => {
+      let n = el && el.parentElement;
+      while (n && n !== document.body) {
+        const ox = getComputedStyle(n).overflowX;
+        if (ox === 'auto' || ox === 'scroll') return true;
+        n = n.parentElement;
+      }
+      return false;
+    };
+    return JSON.stringify({
+      hasBtn: !!btn, label: btn ? btn.textContent.trim() : '',
+      boxW: b ? Math.round(b.width) : 0, boxH: b ? Math.round(b.height) : 0,
+      visible: !!btn && getComputedStyle(btn).display !== 'none' && !!b && b.width > 0 && b.height > 0,
+      targetExists: !!pre, textLen: pre ? pre.textContent.length : 0,
+      text: pre ? pre.textContent : '', entity: pre ? pre.textContent.indexOf('&amp;') : -1,
+      inOverflow: pre ? inOverflow(pre) : false,
+      boxes: document.querySelectorAll('.doc-copy').length,
+      buttons: document.querySelectorAll('.doc-copy-btn').length,
+    });
+  })()`)
+  console.log('   复制块：' + JSON.stringify({ ...copyShape, text: undefined }))
+  ok('★ 第 2 章有一键安装的复制块（按钮 + 它指向的文本块都在）',
+    copyShape.hasBtn && copyShape.visible && copyShape.targetExists,
+    JSON.stringify({ hasBtn: copyShape.hasBtn, visible: copyShape.visible, targetExists: copyShape.targetExists }))
+  ok('复制块与按钮一一对应（每块一个按钮，没有孤儿）',
+    copyShape.boxes === 1 && copyShape.buttons === 1, `块 ${copyShape.boxes} / 按钮 ${copyShape.buttons}`)
+  ok('复制按钮点得着（≥ 60×24 px 的命中区）', copyShape.boxW >= 60 && copyShape.boxH >= 24, `${copyShape.boxW}×${copyShape.boxH}`)
+  ok('★ 要复制的那段文字里就是 GitHub 安装命令',
+    copyShape.text.includes('dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot'))
+  ok('那段文字说了 web profile 怎么换', copyShape.text.includes('--profile web'))
+  ok('那段文字提醒了「要重启 DSH 才会生效」', copyShape.text.includes('重启 DSH'))
+  ok('那段文字没有把 HTML 实体带进去（复制出来不能是 &amp;）', copyShape.entity === -1)
+  ok('文本块躺在横向滚动容器里（390px 下不撑破视口）', copyShape.inOverflow === true)
+  const docsSrc = fs.readFileSync(path.join(ROOT, 'docs.js'), 'utf8')
+  ok('复制实现留了 http 下的兜底与「长按选中复制」的明说',
+    docsSrc.includes("execCommand('copy')") && docsSrc.includes('长按选中复制'),
+    '（这条是源码层，配合下面的行为断言一起看）')
+
+  /* 2026-10-07 补：第 2 章必须给出**插件仓库**的地址。
+     在这之前官网上几处 GitHub 文字指的都是个人主页 @cyanovo，想先看代码的人找不到仓库；
+     而这一章教的两条装法全都来自那个仓库。下面两条读的是**真渲染出来的第 2 章正文**。 */
+  const ch2 = await j(`JSON.stringify(document.getElementById('docsBody').innerHTML)`)
+  ok('★ 第 2 章「从 GitHub 装」里给了插件仓库地址',
+    ch2.includes('https://github.com/cyanovo/dsh-remote-qqbot'), '第 2 章正文里没找到仓库链接')
+  ok('仓库地址在新窗口打开且带 noopener',
+    /<a[^>]*github\.com\/cyanovo\/dsh-remote-qqbot[^>]*target="_blank"[^>]*rel="noopener/.test(ch2))
+
+  const copyClick = await j(`(async () => {
+    const btn = document.querySelector('.doc-copy-btn');
+    if (!btn) return JSON.stringify({ why: '没有复制按钮' });
+    const before = btn.textContent.trim();
+    btn.click();
+    await new Promise((r) => setTimeout(r, 500));
+    const toast = document.getElementById('toast');
+    return JSON.stringify({ before: before, after: btn.textContent.trim(),
+      done: btn.classList.contains('is-done'),
+      toast: toast && toast.hidden === false ? toast.textContent : '' });
+  })()`)
+  console.log('   点一次复制：' + JSON.stringify(copyClick))
+  ok('★ 点一下复制按钮，界面上有明确反馈（按钮文案变了，或弹了提示）',
+    copyClick.after !== copyClick.before || !!copyClick.toast, JSON.stringify(copyClick))
+  ok('反馈是三级兜底里真的落地的那一级（已复制 / 长按选中复制）',
+    /已复制|长按选中复制/.test(copyClick.after || ''), copyClick.after)
+
+  let clip = null
+  try {
+    clip = await evaluate('(navigator.clipboard && navigator.clipboard.readText) ? navigator.clipboard.readText() : ""')
+  } catch (e) { clip = null }
+  if (typeof clip === 'string' && clip.trim().length) {
+    /* ⚠️ Windows 上剪贴板里的换行是 CRLF（Chromium 自己换的），而文本块里是 LF ——
+       直接比长度会差出"一个换行 1 个字符"，第一版就是这么假红了一次。
+       比内容时统一把 CRLF 折成 LF，再逐字比。 */
+    const norm = (s) => String(s).replace(/\r\n/g, '\n').trim();
+    ok('★ 剪贴板里拿到的就是那段文字（与文本块逐字相同，CRLF 已折平）',
+      norm(clip) === norm(copyShape.text),
+      `剪贴板 ${norm(clip).length} 字 / 文本块 ${norm(copyShape.text).length} 字`)
+  } else {
+    console.log('   ℹ️ 这一轮读不到剪贴板（headless 没开放权限）—— 上面只验了按钮反馈与文本内容')
+  }
+
   console.log(`\n教程文档页验收：${pass} 通过 / ${fails.length} 失败`)
   console.log(fails.length ? '>>> 有问题 ❌\n  - ' + fails.join('\n  - ') : '>>> 教程文档页在真浏览器里是对的 ✅')
   return done(fails.length ? 1 : 0)

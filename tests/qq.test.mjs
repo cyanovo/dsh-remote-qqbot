@@ -25,9 +25,15 @@ import {
   C2C_INTENTS, QqBotClient, dshSessionCookie, logSafe,
 } from '../src/qqbot.js'
 import {
-  BotState, DshLocalApi, HELP_TEXT, buildAnswers, buildOneAnswer,
-  extractRefIdx, formatNotification, formatQuestion, formatQuestionBody, pickPromptMode,
-  qqPreviewUrl, readDshSecret,
+  BotState, DshLocalApi, HELP_TEXT, PICK_WINDOW_MS, WORKSPACE_PICK_WINDOW_MS,
+  buildAnswers, buildHelpKeyboard, buildKeyboard, buildNumberButtons,
+  buildOneAnswer, buildOptionKeyboard, buildUpdateNoticeKeyboard, makeCmdButton,
+  cleanOptionText, isRecommendedLabel, optionLabelRoom,
+  extractMsgIdx, extractQuoted, extractRefIdx, formatNotification, formatQuestion, formatQuestionBody,
+  formatTaskSessionPickAck, formatTaskSessionPickerText,
+  formatWorkspacePickAck, formatWorkspacePickerText, isPickerFresh,
+  stripBotMention, summarizeSession,
+  inferSessionFromQuote, pickPromptMode, pickerAge, qqPreviewUrl, readDshSecret, resolveQuoteTarget,
   browserSessionRecord, healBrowserSessionRecord, readBrowserSessionSecret, secretFromCredentials,
   routeIncoming, routeMessage,
 } from '../src/qqbridge.js'
@@ -365,6 +371,52 @@ await t('错误码翻译成人话', () => {
   assert.equal(QqBotClient.explainError(999999), null)
 })
 
+// ── 消息按钮（1.0.16）────────────────────────────────────────────────────────
+// 官方：按钮只能挂在 markdown 消息上（`keyboard` 字段）。这里守的是"发出去的形状"：
+// 带按钮就必须 msg_type=2 + keyboard，且 markdown 失败退回纯文本时按钮必须一起丢。
+console.log('\n[4b] 消息按钮（keyboard）')
+
+await t('★ 带按钮 ⇒ 必须走 markdown（msg_type=2），keyboard 原样带上', async () => {
+  const cap = {}
+  const kb = { content: { rows: [{ buttons: [{ id: '1' }] }] } }
+  await sendBot(cap).sendC2C('O', '**选一个**', { keyboard: kb })
+  assert.equal(cap.body.msg_type, 2)
+  assert.equal(cap.body.markdown.content, '**选一个**')
+  assert.deepEqual(cap.body.keyboard, kb)
+  assert.equal('content' in cap.body, false, 'markdown 消息不能同时带 content')
+})
+
+await t('不带按钮时行为不变：纯文本 msg_type=0，且不出现 keyboard 字段', async () => {
+  const cap = {}
+  await sendBot(cap).sendC2C('O', '普通消息', {})
+  assert.equal(cap.body.msg_type, 0)
+  assert.equal('keyboard' in cap.body, false)
+})
+
+await t('★ markdown 发失败 ⇒ 退回纯文本**且丢掉按钮**（宁可少按钮也不能丢消息）', async () => {
+  const bodies = []
+  const bot = new QqBotClient({
+    appId: 'a', clientSecret: 's', log: () => {},
+    fetchImpl: async (url, init) => {
+      if (url.includes('getAppAccessToken')) {
+        return { status: 200, json: async () => ({ access_token: 'TOK' }) }
+      }
+      bodies.push(JSON.parse(init.body))
+      if (bodies.length === 1) {
+        return { status: 400, json: async () => ({ code: 40034127, message: '无markdown模板权限' }), text: async () => '{"code":40034127}' }
+      }
+      return { status: 200, json: async () => ({ id: 'M2' }), text: async () => '{"id":"M2"}' }
+    },
+  })
+  const r = await bot.sendC2C('O', '带按钮的正文', { keyboard: { content: { rows: [] } } })
+  assert.equal(r.id, 'M2')
+  assert.equal(bodies.length, 2, '应当重发一次')
+  assert.equal(bodies[0].msg_type, 2)
+  assert.ok(bodies[0].keyboard, '第一次要带按钮')
+  assert.equal(bodies[1].msg_type, 0)
+  assert.equal('keyboard' in bodies[1], false, '退回来的纯文本不能带 keyboard')
+})
+
 console.log('\n[5] WebSocket 全流程')
 await t('HELLO → 自动 IDENTIFY（token 前缀 / intents / shard 都要对）', async () => {
   const { bot, ws } = makeBot()
@@ -505,13 +557,13 @@ await t('没有问题时被拒', () => {
 })
 
 console.log('\n[7] 来消息路由')
-await t('无提问 → 当新任务', () => {
+await t('★ 1.0.24：不是 `/` 开头的文本，routeIncoming 一律按闲聊交回去', () => {
+  // ⚠️ 以前这里是「无提问 → 当新任务」「有提问 → 当回答」。那两条"默认判断"已被删除：
+  //    一句话的去向只由「有没有引用」和「带不带 /」决定（见 routeMessage 的 ③）。
   assert.deepEqual(routeIncoming('帮我跑一下测试', { hasPendingQuestion: false }),
-    { kind: 'task', text: '帮我跑一下测试' })
-})
-await t('有提问 → 当回答', () => {
+    { kind: 'chat', text: '帮我跑一下测试' })
   assert.deepEqual(routeIncoming('方案A', { hasPendingQuestion: true }),
-    { kind: 'answer', text: '方案A' })
+    { kind: 'chat', text: '方案A' })
 })
 await t('/task 强制当任务（即使有提问）', () => {
   assert.deepEqual(routeIncoming('/task 换个活干', { hasPendingQuestion: true }),
@@ -532,8 +584,8 @@ await t('未知指令被识别', () => {
 await t('空消息忽略', () => {
   assert.equal(routeIncoming('   ').kind, 'ignore')
 })
-await t('/task 不带内容给用法', () => {
-  assert.equal(routeIncoming('/task').kind, 'usage')
+await t('/task 不带内容 = 先挑工作区（不是给用法）', () => {
+  assert.equal(routeIncoming('/task').kind, 'task_workspaces')
 })
 // 远程更新（1.0.7）：`/update` 直接装、`/update check` 只查不装；中文同义词 `/更新`。
 // 这里守的是**路由**这一层（三分支判断与文案在 tests/update.test.mjs 里守）。
@@ -546,6 +598,276 @@ await t('/update 与 /更新 路由到 {kind:update}，check 只查不装', () =
 await t('帮助里列了 /update（否则用户不知道有这个功能）', () => {
   assert.match(HELP_TEXT, /^\/update\s+把插件更新到最新版（会自动重启 DSH）$/m)
 })
+
+// ── 工作区派活（1.0.15；1.0.24 起"选名单"必须显式）──────────────────────────
+// 主人的原话：「我希望我输入 /task 的时候可以选择工作区再进行输入派活」。
+// 两步：/task → 点按钮 / 发 /pick N 选工作区 → 之后发的话都派进那个工作区的专属会话。
+console.log('\n[7b] 工作区派活（/task 两步）')
+
+await t('/task 三种写法：不带内容列工作区、带内容直接派活', () => {
+  assert.deepEqual(routeIncoming('/task'), { kind: 'task_workspaces' })
+  assert.deepEqual(routeIncoming('/任务'), { kind: 'task_workspaces' })
+  assert.deepEqual(routeIncoming('/task 跑一下测试'), { kind: 'task', text: '跑一下测试' })
+  assert.deepEqual(routeIncoming('/task 跑一下测试', { hasPendingQuestion: true }),
+    { kind: 'task', text: '跑一下测试' }, '/task 带内容仍压过"有提问在等"')
+})
+
+// ⚠️ 这一节 2026-10-07 晚**反向改过**：以前"刚发过名单 + 纯数字 = 选它"。主人当天要求
+//    「不引用、不带 / 就是闲聊，无论任何情况」，所以裸数字一律当闲聊，选名单只剩两条路：
+//    点按钮（按钮发的是 /pick、/open）或者显式发指令。这里守的就是这两条路都还在。
+await t('★ 选名单必须显式：/pick N、/open N、/use N 都还在，裸数字不再算', () => {
+  assert.deepEqual(routeIncoming('/pick 2'), { kind: 'pick_workspace', index: 2, text: '/pick 2' })
+  assert.deepEqual(routeIncoming('/open 2'), { kind: 'pick_task_session', index: 2, text: '/open 2' })
+  assert.deepEqual(routeIncoming('/use 2'), { kind: 'pick_session', index: 2, text: '/use 2' })
+  for (const n of ['0', '1', '2', '12']) {
+    assert.equal(routeMessage({ text: n, refIdx: '', refTarget: null }).kind, 'chat',
+      `裸数字「${n}」必须当闲聊`)
+  }
+})
+
+await t('★ 工作区名单的按钮发的是 /pick N（不是裸数字）', () => {
+  const kb = buildNumberButtons('/pick ', 6)
+  const data = kb.content.rows.flatMap((r) => r.buttons).map((b) => b.action.data)
+  assert.deepEqual(data, ['/pick 1', '/pick 2', '/pick 3', '/pick 4', '/pick 5', '/pick 6'])
+})
+
+await t('★ 提问的选项按钮发的是 /answer N（裸数字已经不作答了）', () => {
+  const kb = buildOptionKeyboard([{ options: [{ label: '方案 A' }, { label: '方案 B' }] }])
+  // 一行一个：两个按钮分在两行，别再把 rows[0] 当整排。
+  assert.deepEqual(kb.content.rows.map((r) => r.buttons.length), [1, 1])
+  const data = kb.content.rows.map((r) => r.buttons[0].action.data)
+  assert.deepEqual(data, ['/answer 1', '/answer 2'])
+  for (const d of data) {
+    assert.equal(routeIncoming(d, { hasPendingQuestion: true }).kind, 'answer', `${d} 必须仍能作答`)
+  }
+})
+
+await t('工作区名单文案：编号 + 名字 + 会话数 + 标出当前 + 说清下一步', () => {
+  const text = formatWorkspacePickerText({
+    workspaces: [
+      { cwd: 'D:\\cyanproject\\agenttool', name: 'agenttool', sessions: 12, updatedAt: Date.now() - 60000 },
+      { cwd: 'D:\\work\\x', name: 'x', sessions: 1, updatedAt: Date.now() - 3600000 },
+    ],
+    currentCwd: 'D:\\cyanproject\\agenttool',
+    count: 6,
+  })
+  assert.match(text, /1\. agenttool · 12 个会话/)
+  assert.match(text, /← 就是它/)
+  assert.match(text, /2\. x · 1 个会话/)
+  assert.match(text, /\/pick/)
+  assert.match(text, /\/task 要做的事/)
+})
+
+await t('工作区名单：空 / 读不到都如实说，不假装"没有工作区"', () => {
+  assert.match(formatWorkspacePickerText({ workspaces: [] }), /还没有可以挑的工作区/)
+  const err = formatWorkspacePickerText({ listError: 'socket hang up' })
+  assert.match(err, /没读出来/)
+  assert.match(err, /socket hang up/)
+})
+
+await t('选工作区的回执：成功 / 越界 / 已不在，三支都要有话说', () => {
+  const ok = formatWorkspacePickAck('ok', {
+    name: 'agenttool', cwd: 'D:\\cyanproject\\agenttool', session: 'main',
+  })
+  assert.match(ok, /工作区已选：agenttool/)
+  assert.match(ok, /D:\\cyanproject\\agenttool/, '完整路径要带上，免得同名目录选错')
+  assert.match(ok, /「main」/)
+  assert.match(formatWorkspacePickAck('out-of-range', { index: 9, count: 2 }), /只有 2 个工作区/)
+  assert.match(formatWorkspacePickAck('gone', { index: 2, name: 'x' }), /已经不在了/)
+})
+
+await t('summarizeSession 带出完整 cwd（派活要靠它建会话），短名仍只留最后一段', () => {
+  const s = summarizeSession({ sessionId: 's1', updatedAt: 1, cwd: 'D:\\cyanproject\\agenttool' })
+  assert.equal(s.cwd, 'D:\\cyanproject\\agenttool')
+  assert.equal(s.project, 'agenttool')
+  assert.equal(summarizeSession({ sessionId: 's2' }).cwd, '', '没有 cwd 时给空串，不吐 undefined')
+})
+
+await t('老状态文件平滑升级：工作区那三个键都有安全默认值', () => {
+  const f = path.join(tmp, 'state-task-old.json')
+  fs.writeFileSync(f, JSON.stringify({ openId: 'o', pickerIds: ['a'], pickerAt: 5 }), 'utf8')
+  const st = new BotState(f)
+  assert.deepEqual(st.data.taskPickerCwds, [])
+  assert.equal(st.data.taskPickerAt, 0)
+  assert.deepEqual(st.data.taskSessions, {})
+  assert.equal(st.data.activeTaskCwd, '')
+})
+
+await t('帮助里写了 /task 的两步用法', () => {
+  assert.match(HELP_TEXT, /^\/task\s+列出工作区/m)
+  assert.match(HELP_TEXT, /^\/task 内容\s+直接派给当前工作区/m)
+})
+
+// ── 消息按钮：选项按钮与 @机器人 前缀（1.0.16）────────────────────────────────
+// 主人的要求：「发送的信息里有蓝色的字，我点击可以执行操作」。
+// 按钮 = 指令按钮（type=2）：点了把 data 当一条消息发回来，走普通消息事件、不需要新事件订阅。
+console.log('\n[7c] 消息按钮：选项按钮与 @机器人 前缀')
+
+await t('单选提问 ⇒ 一行一个按钮，data 是 `/answer N` 显式指令（1.0.24 起裸数字不作答了）', () => {
+  const kb = buildOptionKeyboard([{ id: 'q1', options: [{ label: '方案A' }, { label: '方案B' }] }])
+  // 1.0.26：一行一个（以前 2 个挤在同一行）。主人原话「你一行放 4 个按钮，我根本看不见是什么东西」。
+  assert.equal(kb.content.rows.length, 2, '2 个选项 = 2 行，一个按钮一行')
+  assert.equal(kb.content.rows[0].buttons.length, 1)
+  assert.equal(kb.content.rows[1].buttons.length, 1)
+  const b0 = kb.content.rows[0].buttons[0]
+  assert.equal(b0.render_data.label, '1.方案A')
+  assert.equal(b0.action.data, '/answer 1')
+  assert.equal(b0.action.type, 2, '指令按钮：点了把 data 当消息发回来')
+  assert.equal(b0.action.permission.type, 2, '所有人可点')
+  assert.equal(b0.action.enter, true, '单聊：点一下直接发送')
+  assert.equal(b0.render_data.style, 1, '蓝色线框')
+  const b1 = kb.content.rows[1].buttons[0]
+  assert.equal(b1.action.data, '/answer 2')
+  // 序号能被既有的答案解析吃掉 —— 这才是"点一下等于作答"的关键。
+  // 路由那一半：`/answer 2` 必须被认成作答（裸数字「2」现在会被当闲聊，所以按钮不能发裸数字）。
+  assert.equal(routeIncoming(b1.action.data, { hasPendingQuestion: true }).kind, 'answer')
+  assert.equal(routeIncoming(b1.action.data, { hasPendingQuestion: true }).text, '2')
+  const built = buildOneAnswer('2', { id: 'q1', options: [{ label: '方案A' }, { label: '方案B' }] })
+  assert.deepEqual(built.selected, ['方案B'])
+})
+
+await t('★ 按钮文字剥掉模型自带的「A.」「1、」前缀与「（推荐）」尾巴（1.0.26）', () => {
+  // 就是 2026-10-07 那条真问题：一行 4 个按钮 + 硬切 ⇒ 主人看到的是「1.A. 一行一个按钮（推」。
+  const kb = buildOptionKeyboard([{
+    id: 'q',
+    options: [
+      { label: 'A. 一行一个按钮（推荐）' },
+      { label: 'B) 正文精简' },
+      { label: '3、选项全交给按钮' },
+      { label: 'D. 保持现状（推荐）' },
+    ],
+  }])
+  const labels = kb.content.rows.map((r) => r.buttons[0].render_data.label)
+  assert.deepEqual(labels, ['1.一行一个按钮', '2.正文精简', '3.选项全交给按钮', '4.保持现状'])
+  for (const l of labels) {
+    assert.ok([...l].length <= 10, `超官方上限：${l}`)
+    // 一个括号都不许留：半截括号（「1.A. 一行一个按钮（推」）正是主人说"看不见是什么东西"的元凶。
+    assert.ok(!/[（()）]/.test(l), `不该出现任何括号（更不该是半截的）：${l}`)
+  }
+  // 剥掉的必须是**重复信息**：编号由按钮给，「推荐」由正文那行标 —— 正文里要能标回来。
+  assert.equal(isRecommendedLabel('A. 一行一个按钮（推荐）'), true)
+  assert.equal(isRecommendedLabel('A. 一行一个按钮'), false)
+  assert.equal(cleanOptionText('A) 正文精简'), '正文精简')
+  assert.equal(cleanOptionText('3、选项全交给按钮'), '选项全交给按钮')
+  assert.equal(cleanOptionText('（推荐）'), '')
+})
+
+await t('按钮文字不超过 10 字符（官方硬限制），长选项自动截断', () => {
+  const kb = buildOptionKeyboard([{ id: 'q', options: [{ label: '一个特别特别长的选项名字' }] }])
+  const label = kb.content.rows[0].buttons[0].render_data.label
+  assert.ok([...label].length <= 10, `实际 ${label}`)
+  assert.ok(label.startsWith('1.'))
+  const tight = buildOptionKeyboard([{ id: 'q', options: [{ label: 'x'.repeat(30) }] }], { labelMax: 4 })
+  assert.equal(tight.content.rows[0].buttons[0].render_data.label, '1.xx', '序号占 2 字，正文留 2 字')
+  assert.equal([...tight.content.rows[0].buttons[0].render_data.label].length, 4)
+  // 正文那边判断"会不会被切"用的是同一个口径（optionLabelRoom），不能各写各的。
+  assert.equal(optionLabelRoom(0), 8, '10 字上限 - 「1.」= 8 字给选项名')
+  assert.equal(optionLabelRoom(0, { max: 4 }), 2)
+})
+
+await t('多选 / 多个问题 / 选项超过 5 个 / 没有选项 ⇒ 不装按钮（返回 null）', () => {
+  assert.equal(buildOptionKeyboard([{ id: 'q', multiSelect: true, options: [{ label: 'a' }] }]), null)
+  assert.equal(buildOptionKeyboard([
+    { id: 'a', options: [{ label: 'x' }] }, { id: 'b', options: [{ label: 'y' }] },
+  ]), null)
+  assert.equal(buildOptionKeyboard([{
+    id: 'q', options: Array.from({ length: 6 }, (_, i) => ({ label: `o${i}` })),
+  }]), null)
+  assert.equal(buildOptionKeyboard([{ id: 'q', options: [] }]), null)
+  assert.equal(buildOptionKeyboard([]), null)
+  assert.equal(buildOptionKeyboard(null), null)
+})
+
+await t('★ 指令按钮点出来带 @机器人 前缀：剥掉后仍然是指令', () => {
+  assert.equal(stripBotMention('@DSH助手 /status'), '/status')
+  assert.equal(stripBotMention('@bot /task 跑测试'), '/task 跑测试')
+  assert.equal(routeIncoming('@DSH助手 /status').kind, 'status')
+  assert.equal(routeIncoming('@DSH助手 /task 跑测试').kind, 'task')
+  assert.equal(
+    routeMessage({ text: '@DSH助手 /status', refIdx: '', hasPendingQuestion: false, refTarget: null }).kind,
+    'status',
+  )
+})
+
+await t('@ 前缀只在后面紧跟 / 时才剥（不误伤正常消息的正文）', () => {
+  assert.equal(stripBotMention('@张三 你好'), '@张三 你好')
+  assert.equal(stripBotMention('邮箱 a@b /c'), '邮箱 a@b /c')
+  assert.equal(routeIncoming('@张三 你好').kind, 'chat', '1.0.24：不是指令就是闲聊')
+  assert.equal(routeIncoming('@张三 你好', { hasPendingQuestion: true }).kind, 'chat',
+    '有提问在等也一样 —— 不作答，除非引用那条提问或发 /answer')
+  assert.equal(routeIncoming('@张三 你好').text, '@张三 你好', '送进会话的正文仍是原话')
+  assert.equal(
+    routeMessage({ text: '@张三 你好', refIdx: '', refTarget: null }).kind, 'chat',
+  )
+})
+
+// ── 更新提醒与帮助里的按钮（1.0.17）─────────────────────────────────────────
+console.log('\n[7d] 更新提醒的两个按钮 / 帮助按钮 / /skip')
+
+await t('/skip 与 /update skip 都是「忽略本次」，且没吃掉 /update check', () => {
+  assert.equal(routeIncoming('/skip').kind, 'update_skip')
+  assert.equal(routeIncoming('/忽略').kind, 'update_skip')
+  assert.equal(routeIncoming('/update skip').kind, 'update_skip')
+  assert.equal(routeIncoming('/update 忽略').kind, 'update_skip')
+  assert.deepEqual(routeIncoming('/update check'), { kind: 'update', check: true })
+  assert.deepEqual(routeIncoming('/update'), { kind: 'update', check: false })
+})
+
+await t('更新提醒的两个按钮：显示中文，data 是命令，且命令真的能被路由认出来', () => {
+  const bs = buildUpdateNoticeKeyboard().content.rows[0].buttons
+  assert.equal(bs.length, 2)
+  assert.equal(bs[0].render_data.label, '忽略本次')
+  assert.equal(bs[0].action.data, '/skip')
+  assert.equal(bs[1].render_data.label, '立即更新')
+  assert.equal(bs[1].action.data, '/update')
+  assert.equal(bs[1].render_data.style, 4, '「立即更新」用蓝底白字，比「忽略本次」显眼')
+  assert.equal(routeIncoming(bs[0].action.data).kind, 'update_skip', '点了忽略必须真的能执行')
+  assert.equal(routeIncoming(bs[1].action.data).kind, 'update', '点了更新必须真的能执行')
+})
+
+await t('帮助的按钮：两行七个，每个命令都被路由认得出、文字不超 10 字符', () => {
+  const kb = buildHelpKeyboard()
+  assert.equal(kb.content.rows.length, 2)
+  const all = kb.content.rows.flatMap((r) => r.buttons)
+  assert.equal(all.length, 7)
+  for (const b of all) {
+    assert.ok([...b.render_data.label].length <= 10, `${b.render_data.label} 超过 10 字符`)
+    assert.notEqual(routeIncoming(b.action.data).kind, 'unknown', `${b.action.data} 不是已知指令`)
+  }
+  assert.equal(all[0].render_data.label, '看状态')
+  assert.equal(all[0].action.data, '/status')
+  // 1.0.19 加的第 7 个：直接开个新对话（`/task` 第二步也能点到，这里顺手放一个）。
+  assert.ok(all.some((b) => b.action.data === '/new'), '帮助里要能直接开新对话')
+})
+
+await t('按钮超限就整个不装（宁可没按钮，也不要发一条平台会拒的消息）', () => {
+  const one = makeCmdButton('x', '/x')
+  assert.equal(buildKeyboard([Array(6).fill(one)]), null, '一行 6 个超限')
+  assert.equal(buildKeyboard(Array(6).fill([one])), null, '6 行超限')
+  assert.equal(buildKeyboard([]), null)
+  assert.equal(buildKeyboard([[]]), null)
+  assert.ok(buildKeyboard([Array(5).fill(one)]), '5 个一行是允许的')
+  assert.ok(buildKeyboard(Array(5).fill([one])), '5 行是允许的')
+})
+
+await t('label 超长会自动截到 10 字符（官方硬限制）', () => {
+  const b = makeCmdButton('这是一个非常非常长的按钮名字', '/x')
+  assert.equal([...b.render_data.label].length, 10)
+  assert.equal(b.action.data, '/x', 'data 不受显示文字截断影响')
+})
+
+// ⚠️ 这一条是**源码级守卫**（不是行为测试）：更新检查跑在定时器里、要假 fetch 才能端到端跑，
+//    而这里要守的只是"接线有没有被拆掉"。真正的行为（点了按钮会怎样）由上面那几条路由断言守。
+await t('【源码】更新提醒挂了按钮、检查认「忽略本次」、帮助也挂了按钮', () => {
+  // 自己读一份：`qqruntimeSrc` 是在文件后面才声明的，这里直接用会踩 TDZ。
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'qqruntime.js'), 'utf8')
+  assert.match(src, /updateSkipped === got\.version/, '更新检查必须认「忽略本次」')
+  assert.match(src, /async function handleUpdateSkip/, '要有 /skip 的处理器')
+  assert.match(src, /state\.set\(\{ updateSkipped: pending \}\)/, '忽略必须落盘')
+  assert.match(src, /buttons: buildUpdateNoticeKeyboard\(\)/, '新版本提醒要挂两个按钮')
+  assert.match(src, /replyPassive\(data, HELP_TEXT, undefined, buildHelpKeyboard\(\)\)/,
+    '帮助回复要挂按钮')
+})
 await t('★ 投递模式默认 queue：DSH 里才会落成正常的用户消息气泡', () => {
   // 依据 DSH 源码：queue → `user` 节点（正常消息）；steer → `steering`（「插话」节点）。
   // 主人明确要求「QQ 提问跟在 dsh 输入框提问一样」，所以**会话在跑时也必须是 queue**。
@@ -557,6 +879,341 @@ await t('只有「在跑 + 明确选了 steer」才插话（空闲时 steer 会�
   assert.equal(pickPromptMode(true, 'steer'), 'steer')
   assert.equal(pickPromptMode(false, 'steer'), 'queue', '空闲时 steer 无意义，退化为排队')
   assert.equal(pickPromptMode(true, 'nonsense'), 'queue', '非法值一律回到安全的 queue')
+})
+
+// ── 派活的两处修复（1.0.18）─────────────────────────────────────────────────
+//
+// 🔴 现场：2026-10-07 08:45 发的 `/task` 工作区名单，主人 09:09 回「2」。
+//    名单 5 分钟就作废了 ⇒ workspacePickerActive=false ⇒ 那个「2」一路走到 `chat`，
+//    被当成一句派活正文注入了会话（转录里 `user/message` 的正文就是 `"2"`）：
+//    选择没生效、白跑一轮、还往会话里塞了句没头没脑的东西。
+//
+//    两处修复，缺一不可：
+//    ① 工作区名单的窗口 5 分钟 → **24 小时**（手机上看到名单到想好选哪个，5 分钟不够）；
+//    ② 裸数字**绝不再注入会话** —— 没有名单能解释它就问一句（`stray_number`）。
+console.log('\n[7e] 派活：工作区名单 24 小时有效 + 裸数字绝不注入会话')
+
+await t('★ `/pick 3` 是显式指令：直接给出编号，不需要名单新鲜', () => {
+  assert.deepEqual(routeIncoming('/pick 3'), { kind: 'pick_workspace', index: 3, text: '/pick 3' })
+  assert.equal(routeIncoming('/选择 5').index, 5)
+  assert.equal(routeIncoming('/choose 12').index, 12)
+})
+
+await t('/pick 不带编号 / 带非数字 → 说清用法，而不是当成选第 0 个', () => {
+  assert.equal(routeIncoming('/pick').kind, 'usage')
+  assert.match(routeIncoming('/pick').text, /\/pick 3/)
+  assert.equal(routeIncoming('/pick 三').kind, 'usage')
+  assert.equal(routeIncoming('/pick 3 5').kind, 'usage')
+})
+
+await t('★ 工作区窗口 24 小时、会话窗口 5 分钟，且两个常量关系正确', () => {
+  assert.equal(WORKSPACE_PICK_WINDOW_MS, 24 * 60 * 60 * 1000)
+  assert.equal(PICK_WINDOW_MS, 5 * 60 * 1000)
+  assert.ok(WORKSPACE_PICK_WINDOW_MS > PICK_WINDOW_MS)
+})
+
+await t('★ 复现当天现场：隔 24 分钟的名单，对工作区**仍有效**（对会话仍然失效）', () => {
+  const now = 1791335358000 // 2026-10-07 09:09:18 前后
+  const listAt = now - 24 * 60 * 1000 // 08:45 那份名单
+  const picker = { pickerAt: listAt, ids: ['D:/a', 'D:/b'] }
+  assert.equal(isPickerFresh(picker, now), false, '按会话那个 5 分钟窗口，它确实过期了（故障成因）')
+  assert.equal(isPickerFresh(picker, now, WORKSPACE_PICK_WINDOW_MS), true, '按工作区窗口必须还有效')
+  assert.equal(pickerAge(picker, now), 24 * 60 * 1000, '要能说清"是 24 分钟前那份名单"')
+})
+
+await t('工作区名单超过 24 小时才失效', () => {
+  const now = 1791335358000
+  const old = { pickerAt: now - WORKSPACE_PICK_WINDOW_MS - 1, ids: ['D:/a'] }
+  assert.equal(isPickerFresh(old, now, WORKSPACE_PICK_WINDOW_MS), false)
+})
+
+await t('★ 名单下面挂数字按钮：点了发回来的是 `/pick N`，且真的能选中第 N 个', () => {
+  const kb = buildNumberButtons('/pick ', 6)
+  assert.equal(kb.content.rows.length, 2, '6 个 → 两行（每行 5 个）')
+  assert.equal(kb.content.rows[0].buttons.length, 5)
+  assert.equal(kb.content.rows[1].buttons.length, 1)
+  const all = kb.content.rows.flatMap((r) => r.buttons)
+  all.forEach((b, i) => {
+    assert.equal(b.render_data.label, String(i + 1), '显示的就是编号')
+    assert.equal(b.action.data, `/pick ${i + 1}`, 'data 是显式指令（不走裸数字那条路）')
+    assert.equal(b.action.type, 2)
+    // 按钮文字不超过 10 字符（官方硬限制），编号一定不超
+    assert.ok([...b.render_data.label].length <= 10)
+    // 关键：点出来的东西必须真的被路由认成"选第 i+1 个工作区"
+    const r = routeIncoming(b.action.data)
+    assert.equal(r.kind, 'pick_workspace', `点了第 ${i + 1} 个必须能执行`)
+    assert.equal(r.index, i + 1)
+  })
+})
+
+await t('会话名单的数字按钮同理（`/use N`），6 个也不超两行', () => {
+  const kb = buildNumberButtons('/use ', 6)
+  const all = kb.content.rows.flatMap((r) => r.buttons)
+  assert.equal(all.length, 6)
+  all.forEach((b, i) => {
+    const r = routeIncoming(b.action.data)
+    assert.equal(r.kind, 'pick_session', `点了第 ${i + 1} 个会话必须能切过去`)
+    assert.equal(r.index, i + 1)
+  })
+})
+
+await t('按钮装不下就整个不装：0 个 / 超过 5 行（25 个）都返回 null', () => {
+  assert.equal(buildNumberButtons('/pick ', 0), null)
+  assert.equal(buildNumberButtons('/pick ', -1), null)
+  assert.equal(buildNumberButtons('/pick ', 26), null, '26 个要 6 行，超限')
+  assert.ok(buildNumberButtons('/pick ', 25), '25 个正好 5 行，允许')
+})
+
+await t('★ 1.0.24：路由里已经没有"裸数字"这条分支了（拦人不再存在）', () => {
+  // 行为断言在 session-picker [3] 里（裸数字一律 chat）。这里守**另一件**事：那套
+  // 「拦下来问一句」的机制被真正删掉了 —— 只剩一个空壳函数就说明回退了一半。
+  const bridge = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'qqbridge.js'), 'utf8')
+  const rt = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'qqruntime.js'), 'utf8')
+  assert.ok(!bridge.includes('stray_number'), 'qqbridge 里不该再有 stray_number')
+  assert.ok(!bridge.includes('formatStrayNumber'), 'formatStrayNumber 应当已经删掉')
+  assert.ok(!rt.includes('stray_number'), 'qqruntime 里那个 case 也要删干净')
+  assert.ok(!rt.includes('formatStrayNumber'), 'qqruntime 不该再引用它')
+  // 路由函数本身不许再看"名单新不新鲜" —— 那是被删掉的那条规则的全部依据。
+  const at = bridge.indexOf('export function routeMessage(')
+  assert.ok(at > 0)
+  const routeFn = bridge.slice(at, bridge.indexOf('\n}\n', at))
+  assert.ok(routeFn.length > 200, '切出来的函数体不能是空的（否则这条守卫等于没写）')
+  assert.ok(!/pickerActive|workspacePickerActive|taskSessionPickerActive/.test(routeFn),
+    '🔴 routeMessage 的签名里不该再出现这三个"名单新鲜"开关')
+  assert.match(routeFn, /kind: 'chat'/, '不引用、不带 / → 一律闲聊')
+})
+
+await t('★ 1.0.24：消息一律照投，只在两种"多半打错了"的情形下补一句提示', () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'qqruntime.js'), 'utf8')
+  const at = src.indexOf("case 'chat': {")
+  assert.ok(at > 0, '要有 chat 分支')
+  const body = src.slice(at, src.indexOf("case 'sessions':", at))
+  const promptAt = body.indexOf('await handlePrompt(')
+  const hintAt = body.indexOf('answerHinted')
+  assert.ok(promptAt > 0, '闲聊分支必须照常投递（handlePrompt）')
+  assert.ok(hintAt > promptAt, '🔴 提示只能发生在投递**之后**，绝不能拦下这条消息')
+  assert.match(body, /引用那条提问/, '有提问在等时要告诉主人"引用才能回答"')
+  assert.match(body, /\/answer /, '也要给出显式指令这条路')
+  assert.match(body, /点上面的按钮/, '刚发过名单却手打了数字时，要说清怎么选')
+  // 同一条提问只提示一次（否则他每说一句都被念一遍）。
+  assert.match(body, /!answerHinted\.has\(pending\.askId\)/, '提示要去重')
+  assert.ok(src.includes('const answerHinted = new Set()'), '去重集合要在模块作用域')
+})
+
+await t('★ 提问文案必须说清"怎么才算回答"（1.0.24 起普通消息不再算作答）', () => {
+  const single = formatQuestion([{ options: [{ label: 'A' }, { label: 'B' }] }])
+  assert.match(single, /引用这条消息/, '单选带按钮：两个入口都要写出来')
+  assert.match(single, /点下面的按钮/)
+  const freeform = formatQuestion([{ options: [] }])
+  assert.match(freeform, /引用这条消息/)
+  assert.ok(!/回数字比如 1/.test(freeform), '没有选项的题不该让人"回数字"')
+  const multi = formatQuestion([{ options: [{ label: 'A' }] }, { options: [{ label: 'B' }] }])
+  assert.match(multi, /引用这条消息/)
+  assert.match(multi, /2 个问题分 2 行答/)
+})
+
+await t('`/pick` 时没有名单：明说"先发 /task"，**不许**悄悄拿此刻的列表顶上', () => {
+  const t1 = formatWorkspacePickAck('no-list')
+  assert.match(t1, /没有在等你选的工作区名单/)
+  assert.match(t1, /\/task/)
+})
+
+await t('工作区名单文案里写了「名单留 24 小时」和可以点按钮', () => {
+  const txt = formatWorkspacePickerText({
+    workspaces: [
+      { cwd: 'D:/a', name: 'a', sessions: 1, updatedAt: Date.now() },
+      { cwd: 'D:/b', name: 'b', sessions: 2, updatedAt: Date.now() },
+    ],
+    currentCwd: 'D:/a', count: 6,
+  })
+  assert.match(txt, /24 小时/)
+  assert.match(txt, /按钮/)
+})
+
+await t('★ 1.0.24 的硬要求：不引用、不带 / 的一句话（含数字）就是闲聊', () => {
+  // ⚠️ 这一条 2026-10-07 晚**方向反了**。当天早些时候为了修「09:09 那个 2 被当成派活正文」
+  //    的故障，这里断言的是"必须落到 stray_number、绝不能 chat"。主人当晚明确要求
+  //    「只要我不引用信息或者信息前边不带 / 的命令就是闲聊，无论任何情况」——
+  //    他选了可预测，代价（数字可能被当成一句话送进会话）由他知情承担。
+  //    现在拦人的那套没了，"打错了"由 qqruntime 的一句提示兜着（见上面那条源码守卫）。
+  for (const s of ['2', '派 2', '2 号项目先别动', '在吗']) {
+    const r = routeMessage({ text: s, refIdx: '', hasPendingQuestion: false, refTarget: null })
+    assert.equal(r.kind, 'chat', `「${s}」必须当闲聊`)
+    assert.equal(r.text, s)
+  }
+  // 但"选名单"这条路没丢：显式指令与按钮都还在（按钮发的是 /pick、/open）。
+  assert.equal(routeIncoming('/pick 2').kind, 'pick_workspace')
+  assert.equal(routeIncoming('/open 2').kind, 'pick_task_session')
+})
+
+// ⚠️ 源码级守卫（行为跑不动：那几条路要真起 DSH 接口）。
+//    要守的是：①三份名单都挂上了按钮；②派活第二步的"没有名单就拒绝"还在。
+await t('【源码】三份名单都挂按钮；没名单就拒绝；24 小时窗口真的传进去了', () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'qqruntime.js'), 'utf8')
+  assert.match(src, /buildNumberButtons\('\/pick ', picked\.length\)/, '工作区名单要挂数字按钮')
+  assert.match(src, /buildNumberButtons\('\/use ', picked\.length\)/, '会话名单要挂数字按钮')
+  // 派活第二步：数字按钮 + 一个额外的「新对话」按钮（单独一行）。
+  assert.match(src, /buildNumberButtons\('\/open ', picked\.length, \{ extra: \[makeCmdButton\('新对话', '\/new'\)\] \}\)/,
+    '工作区里的会话名单要挂数字按钮和「新对话」')
+  // 两处"没名单就拒绝"：工作区名单（1.0.18）、工作区会话名单（1.0.19）。
+  assert.match(src, /formatWorkspacePickAck\('no-list'\)/, '没有工作区名单时要明确拒绝，不许现拉一份')
+  assert.match(src, /formatTaskSessionPickAck\('no-list'\)/, '没有工作区会话名单时也要明确拒绝')
+  assert.match(src, /formatTaskSessionPickAck\('no-workspace'\)/, '不知道工作区时不许猜一个目录建会话')
+  // ⚠️ 必须钉住**调用形状**（第三个实参），不能只匹配常量名 —— 名字在注释里也出现过，
+  //    只匹配名字的话，把窗口改回 5 分钟这条守卫还是绿的（量具骗人的老毛病）。
+  //    工作区名单与"工作区里的会话名单"各要传一次（1.0.24 起这一句只用来决定"提示里说哪份名单"）。
+  const windowArg = src.match(/\},\s*nowMs,\s*WORKSPACE_PICK_WINDOW_MS\s*,?\s*\)/g) ?? []
+  assert.equal(windowArg.length, 2,
+    '工作区名单和派活第二步的会话名单都必须把 24 小时窗口**传给** isPickerFresh（写在注释里不算）')
+})
+
+// ── [7f] 派活第二步：在工作区里挑会话 / 开新对话（1.0.19）────────────────────
+// 主人 2026-10-07 的原话：「我不仅需要挑工作区，还需要在工作区里挑选会话或者新对话」。
+// 以前 `/task` 是"一个工作区一个固定专属会话"，既接不上该工作区里的别的会话，
+// 也没法明确地从零开一个新对话。
+console.log('\n[7f] 派活第二步：工作区里挑会话 / 开新对话')
+
+await t('`/open N` 是"选当前工作区里第 N 个会话"，`/open 0` 是新对话', () => {
+  const r = routeIncoming('/open 2')
+  assert.equal(r.kind, 'pick_task_session')
+  assert.equal(r.index, 2)
+  assert.equal(routeIncoming('/开 3').index, 3, '中文别名也要认')
+  assert.equal(routeIncoming('/打开 4').index, 4)
+  assert.equal(routeIncoming('/open 0').index, 0, '0 = 开一个新对话')
+  assert.equal(routeIncoming('/open').kind, 'usage', '不带数字要给用法，不能瞎猜')
+})
+
+await t('`/new` 就是不挑会话、直接开新对话', () => {
+  assert.equal(routeIncoming('/new').kind, 'new_task_session')
+  assert.equal(routeIncoming('/新').kind, 'new_task_session')
+  assert.equal(routeIncoming('/新对话').kind, 'new_task_session')
+})
+
+await t('`/open` 与 `/use` 是两回事：一个只认本工作区的名单，一个是全局最近会话', () => {
+  assert.equal(routeIncoming('/use 2').kind, 'pick_session')
+  assert.equal(routeIncoming('/open 2').kind, 'pick_task_session')
+  assert.notEqual(routeIncoming('/use 2').kind, routeIncoming('/open 2').kind)
+})
+
+await t('★ 第二步的按钮：数字走 `/open N`，最后单独一行是「新对话」', () => {
+  const kb = buildNumberButtons('/open ', 6, { extra: [makeCmdButton('新对话', '/new')] })
+  assert.equal(kb.content.rows.length, 3, '6 个数字两行 + 新对话一行')
+  const all = kb.content.rows.flatMap((r) => r.buttons)
+  assert.equal(all.length, 7)
+  all.slice(0, 6).forEach((b, i) => {
+    const r = routeIncoming(b.action.data)
+    assert.equal(r.kind, 'pick_task_session', `点了第 ${i + 1} 个会话必须能选它`)
+    assert.equal(r.index, i + 1)
+  })
+  const last = all[6]
+  assert.equal(last.render_data.label, '新对话')
+  assert.equal(routeIncoming(last.action.data).kind, 'new_task_session', '「新对话」按钮点了必须真能开')
+})
+
+await t('加了额外一行之后，行数上限照样守得住（宁可没按钮，也不发会被拒的消息）', () => {
+  const extra = [makeCmdButton('新对话', '/new')]
+  assert.equal(buildNumberButtons('/open ', 25, { extra }), null, '25 个已经 5 行，再加一行就超限')
+  assert.ok(buildNumberButtons('/open ', 25), '不带额外那一行时 25 个仍然可以')
+  assert.equal(buildNumberButtons('/open ', 0), null, '没有数字也没有额外按钮 → 不装')
+  assert.equal(buildNumberButtons('/open ', 0, { extra }), null)
+  const onlyExtra = buildNumberButtons('/open ', 0, { extra: [] })
+  assert.equal(onlyExtra, null, '空数组不算额外按钮')
+})
+
+await t('★ 1.0.24：第二步的名单新鲜也不吃裸数字了，`/open N` 才是选择', () => {
+  const r = routeMessage({ text: '3', refIdx: '', hasPendingQuestion: false, refTarget: null })
+  assert.equal(r.kind, 'chat', '裸数字一律闲聊')
+  assert.equal(routeIncoming('/open 3').kind, 'pick_task_session')
+  assert.equal(routeIncoming('/open 3').index, 3)
+  assert.equal(routeIncoming('/open 0').index, 0, '0 也要走到那个分支（由运行时解释成"新对话"）')
+  assert.equal(routeMessage({ text: '开 2', refIdx: '', refTarget: null }).kind, 'chat')
+})
+
+await t('★ 三份名单的开关现在都不起作用了（1.0.24 删掉了那条规则）', () => {
+  // 以前 os 这三份名单都用裸数字，调用方只能把"后发的那份"置 true。现在它们
+  // 只用来决定"提示里说哪一份名单"，路由本身不再看 —— 传 true 也必须是闲聊。
+  const r = routeMessage({
+    text: '2', refIdx: '', hasPendingQuestion: false, refTarget: null,
+    taskSessionPickerActive: true, workspacePickerActive: true, pickerActive: true,
+  })
+  assert.equal(r.kind, 'chat', '三份都新鲜也不能把一句闲聊变回"选择"')
+})
+
+await t('第二步的名单文案：列出会话、标出"现在是它/上次派活用的"，并写清 0 = 新对话', () => {
+  const now = Date.now()
+  const txt = formatTaskSessionPickerText({
+    cwd: 'D:/cyanproject/agenttool',
+    name: 'agenttool',
+    sessions: [
+      { id: 's1', title: '修派活按钮', running: true, updatedAt: now },
+      { id: 's2', title: '插件 1.0.18', running: false, updatedAt: now - 2 * 3600 * 1000 },
+    ],
+    currentId: 's1',
+    lastUsedId: 's2',
+    count: 6,
+  })
+  assert.match(txt, /agenttool 里的会话/)
+  assert.match(txt, /1\. 修派活按钮/)
+  assert.match(txt, /正在跑/)
+  assert.match(txt, /现在就是它/, '要能一眼看出现在是哪个')
+  assert.match(txt, /上次派活用的/, '上次那个也要标出来，省得重新找')
+  assert.match(txt, /回 0 = 在这个工作区开一个新对话/)
+  assert.match(txt, /再发一次 \/task/)
+
+  // 空列表：兜底文案要给出"回 0"，不能只说"没有"。
+  const empty = formatTaskSessionPickerText({ cwd: 'D:/x', name: 'x', sessions: [] })
+  assert.match(empty, /回 0/)
+  // 读不出来：如实说 + 让人重试，绝不假装"没有会话"。
+  const bad = formatTaskSessionPickerText({ cwd: 'D:/x', listError: 'ECONNREFUSED' })
+  assert.match(bad, /ECONNREFUSED/)
+  assert.match(bad, /再发一次 \/task/)
+})
+
+await t('第二步的回执：六种结果各说各的，绝不含糊', () => {
+  const ok = formatTaskSessionPickAck('ok', { name: 'agenttool', cwd: 'D:/a', session: '修派活按钮' })
+  assert.match(ok, /派活会话已选：修派活按钮/)
+  assert.match(ok, /D:\/a/)
+  const fresh = formatTaskSessionPickAck('new', { name: 'agenttool', cwd: 'D:/a', session: '新会话' })
+  assert.match(fresh, /已经开了个新对话/)
+  assert.match(fresh, /原来那些会话都还在/, '开新的不该让人以为老的没了')
+  assert.match(formatTaskSessionPickAck('gone', { index: 2, session: 'x' }), /已经不在了/)
+  assert.match(formatTaskSessionPickAck('out-of-range', { index: 3, count: 2 }), /只有 2 个会话/)
+  assert.match(formatTaskSessionPickAck('no-list'), /先发 \/task/)
+  assert.match(formatTaskSessionPickAck('no-list'), /\/new/, '顺带告诉人可以直接开新的')
+  assert.match(formatTaskSessionPickAck('no-workspace'), /先发 \/task/,
+    '不知道在哪个目录时，不能猜一个目录去建会话')
+  // 五句话必须互不相同 —— 混用会让人不知道该重发 /task 还是已经选好了。
+  const all = [
+    ok, fresh,
+    formatTaskSessionPickAck('gone', { index: 1, session: 'x' }),
+    formatTaskSessionPickAck('out-of-range', { index: 1, count: 2 }),
+    formatTaskSessionPickAck('no-list'),
+    formatTaskSessionPickAck('no-workspace'),
+  ]
+  assert.equal(new Set(all).size, all.length)
+})
+
+await t('★ 1.0.24：`/answer` 这条路还在（自由作答的提问靠它或引用作答）', () => {
+  assert.equal(routeIncoming('/answer 用方案 B', { hasPendingQuestion: true }).kind, 'answer')
+  assert.equal(routeIncoming('/answer 用方案 B', { hasPendingQuestion: true }).text, '用方案 B')
+  assert.equal(routeIncoming('/answer 用方案 B').kind, 'no_question', '没人在等时说清"没有提问在等"')
+  assert.match(HELP_TEXT, /\/answer/, '帮助里要留下这条路，否则没人知道怎么回答自由作答的提问')
+})
+
+await t('帮助里两条新指令都在，且都能被路由认出来', () => {
+  assert.match(HELP_TEXT, /\/open 2/)
+  assert.match(HELP_TEXT, /\/new/)
+  assert.match(HELP_TEXT, /挑工作区里的会话|挑一个或开新对话/)
+  assert.equal(routeIncoming('/open 2').kind, 'pick_task_session')
+  assert.equal(routeIncoming('/new').kind, 'new_task_session')
+})
+
+await t('帮助里把 1.0.24 的新规矩写在最前面（不引用、不带 / 就是闲聊）', () => {
+  assert.match(HELP_TEXT, /不引用我的消息/)
+  assert.match(HELP_TEXT, /不带 \/ 开头/)
+  assert.match(HELP_TEXT, /一律当闲聊/)
+  assert.ok(!/我正有问题等你答的时候直接回/.test(HELP_TEXT),
+    '旧文案说"直接回就是在回答它"—— 1.0.24 起这是错的')
 })
 
 // ── [7b] 引用回复路由 ──────────────────────────────────────────────────────
@@ -603,9 +1260,17 @@ await t('引用一条认不出来的消息 → unknown_ref（宁可问，也不�
   assert.equal(r.kind, 'unknown_ref')
 })
 
-await t('不引用但正好有提问在等 → 仍然作答（防 agent 永久卡住）', () => {
+await t('★ 不引用 + 有提问在等 → 也是闲聊（1.0.24 起不再抢消息）；回答要引用或 /answer', () => {
+  // ⚠️ 方向反了：以前这里是"必须作答（防 agent 永久卡住）"。主人 2026-10-07 晚要求
+  //    「不引用、不带 / 就是闲聊，无论任何情况」—— agent 卡住的风险由 qqruntime 的
+  //    提示兜着（见 [7e] 那条源码守卫：提示在投递**之后**，且同一条提问只提示一次）。
   const r = routeMessage({ text: '方案A', refIdx: '', hasPendingQuestion: true, refTarget: null })
-  assert.equal(r.kind, 'answer')
+  assert.equal(r.kind, 'chat')
+  assert.equal(routeMessage({
+    text: '方案A', refIdx: 'REFIDX_ask', hasPendingQuestion: true,
+    refTarget: { kind: 'question', askId: 'ask-9', sessionId: 's1' },
+  }).kind, 'answer', '引用那条提问 → 仍然作答')
+  assert.equal(routeIncoming('/answer 方案A', { hasPendingQuestion: true }).kind, 'answer')
 })
 
 await t('/task 显式指令优先级最高，压过引用', () => {
@@ -735,20 +1400,73 @@ await t('出错通知是口语的「出错了」', () => {
 await t('未知 kind 也不炸', () => {
   assert.match(formatNotification({ kind: 'weird' }), /weird/)
 })
-await t('问题渲染带编号选项，能直接回数字', () => {
+await t('★ 装了按钮时正文不再重复选项文字，只留编号 + 说明（1.0.26 主人要求）', () => {
   const s = formatQuestion([Q1])
   assert.match(s, /选哪个方案？/)
-  assert.match(s, /1\. 方案A/)
-  assert.match(s, /2\. 方案B/)
-  assert.match(s, /回数字/)
+  assert.ok(!/方案A/.test(s), `选项名由按钮承担，正文再写一遍就是同一条信息出现两次：\n${s}`)
+  assert.ok(!/方案B/.test(s))
+  // 省掉的那部分必须在按钮上真的存在，而且编号与正文能对上 —— 否则就是丢信息。
+  const rows = buildOptionKeyboard([Q1]).content.rows
+  assert.equal(rows.length, 2, '一行一个')
+  assert.equal(rows[0].buttons[0].render_data.label, '1.方案A')
+  assert.equal(rows[1].buttons[0].render_data.label, '2.方案B')
+  assert.match(s, /点下面的按钮/)
 })
+
+await t('★ 按钮没装上时正文一个字都不能省（多选 / 多问 / 超过 5 个选项）', () => {
+  // 多问：按钮不装（一次点不完），正文里的选项名就是唯一的答案依据。
+  assert.match(formatQuestion([Q1, Q2]), /1\. 方案A/)
+  // 多选：同理。
+  const multi = formatQuestion([{
+    id: 'q', question: '要哪些？', multiSelect: true, options: [{ label: 'A' }, { label: 'B' }],
+  }])
+  assert.match(multi, /1\. A/)
+  // 6 个选项：一行一个 ⇒ 要 6 行，超官方 5 行上限 ⇒ 整个不装按钮。
+  const six = formatQuestion([{
+    id: 'q', question: '选一个？', options: Array.from({ length: 6 }, (_, i) => ({ label: `选项${i + 1}` })),
+  }])
+  assert.match(six, /6\. 选项6/)
+  assert.equal(buildOptionKeyboard([{
+    id: 'q', options: Array.from({ length: 6 }, (_, i) => ({ label: `选项${i + 1}` })),
+  }]), null)
+})
+
+await t('★ 选项名会被按钮切成半截、又没有说明时，正文把它补全（唯一例外）', () => {
+  const long = '这一个选项名字特别长会被切'
+  const s = formatQuestion([{
+    id: 'q', question: '走这条？', options: [{ label: long }, { label: '短的名字' }],
+  }])
+  assert.match(s, new RegExp(`1\\. ${long}`), `正文必须补上会被切的那个选项名：\n${s}`)
+  assert.ok(!/2\. 短的名字/.test(s), '能完整放进按钮的选项名不该再重复一遍')
+  // 补全的判断依据与按钮同一个口径：按钮上放得下 8 个字，超过就补。
+  assert.equal([...cleanOptionText(long)].length > optionLabelRoom(0), true)
+  assert.equal([...cleanOptionText('短的名字')].length > optionLabelRoom(1), false)
+})
+
 await t('选项自带的说明也发出来（回复时更有把握）', () => {
   const s = formatQuestion([{
     id: 'q', question: '走哪条？',
     options: [{ label: 'A', description: '快但贵' }, { label: 'B' }],
   }])
-  assert.match(s, /1\. A\n\s+快但贵/)
-  assert.match(s, /2\. B/)
+  // 1.0.26：有说明 ⇒ 正文发说明（选项名在按钮上）；没说明又短 ⇒ 正文一个字都不写。
+  assert.match(s, /  1\. 快但贵/)
+  assert.ok(!/2\. B/.test(s), `选项名不该重复：\n${s}`)
+  const rows = buildOptionKeyboard([{
+    id: 'q', options: [{ label: 'A', description: '快但贵' }, { label: 'B' }],
+  }]).content.rows
+  assert.equal(rows[0].buttons[0].render_data.label, '1.A')
+  assert.equal(rows[1].buttons[0].render_data.label, '2.B')
+})
+
+await t('标记「（推荐）」的选项：按钮上剥掉，正文那行标回来（别的字不丢）', () => {
+  const s = formatQuestion([{
+    id: 'q', question: '选哪个？',
+    options: [{ label: 'A. 一行一个按钮（推荐）', description: '最省事' }, { label: 'B. 保持现状' }],
+  }])
+  assert.match(s, /1\. （推荐）最省事/)
+  assert.ok(!/（推荐）.*（推荐）/.test(s))
+  const rows = buildOptionKeyboard([{ id: 'q', options: [{ label: 'A. 一行一个按钮（推荐）' }, { label: 'B. 保持现状' }] }]).content.rows
+  assert.deepEqual(rows.map((r) => r.buttons[0].render_data.label), ['1.一行一个按钮', '2.保持现状'])
 })
 await t('⚠️ 多问时问题编号与选项编号不能混：数字只留给选项', () => {
   const s = formatQuestion([Q1, Q2])
@@ -1123,8 +1841,10 @@ const indexSrc = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'in
 await t('qqruntime 里确实有 sendChatAnswer，且挂在 createQqRuntime 的返回值上', () => {
   assert.ok(qqSrcFull.includes('async function sendChatAnswer('), 'sendChatAnswer 没找到')
   // 它不是模块级 export，而是工厂返回对象的一个成员（index.js 通过 qq.sendChatAnswer 调用）。
-  // 注意用 lastIndexOf —— 文件中间有好几个嵌套函数自己的 `return {`，第一个不是工厂的返回对象。
-  const returnAt = qqSrcFull.lastIndexOf('  return {')
+  // 注意用 lastIndexOf + **行首锚点** —— 文件中间有好几个嵌套函数自己的 `return {`。
+  // 2026-10-05 补：锚点必须带换行。只写 `'  return {'` 时，任意一行缩进后的 `return {}`
+  // （例如某个兜底分支）都会被当成"工厂的返回对象"，护栏会假红一次 —— 量具本身骗人。
+  const returnAt = qqSrcFull.lastIndexOf('\n  return {')
   assert.notEqual(returnAt, -1, '找不到 createQqRuntime 的返回对象 —— 测试已与源码脱节')
   const returned = qqSrcFull.slice(returnAt, qqSrcFull.length)
   assert.ok(returned.includes('sendChatAnswer'), `sendChatAnswer 没被返回：${returned.slice(0, 200)}`)
@@ -1696,16 +2416,18 @@ await t('作答时提问已经结束 → 必须说清「提问结束了 / 你这
 
 console.log('\n[13] 引用回执／旧消息：认不出会话也不能把主人的话丢掉（2026-10-05 报的 bug）')
 
-// ⚠️ 这里**故意不用顶层 extractFunction**：万一签名被改回去（= 修复被回退），顶层断言会
+// ⚠️ 这里**故意不用顶层 extractFunction**：万一函数被删掉（= 修复被回退），顶层断言会
 //    让整个测试文件当场崩掉 —— 那样只会看到一句 AssertionError，看不到"哪几条行为红了"。
 //    改成把源码抠取放进每条测试里失败，反向校验时才能拿到清清楚楚的红色。
+//    只按函数头找（不写全参数表）：1.0.17 给它加过一个 buttons 参数，
+//    守卫应该盯"函数还在不在"，而不是盯参数表 —— 参数一改就红属于假报警。
 let replyPassiveSrc = ''
-try { replyPassiveSrc = extractFunction(qqruntimeSrc, 'async function replyPassive(data, text, target) {') } catch { replyPassiveSrc = '' }
+try { replyPassiveSrc = extractFunction(qqruntimeSrc, 'async function replyPassive(') } catch { replyPassiveSrc = '' }
 
 /** 把 replyPassive 放进受控环境跑：日志 / bot / state 全由测试注入。 */
 function makeReplyPassive({ bot, state, logs = [] }) {
   assert.notEqual(replyPassiveSrc, '',
-    '源码里找不到 replyPassive(data, text, target) —— 回执登记的修复被回退了？')
+    '源码里找不到 replyPassive 函数 —— 回执登记的修复被回退了？')
   const build = new Function('l', 'bot', 'state', `${replyPassiveSrc}\nreturn replyPassive`)
   return { replyPassive: build((m) => logs.push(String(m)), bot, state), logs }
 }
@@ -1851,6 +2573,322 @@ await t('【源码】按兜底送进去时必须明说，并带上「那条是�
 await t('【源码】pendingAsks 条目要带会话名（回执登记时才有 label 可用）', () => {
   assert.ok(qqruntimeSrc.includes('session: sessionTitleOf(request?.agent), resolve'),
     'pendingAsks 里没记会话名，作答回执只能说「那个会话」')
+})
+
+// ── [14] 官方的 `msg_elements`：被引用那条消息的**正文**，事件里本来就有 ──────
+//
+// 主人问了一句把我说醒的话（2026-10-05）：「我引用的消息，QQ 机器人那里不是可以正确
+// 获取吗？应该有对应的接口吧？」—— 对，而且不用调接口：官方「单聊消息事件」里
+// message_type=103（引用消息）时事件带 `msg_elements`，第一个元素就是被引用那条：
+//   .msg_idx / .content / .author.bot
+// 我们以前**只读索引、把正文扔了**。现在补上，于是引用反查多了一条完全不依赖
+// 状态文件的路：我发出去的每条消息里都写着会话名（「✅ main 跑完了」「✅ 收到…（main）」），
+// 从正文里就能把会话认出来 —— 状态文件被清、登记被挤出上限，都还认得。
+// 文档：https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/c2c_message_create.html
+
+console.log('\n[14] 引用反查第三条路：用官方事件里的被引用正文认会话')
+
+/** 官方「单聊消息事件」示例 3（引用消息）的形状。 */
+const QUOTE_EVENT_DOC = {
+  id: 'ROBOT1.0_zzzz',
+  author: { id: 'C3D4E5F6', user_openid: 'C3D4E5F6', union_openid: '', username: '', bot: false },
+  content: '这个建议很有帮助，谢谢你！',
+  message_type: 103,
+  msg_elements: [
+    {
+      msg_idx: 'REFIDX_aaaaaaaaaaaaaaa==',
+      message_type: 103,
+      content: '每天坚持阅读半小时，一个月后你会发现自己的变化',
+      author: { id: 'A1B2C3D4', user_openid: 'A1B2C3D4', bot: false },
+    },
+  ],
+  message_scene: {
+    source: 'default',
+    ext: ['ref_msg_idx=REFIDX_aaaaaaaaaaaaaaa==', 'msg_idx=REFIDX_zzzzzzzzzzzzzzz=='],
+  },
+  timestamp: '2026-07-21T10:02:00+08:00',
+}
+
+/** 引用**我发的**一条通知时的事件形状（author.bot 为 true）。 */
+const quoteOfMine = (content, bot = true) => ({
+  id: 'ROBOT1.0_yyy',
+  author: { user_openid: 'ME', bot: false },
+  content: '接着说',
+  message_type: 103,
+  msg_elements: [
+    { msg_idx: 'REFIDX_botmsg==', message_type: 0, content, author: { user_openid: 'BOT_OPENID', bot } },
+  ],
+  message_scene: { source: 'default', ext: ['ref_msg_idx=REFIDX_botmsg==', 'msg_idx=REFIDX_mine=='] },
+})
+
+/** ⚠️ 运行时传给 inferSessionFromQuote / resolveQuoteTarget 的是 **extractQuoted 的产物**，
+ *  不是原始事件 —— 测试也必须走这一步，否则等于在测一个不存在的调用方式。 */
+const quotedOf = (content, bot = true) => extractQuoted(quoteOfMine(content, bot))
+
+await t('【行为】extractQuoted：官方示例（引用消息）里能读出被引用那条的正文与作者', () => {
+  const q = extractQuoted(QUOTE_EVENT_DOC)
+  assert.equal(q.idx, 'REFIDX_aaaaaaaaaaaaaaa==')
+  assert.equal(q.content, '每天坚持阅读半小时，一个月后你会发现自己的变化')
+  assert.equal(q.bot, false, '那条是用户自己发的，不能当成我发的')
+  assert.equal(q.authorId, 'A1B2C3D4')
+})
+
+await t('【行为】extractQuoted：我发的通知被引用时，能认出「是我发的」', () => {
+  const q = extractQuoted(quoteOfMine('✅ main 跑完了'))
+  assert.equal(q.content, '✅ main 跑完了')
+  assert.equal(q.bot, true)
+  assert.equal(q.authorId, 'BOT_OPENID')
+})
+
+await t('【行为】extractQuoted：没引用（没有 msg_elements / 空元素）→ null，不能瞎认', () => {
+  assert.equal(extractQuoted({ content: '你好', message_type: 0 }), null)
+  assert.equal(extractQuoted({ msg_elements: [] }), null)
+  assert.equal(extractQuoted({ msg_elements: [null] }), null)
+  assert.equal(extractQuoted({ msg_elements: [{ msg_idx: '', content: '' }] }), null)
+  assert.equal(extractQuoted(null), null)
+  // author 缺失时按"别人发的"算：宁可少一条路，也不能把别人的话当成我发的
+  assert.equal(extractQuoted({ msg_elements: [{ content: 'x' }] }).bot, false)
+})
+
+await t('【行为】extractQuoted：多个元素时按 ref_idx 挑那一个（防御：官方可能有嵌套）', () => {
+  const data = {
+    msg_elements: [
+      { msg_idx: 'REFIDX_nested==', content: '嵌套的更外一层' },
+      { msg_idx: 'REFIDX_want==', content: '我要的那条' },
+    ],
+    message_scene: { ext: ['ref_msg_idx=REFIDX_want==', 'msg_idx=REFIDX_now=='] },
+  }
+  assert.equal(extractQuoted(data, 'REFIDX_want==').content, '我要的那条')
+  // 挑不到就退回第一个（宁可拿错一条正文，也别整条丢掉）
+  assert.equal(extractQuoted(data, 'REFIDX_nope==').content, '嵌套的更外一层')
+})
+
+await t('【行为】extractRefIdx：ext 里没有 ref_msg_idx 时，退到元素自带的 msg_idx', () => {
+  const data = { msg_elements: [{ msg_idx: 'REFIDX_from_element==', content: 'x' }], message_scene: { ext: [] } }
+  assert.equal(extractRefIdx(data), 'REFIDX_from_element==')
+})
+
+// 🔴 反向校验：把「按元素兜底」这条路拿掉（= 只认 ext），上面那条断言必须不成立 ——
+// 证明它测的是新加的那条路，而不是别的什么地方碰巧凑出来的。
+await t('【反向】只认 ext 的老写法下，同一份事件是取不到索引的', () => {
+  const oldWay = (data) => {
+    const ext = data?.message_scene?.ext
+    if (!Array.isArray(ext)) return ''
+    for (const item of ext) {
+      const m = /^ref_msg_idx=(.+)$/.exec(String(item ?? '').trim())
+      if (m) return m[1].trim()
+    }
+    return ''
+  }
+  const data = { msg_elements: [{ msg_idx: 'REFIDX_from_element==', content: 'x' }], message_scene: { ext: [] } }
+  assert.equal(oldWay(data), '', '老写法本来就取不到 —— 所以上面那条测的确实是新路')
+  assert.notEqual(extractRefIdx(data), '')
+})
+
+await t('【行为】extractMsgIdx：只认本条消息自己的 msg_idx，不会误抓 ref_msg_idx', () => {
+  assert.equal(extractMsgIdx(QUOTE_EVENT_DOC), 'REFIDX_zzzzzzzzzzzzzzz==')
+  assert.equal(extractMsgIdx({ message_scene: { ext: ['ref_msg_idx=REFIDX_a=='] } }), '',
+    'ref_msg_idx 不是本条消息的索引，绝不能当成去重键')
+  assert.equal(extractMsgIdx({}), '')
+})
+
+const SESSIONS = [
+  { id: 'session-plugin', title: '插件' },
+  { id: 'session-main', title: 'main' },
+  { id: 'session-front', title: '前端重构' },
+  { id: 'session-front2', title: '前端' },
+]
+
+await t('【行为】inferSessionFromQuote：通知首行、回执括号、提问首行都能认出会话', () => {
+  const cases = [
+    ['✅ 插件 跑完了\n\n改了去重键，21 项全绿。', 'session-plugin'],
+    ['❓ main 想问你个事\n\n【第 1 问】…', 'session-main'],
+    ['⚠️ main 出错了\n\nboom', 'session-main'],
+    ['✅ 收到，我这就开始（插件）', 'session-plugin'],
+    ['✅ 收到，我这就开始（前端重构）', 'session-front'],
+    ['❌ 这句没送进 插件：DSH 会话密钥不可用', 'session-plugin'],
+  ]
+  for (const [content, want] of cases) {
+    const hit = inferSessionFromQuote(quotedOf(content), SESSIONS)
+    assert.equal(hit?.sessionId, want, `「${content.split('\n')[0]}」该认出 ${want}，实际 ${JSON.stringify(hit)}`)
+    assert.equal(hit.session, SESSIONS.find((s) => s.id === want).title)
+  }
+})
+
+await t('【行为】inferSessionFromQuote：认不出的名字绝不硬猜（猜错会话比认不出更糟）', () => {
+  assert.equal(inferSessionFromQuote(quotedOf('✅ 谁谁 跑完了'), SESSIONS), null)
+  assert.equal(inferSessionFromQuote(quotedOf('（某个我不认识的会话）'), SESSIONS), null)
+  assert.equal(inferSessionFromQuote(quotedOf('随便一句没有会话名的话'), SESSIONS), null)
+  assert.equal(inferSessionFromQuote(quotedOf('✅ 插件 跑完了'), []), null, '一个会话都没有时不能猜')
+  assert.equal(inferSessionFromQuote(null, SESSIONS), null)
+  assert.equal(inferSessionFromQuote({ content: '   ' }, SESSIONS), null)
+})
+
+await t('【行为】inferSessionFromQuote：我方那句「认不出」的提示被引用时不会误判', () => {
+  const note = '（说一声：你引用的那条我认不出属于哪个会话 —— 没登记过、会话名也没对上，所以这句话我放进了「闲聊」：那里只能看、不能动手。）'
+  assert.equal(inferSessionFromQuote(quotedOf(note), SESSIONS), null,
+    '括号里是一整句话，不是会话名 —— 不能因为里面出现了「会话」两个字就认成某个会话')
+})
+
+await t('【行为】inferSessionFromQuote：按首行猜只对**我发的**消息生效，且只认第一行', () => {
+  // 我发的：首行里出现会话名 → 敢认
+  const mine = inferSessionFromQuote(quotedOf('前端重构这件事我想再放放'), SESSIONS)
+  assert.equal(mine?.sessionId, 'session-front')
+  assert.ok(!mine.how.includes('我方格式'), '这是松判据（首行），不是高置信那条')
+
+  // 你自己发的：同样的话不敢认（你随口提到会话名，不代表话题就是它）
+  assert.equal(inferSessionFromQuote(quotedOf('前端重构这件事我想再放放', false), SESSIONS), null)
+
+  // 只有**第二行**出现会话名 → 不认（summary 里提到别的会话名是常事）
+  assert.equal(inferSessionFromQuote(quotedOf('刚才那轮跑完了\n顺便说下前端重构'), SESSIONS), null)
+})
+
+await t('【行为】inferSessionFromQuote：同一行里两个标题都在时取最长的那个', () => {
+  const hit = inferSessionFromQuote(quotedOf('前端重构 和 前端 都提到了'), SESSIONS)
+  assert.equal(hit?.sessionId, 'session-front', '"前端重构" 比 "前端" 更具体，不能只认短的那个')
+})
+
+await t('【行为】resolveQuoteTarget：三级顺序 = 精确登记 > 引用正文 > 最近一条', () => {
+  const exact = { sessionId: 'session-exact', kind: 'turn-complete' }
+  const recent = { sessionId: 'session-recent', viaFallback: true, ageMs: 1000 }
+  const quoted = quotedOf('✅ 插件 跑完了')
+
+  const a = resolveQuoteTarget({ exact, quoted, sessions: SESSIONS, recent })
+  assert.equal(a, exact, '精确命中就该原样返回（那是知道得最准的一路）')
+
+  const b = resolveQuoteTarget({ quoted, sessions: SESSIONS, recent })
+  assert.equal(b.sessionId, 'session-plugin', '正文认得出会话时，不该退到"最近一条"去猜')
+  assert.equal(b.viaContent, true)
+  assert.ok(b.how.includes('我方格式'))
+
+  const c = resolveQuoteTarget({ quoted: quotedOf('一句认不出的话'), sessions: SESSIONS, recent })
+  assert.equal(c.sessionId, 'session-recent', '正文认不出时才轮到最近一条')
+
+  assert.equal(resolveQuoteTarget({ quoted, sessions: [] }), null, '三条路都没有就是 null（调用方会投进闲聊，绝不丢）')
+})
+
+await t('【行为】resolveQuoteTarget：认出来的会话正卡在提问上 → 这条必须按「作答」走', () => {
+  const quoted = quotedOf('❓ 插件 想问你个事')
+  const hit = resolveQuoteTarget({
+    quoted, sessions: SESSIONS, pending: { askId: 'ask-1', sessionId: 'session-plugin' },
+  })
+  assert.equal(hit.kind, 'question', '否则这句话会被当普通消息注入会话，而 agent 还卡在提问上等答案')
+  assert.equal(hit.askId, 'ask-1')
+  // 端到端：路由出来必须是「作答」，而且带着 askId
+  const route = routeMessage({ text: '1', refIdx: 'REFIDX_botmsg==', hasPendingQuestion: true, refTarget: hit })
+  assert.equal(route.kind, 'answer')
+  assert.equal(route.askId, 'ask-1')
+
+  // 正等回答的是**别的**会话 → 不能挪用作答（那是别人在等）
+  const other = resolveQuoteTarget({
+    quoted, sessions: SESSIONS, pending: { askId: 'ask-9', sessionId: 'session-main' },
+  })
+  assert.equal(other.kind, 'quote-content')
+  assert.equal(other.askId, undefined)
+})
+
+await t('【行为】引用了但索引丢了：靠正文认出会话后必须走引用那条路（不能当闲聊）', () => {
+  const target = resolveQuoteTarget({ quoted: quotedOf('✅ 插件 跑完了'), sessions: SESSIONS })
+  const withQuote = routeMessage({ text: '接着说', refIdx: '', hasPendingQuestion: false, refTarget: target, hasQuote: true })
+  assert.equal(withQuote.kind, 'prompt', '索引没拿到也不该退化成闲聊 —— 那会把话送进另一个会话')
+  assert.equal(withQuote.sessionId, 'session-plugin')
+
+  // 🔴 反向校验：不显式声明 hasQuote（= 老调用方的行为）时就是闲聊 —— 证明确实是这个开关在做判断
+  const oldWay = routeMessage({ text: '接着说', refIdx: '', hasPendingQuestion: false, refTarget: target })
+  assert.equal(oldWay.kind, 'chat')
+})
+
+await t('【源码】onC2cMessage：三级兜底收敛到一个决策点，且只在"精确没中"时才去认正文', () => {
+  const body = extractFunction(qqruntimeSrc, 'async function onC2cMessage(data) {')
+  assert.ok(body.includes('resolveQuoteTarget({ exact, quoted, sessions, pending, recent })'),
+    '三级顺序必须写在纯函数 resolveQuoteTarget 里（散在分支里迟早写歪），这里只负责备料')
+  assert.ok(body.indexOf('if (!exact && quoted?.content)') < body.indexOf('resolveQuoteTarget({ exact'),
+    '只在"精确反查没中"时才去认正文')
+  assert.ok(body.includes('ensureApi(cfg)') && body.includes('await listSessions()'),
+    '认正文要用会话列表（标题 → id），得先 ensureApi 再拉')
+  assert.ok(body.includes('else if (!exact)'), '没有引用正文可认时，才直接用"最近一条"兜底')
+})
+
+await t('【源码】prompt 分支：靠正文认出的会话也必须明说（viaContent）', () => {
+  const at = qqruntimeSrc.indexOf("case 'prompt': {")
+  const end = qqruntimeSrc.indexOf('// 显式 /task', at)
+  const block = qqruntimeSrc.slice(at, end)
+  assert.ok(block.includes('refTarget?.viaContent'), '靠正文认的也要说一声，认错了他才知道')
+  assert.ok(block.includes('refTarget?.viaFallback'), '按"最近一条"猜的那条说明也不能丢')
+})
+
+await t('【源码】unknown_ref 分支：要把你引用的那句摘出来回给你', () => {
+  const at = qqruntimeSrc.indexOf("case 'unknown_ref': {")
+  const end = qqruntimeSrc.indexOf("case 'screen_ref':", at)
+  const block = qqruntimeSrc.slice(at, end)
+  assert.ok(block.includes('quoted?.content'), '连"我看见了什么"都不说，主人只能干着急')
+  assert.ok(block.includes('handlePrompt('), '认不出也必须投递')
+})
+
+await t('【源码】msg_idx 重复：只记日志，绝不 return（宁可重复一次也不能丢）', () => {
+  const at = qqruntimeSrc.indexOf('const myMsgIdx = extractMsgIdx(data)')
+  assert.notEqual(at, -1, '找不到 msg_idx 观测块 —— 测试已与源码脱节')
+  const end = qqruntimeSrc.indexOf('const text = String(data?.content', at)
+  const block = qqruntimeSrc.slice(at, end)
+  const codeOnly = block.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n')
+  assert.ok(codeOnly.includes('seenMsgIdx.has(myMsgIdx)'), '要能发现重复（否则观测就没意义）')
+  assert.ok(!/\breturn\b/.test(codeOnly),
+    '官方建议按 msg_idx 去重，但万一它不是每条唯一，按它去重会把正常消息永久丢掉')
+
+  // 🔴 反向校验：把「重复就 return」写回去，上面的检查器必须报红
+  const bad = [
+    'const myMsgIdx = extractMsgIdx(data)',
+    'if (myMsgIdx && seenMsgIdx.has(myMsgIdx)) {',
+    '  l("重复")',
+    '  return',
+    '}',
+  ].join('\n')
+  const badCode = bad.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n')
+  assert.ok(/\breturn\b/.test(badCode), '检查器失效了：重复就 return 的写法它都看不出来')
+})
+
+console.log('\n[15] agent 状态落盘（回合中途重启后还认得出"它正在跑" —— 2026-10-05 报的 bug）')
+
+await t('markAgentStatus 落盘，另一个实例从盘上读得回来', () => {
+  const f = path.join(tmp, 'state-agent.json')
+  new BotState(f).markAgentStatus('session-a', 'running')
+  assert.equal(new BotState(f).agentStatusMap()['session-a'].s, 'running')
+})
+
+await t('老状态文件（没有 agentStatus 键）平滑升级：读回空表、不炸', () => {
+  const f = path.join(tmp, 'state-agent-legacy.json')
+  fs.writeFileSync(f, JSON.stringify({ openId: 'o1', sessionId: null, lastSeq: 2, seen: [] }), 'utf8')
+  const st = new BotState(f)
+  assert.deepEqual(st.agentStatusMap(), {})
+  assert.deepEqual(st.data.agentStatus, {})
+})
+
+await t('只认 running / idle —— 别的状态不许盖掉"它正在跑"这个事实', () => {
+  const f = path.join(tmp, 'state-agent-only.json')
+  const st = new BotState(f)
+  st.markAgentStatus('s1', 'running')
+  st.markAgentStatus('s1', 'error')
+  st.markAgentStatus('', 'running')
+  assert.equal(new BotState(f).agentStatusMap()['s1'].s, 'running')
+  assert.equal(Object.keys(new BotState(f).agentStatusMap()).length, 1, '空 id 不该建条目')
+})
+
+await t('过期条目会被清掉（不会永远把某个 agent 当"在跑"）', () => {
+  const f = path.join(tmp, 'state-agent-ttl.json')
+  const st = new BotState(f)
+  st.markAgentStatus('s-old', 'running', 50, 1000)
+  st.data.agentStatus['s-old'].at = Date.now() - 5000
+  st.markAgentStatus('s-new', 'running', 50, 1000)
+  const m = new BotState(f).agentStatusMap()
+  assert.equal(m['s-old'], undefined, '超过 TTL 的条目必须清掉')
+  assert.equal(m['s-new'].s, 'running')
+})
+
+await t('条目数量有上限，状态文件不会无限膨胀', () => {
+  const f = path.join(tmp, 'state-agent-cap.json')
+  const st = new BotState(f)
+  for (let i = 0; i < 10; i += 1) st.markAgentStatus(`s${i}`, 'idle', 3)
+  assert.equal(Object.keys(st.agentStatusMap()).length, 3)
 })
 
 console.log(`\n${'─'.repeat(60)}`)

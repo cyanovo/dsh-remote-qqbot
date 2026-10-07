@@ -104,8 +104,16 @@
 
         <div class="card prose">
           <h2>怎么装</h2>
-          <p>插件没有发布到 npm。安装命令见<a href="#docs/install">教程第 2 章</a>，那一章也写了两个容易出错的地方。</p>
-          <p>装完重启 DSH，在设置里填好 QQ 机器人的 AppID 和密钥即可使用，不需要在本站注册。
+          <p>两种装法，任选一种：</p>
+          <ul>
+            <li><b>让 DSH 自己装</b>：<a href="#docs/install">教程第 2 章</a> 有一段可以直接复制的文字，
+              粘进 DSH 的输入框发出去，它会自己装好、核对版本，再提醒你重启。</li>
+            <li><b>自己敲一条命令</b>：<code>dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot</code>
+              （<code>dsh web</code> 起的把 <code>desktop</code> 换成 <code>web</code>）。
+              插件仓库：<a href="https://github.com/cyanovo/dsh-remote-qqbot" target="_blank" rel="noopener noreferrer">github.com/cyanovo/dsh-remote-qqbot</a>
+              —— 想先看代码、或想自己改，从这里进。</li>
+          </ul>
+          <p>装完<b>重启 DSH</b>，在设置里填好 QQ 机器人的 AppID 和密钥即可使用，不需要在本站注册。
           只有想把完整回答存在自己账号下、并拿到可点的链接时，才需要绑定一次。</p>
         </div>
 
@@ -170,7 +178,8 @@
           <h2>联系方式</h2>
           <ul>
             <li><b>QQ 1103416608</b>：安装卡住了、额度或兑换码有问题、发现 bug、想要新功能，都可以在 QQ 找我。</li>
-            <li><b>GitHub <a href="https://github.com/cyanovo" target="_blank" rel="noopener noreferrer">@cyanovo</a></b>：源码、部署脚本、教程都在这里，也可以在那边提 issue。</li>
+            <li><b>插件仓库 <a href="https://github.com/cyanovo/dsh-remote-qqbot" target="_blank" rel="noopener noreferrer">dsh-remote-qqbot</a></b>：插件的全部源码在这里，装之前可以先看；发现问题、想要新功能，也可以在那边提 issue。</li>
+            <li><b>GitHub <a href="https://github.com/cyanovo" target="_blank" rel="noopener noreferrer">@cyanovo</a></b>：本站、部署脚本、教程都挂在这个账号下。</li>
           </ul>
         </div>
       </section>
@@ -200,7 +209,8 @@
       <footer class="foot">
         <span>DSH 通知插件 · 网页端</span>
         <span>联系作者：QQ <b>1103416608</b> ｜
-          <a href="https://github.com/cyanovo" target="_blank" rel="noopener noreferrer">GitHub @cyanovo</a></span>
+          <a href="https://github.com/cyanovo" target="_blank" rel="noopener noreferrer">GitHub @cyanovo</a> ｜
+          <a href="https://github.com/cyanovo/dsh-remote-qqbot" target="_blank" rel="noopener noreferrer">插件源码</a></span>
         <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">豫ICP备2026030622号</a>
       </footer>
     </div>

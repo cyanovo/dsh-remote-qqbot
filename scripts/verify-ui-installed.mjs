@@ -7,6 +7,8 @@
 // 5) 安装目录 lib/collab.js 含「协作模式已关闭」护栏
 // 6) 插件自有覆盖存储 lib/overrides.js 在，且桌面版拒绝原生写入时真的落盘；落盘失败必须抛错
 // 7) 挑会话（0.8.5）：列表纯文本、编号齐全、**有提问在等时数字必须是作答**、qqruntime 真接线
+// 8) 接收 QQ 推送：设置里那个开关（1.0.20）—— 字段表里的标签/说明 + 客户端那张卡
+// 9) 新版本提醒：默认间隔 1 小时 + `/update check` 也带两个按钮（1.0.20）
 import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync, existsSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
@@ -151,14 +153,49 @@ const listing = qq.formatSessionPickerText({
 check('  列表编号 1..6 齐全', [1, 2, 3, 4, 5, 6].every((i) => listing.split('\n').some((l) => l.startsWith(`${i}. `))))
 check('  列表是纯文本（没有 markdown 记号，避免被吃掉）', !listing.includes('**') && !listing.includes('`'))
 const pick = (o) => qq.routeMessage({ text: '2', refIdx: '', refTarget: null, ...o })
-check('  看过名单回「2」= 选会话', pick({ hasPendingQuestion: false, pickerActive: true }).kind === 'pick_session')
-check('  ★ 有提问在等回「2」= 作答（优先级不能反）', pick({ hasPendingQuestion: true, pickerActive: true }).kind === 'answer')
+// ⚠️ 期望值 2026-10-07（1.0.24）改过：裸数字**一律闲聊**。主人明确要求「只要我不引用信息、
+//    前面也不带 /，就是闲聊，无论任何情况」，所以"看过名单的裸数字=选择""有提问在等=作答"
+//    两条抢消息的规则被删掉了；选会话 / 作答要走按钮（`/pick N`）或引用。
+check('  看过名单回「2」= 仍然是闲聊（数字不再自己"认领"名单）', pick({ hasPendingQuestion: false, pickerActive: true }).kind === 'chat')
+check('  ★ 有提问在等回「2」= 仍然是闲聊（作答得引用提问或点按钮）', pick({ hasPendingQuestion: true, pickerActive: true }).kind === 'chat')
 check('  qqruntime 里真用了 isPickerFresh（接线没漏）',
   readFileSync(path.join(installedLib, 'qqruntime.js'), 'utf8').includes('isPickerFresh({'))
 check('  qqruntime 里真处理了 sessions / pick_session 两个分支',
   /case 'sessions'/.test(readFileSync(path.join(installedLib, 'qqruntime.js'), 'utf8'))
   && /case 'pick_session'/.test(readFileSync(path.join(installedLib, 'qqruntime.js'), 'utf8')))
 check('  设置面板能看见「会话列表条数」', fields.has('qqRecentCount'))
+
+// ---- 8. 接收 QQ 推送：设置里那个开关（1.0.20） ----
+// 主人 2026-10-07：「我希望在 DSH 的设置里面，也有插件是否接收推送功能的开关」。
+// 这个键本来就在字段表里（旧标签「远程提醒」），1.0.20 把它提成设置页**最上面一张卡**。
+const push = fields.get('qqNotifyEnabled')
+check('★ 设置面板里有「接收 QQ 推送」', push?.label === '接收 QQ 推送', `实际标签 ${push?.label ?? '缺失'}`)
+check('  它是 boolean 且在 qq 分组', push?.type === 'boolean' && push?.group === 'qq')
+check('  说明写清了它管新版本提醒、关掉后长连接与反向对话照旧',
+  /新版本/.test(push?.description ?? '') && /长连接|反向对话/.test(push?.description ?? ''))
+check('  说明里点明了它和输入框旁边那个小开关是同一个',
+  /输入框旁边|小开关/.test(push?.description ?? ''))
+check('  host 说关着 → 视图里就是关着（界面不能自己猜成开）',
+  configView(noNs, NS, { qqEnabled: true, qqNotifyEnabled: false }).values.qqNotifyEnabled === false)
+check('★ 设置页把这张卡渲染在字段表之前，并排掉分组里的同名键',
+  client.includes("key: 'push-switch'") && client.includes("field.key !== 'qqNotifyEnabled'"))
+check('★ 显示口径与行为一致：缺省视为开（不能写成 === true）',
+  client.includes("const pushOn = valueOf('qqNotifyEnabled') !== false") && client.includes('checked: pushOn'))
+
+// ---- 9. 新版本提醒：间隔 1 小时 + 手动查也带两个按钮（1.0.20） ----
+const installedRuntime = readFileSync(path.join(installedLib, 'qqruntime.js'), 'utf8')
+const checkOnlyIdx = installedRuntime.indexOf('if (checkOnly) {')
+const checkOnlyBody = checkOnlyIdx > 0
+  ? installedRuntime.slice(checkOnlyIdx, installedRuntime.indexOf('if (updating) {', checkOnlyIdx))
+  : ''
+check('★ 默认间隔 1 小时（DEFAULTS + 定时器兜底两处）',
+  /qqUpdateCheckHours: 1,/.test(readFileSync(path.join(installedRoot, 'lib', 'index.js'), 'utf8'))
+  && /\n      : 1\n/.test(installedRuntime))
+check('★ `/update check` 发现新版时回的提醒带两个按钮',
+  checkOnlyBody.includes('buildUpdateNoticeKeyboard()'))
+check('  手动看过就记账，自动检查不再重复推同一条',
+  checkOnlyBody.includes('state.set({ updateNotified: got.version })'))
+check('  帮助里能查到 `/update check`', qq.HELP_TEXT.includes('/update check'))
 
 console.log(bad === 0 ? `\n>>> ${localVersion} 安装产物核对全部通过 ✅` : `\n>>> 有 ${bad} 项不通过 ❌`)
 process.exit(bad === 0 ? 0 : 1)

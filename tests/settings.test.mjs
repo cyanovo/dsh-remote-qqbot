@@ -283,5 +283,18 @@ await test('回归：Cordis 传入的「已填满默认值的 config」不得覆
   assert.ok(!/内部不一致/.test(joined), '不应触发内部不一致告警')
 })
 
+await test('★ 运行状态里能看到「跑的是 / 装的是」（"装完没重启"是个看不见的坑）', () => {
+  // 为什么钉这一行：DSH 没有插件热重载 —— `pnpm add` 换的只是磁盘文件。
+  // 主人 2026-10-07 被它卡了一整天（手机那头跑的是 1.0.18、磁盘上已是 1.0.20、
+  // `/update` 还说"已经是最新版"，新功能一个也看不到）。界面上唯一能看见这个差异的地方就是这一行。
+  const svc = makeSettingsService({ hubUrl: 'https://hub.example' })
+  MOD.apply(makeCtx(svc), {})
+  const row = MOD.lastStatusLines().find((r) => r.label === '插件版本')
+  assert.ok(row, '状态里必须有「插件版本」这一行')
+  assert.match(row.value, /跑的是 \d+\.\d+\.\d+/, '要说清内存里跑的是哪一版')
+  assert.match(row.value, /装的是 \d+\.\d+\.\d+/, '也要说清磁盘上装的是哪一版')
+  assert.notEqual(row.warn, true, '两边一致时不该报警')
+})
+
 console.log(`\n通过 ${passed} / 失败 ${failed}`)
 process.exit(failed === 0 ? 0 : 1)

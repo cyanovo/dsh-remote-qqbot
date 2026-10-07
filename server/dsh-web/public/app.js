@@ -247,20 +247,18 @@ function accountBlock() {
   // 要不要显示，看服务端 /api/meta 怎么说的（本机直连/带后台口令时是 false）。
   const capLogin = captchaNeeded() ? `
     <div class="cap">
-      <img class="cap-img" id="capImg_login" alt="人机验证图片，点击可换一张" width="132" height="44">
+      <img class="cap-img" id="capImg_login" alt="人机验证图片" width="132" height="44">
       <input type="text" id="capText_login" autocomplete="off" spellcheck="false" inputmode="latin"
              maxlength="8" placeholder="图里的 4 位" aria-label="人机验证">
       <button type="button" class="btn" id="capNew_login">换一张</button>
-    </div>
-    <p class="cap-tip">看不清就点「换一张」。这一关是给机器设的，不是给你设的。</p>` : '';
+    </div>` : '';
   const capReg = captchaNeeded() ? `
     <div class="cap">
-      <img class="cap-img" id="capImg_reg" alt="人机验证图片，点击可换一张" width="132" height="44">
+      <img class="cap-img" id="capImg_reg" alt="人机验证图片" width="132" height="44">
       <input type="text" id="capText_reg" autocomplete="off" spellcheck="false" inputmode="latin"
              maxlength="8" placeholder="图里的 4 位" aria-label="人机验证">
       <button type="button" class="btn" id="capNew_reg">换一张</button>
-    </div>
-    <p class="cap-tip">同样要填一张图里的 4 位。</p>` : '';
+    </div>` : '';
   return `<h2>登录</h2>
     <label class="f"><span>用户名</span><input type="text" id="loginName" autocomplete="username" placeholder="2–24 位，中文/字母/数字"></label>
     <label class="f"><span>密码</span><input type="password" id="loginPass" autocomplete="current-password"></label>
@@ -269,7 +267,7 @@ function accountBlock() {
     <div class="msg" id="loginMsg"></div>
     <hr style="border:0;border-top:1px solid var(--line-2);margin:24px 0">
     <h2>还没有账号</h2>
-    <p class="hint">注册只需用户名和密码（外加一张图里的 4 位），注册后每天有 100 次免费完整查看。</p>
+    <p class="hint">注册只需用户名和密码，注册后每天有 100 次免费完整查看。</p>
     <label class="f"><span>用户名</span><input type="text" id="regName" autocomplete="username"></label>
     <label class="f"><span>密码（至少 6 位）</span><input type="password" id="regPass" autocomplete="new-password"></label>
     ${capReg}
@@ -369,7 +367,7 @@ function bindDynamic() {
     if (need && (!cap || !cap.id)) { msg('loginMsg', '验证码还没加载出来，点「换一张」重试', 'err'); loadCaptcha('login'); return; }
     const capText = need ? $('capText_login').value.trim() : '';
     // 空着就别白跑一趟服务端（服务端那边也会拒，但那是一次没必要的往返）
-    if (need && !capText) { msg('loginMsg', '请照图填写这 4 位验证码（看不清就点「换一张」）', 'err'); return; }
+    if (need && !capText) { msg('loginMsg', '请填写图中的 4 位验证码', 'err'); return; }
     msg('loginMsg', '正在登录…');
     try {
       const r = await api('/api/login', {
@@ -392,7 +390,7 @@ function bindDynamic() {
     const cap = need ? state.captcha.reg : null;
     if (need && (!cap || !cap.id)) { msg('regMsg', '验证码还没加载出来，点「换一张」重试', 'err'); loadCaptcha('reg'); return; }
     const capText = need ? $('capText_reg').value.trim() : '';
-    if (need && !capText) { msg('regMsg', '请照图填写这 4 位验证码（看不清就点「换一张」）', 'err'); return; }
+    if (need && !capText) { msg('regMsg', '请填写图中的 4 位验证码', 'err'); return; }
     msg('regMsg', '正在注册…');
     try {
       const r = await api('/api/register', {

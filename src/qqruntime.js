@@ -31,10 +31,16 @@ import { fileURLToPath } from 'node:url'
 
 import { QqBotClient } from './qqbot.js'
 import {
-  BotState, DshLocalApi, HELP_TEXT, PICKER_DEFAULT_COUNT, buildAnswers, extractRefIdx,
+  BotState, DshLocalApi, HELP_TEXT, PICKER_DEFAULT_COUNT, WORKSPACE_PICK_WINDOW_MS,
+  buildAnswers, buildHelpKeyboard,
+  buildNumberButtons, buildOptionKeyboard, buildUpdateNoticeKeyboard,
+  extractMsgIdx,
+  extractQuoted, extractRefIdx,
   formatNotification, formatPickAck, formatQuestion, formatSessionPickerText,
-  formatStatusText, isPickerFresh, pickPromptMode, readDshSecret,
-  healBrowserSessionRecord, readBrowserSessionSecret,
+  formatStatusText, formatTaskSessionPickAck, formatTaskSessionPickerText,
+  formatWorkspacePickAck, formatWorkspacePickerText,
+  inferSessionFromQuote, isPickerFresh, makeCmdButton, pickPromptMode, readDshSecret,
+  healBrowserSessionRecord, readBrowserSessionSecret, resolveQuoteTarget, shortPath,
   routeMessage, summarizeSession,
 } from './qqbridge.js'
 import { planQqFulltext } from './fulltext.js'
@@ -42,12 +48,15 @@ import { captureScreen } from './screenshot.js'
 import {
   DEFAULT_UPDATE_SOURCE, RESTART_DELAY_SECONDS, UPDATE_CHECK_TIMEOUT_MS,
   UPDATE_INSTALL_TIMEOUT_MS, UPDATE_LOG_FILE_NAME, buildAddCommand, buildRestartScript,
-  compareVersions, fetchLatestVersion, formatAlreadyLatest, formatCheckFailed,
-  formatRemoteOlder, formatRestartDone, formatUpdateAvailable, formatUpdateBusy,
-  formatUpdateCheck, formatUpdateDone, formatUpdateFailed, formatUpdateMisconfigured,
-  formatUpdateNoChange, formatUpdating, launchRestartScript, parseDesktopRuntime,
-  parseUpdateSource, pluginRootFromFile, readPackageVersion, resolveProfileFromPluginFile,
-  restartLogSize, runProcess, verifyRestartLaunched, writeRestartLauncher, writeRestartScript,
+  compareVersions, fetchAndVerifyPackage, fetchLatestVersion, formatAlreadyLatest, formatCheckFailed,
+  formatNothingToSkip, formatRemoteOlder, formatRestartDone, formatUpdateAvailable,
+  formatUpdateBusy, formatUpdateDone, formatUpdateFailed,
+  formatUpdateMisconfigured, formatUpdateNoChange, formatUpdateSkipped, formatUpdating,
+  formatPendingRestart,
+  launchRestartScript, parseDesktopRuntime,
+  parseUpdateSource, pluginRootFromFile, readPackageVersion, removeVerifiedPackage,
+  resolveProfileFromPluginFile, restartLogSize, runProcess, verifyRestartLaunched,
+  writeRestartLauncher, writeRestartScript,
 } from './update.js'
 
 /**
@@ -79,6 +88,15 @@ const ASK_TTL_MS = 24 * 60 * 60 * 1000
  */
 const ASK_DESKTOP_FALLBACK_MS = 90 * 1000
 
+/**
+ * 启动那次更新检查"配置还没就绪"时，隔多久补查、最多补几次。
+ *
+ * 30 秒 × 3 ≈ 一分半，足够覆盖插件 apply 到配置就绪之间的空窗；
+ * 再多也没意义 —— 真关着 QQ 通道的人，补一百次也还是关着。
+ */
+const UPDATE_LATE_RETRY_MS = 30 * 1000
+const UPDATE_LATE_RETRY_MAX = 3
+
 /** 闲聊回答的默认最大长度（按码点）。QQ 单条消息有长度上限，留足余量。 */
 const CHAT_ANSWER_MAX = 1500
 
@@ -90,6 +108,51 @@ const CHAT_ANSWER_MAX = 1500
  * 为什么不从配置里取：profile 是 DSH 自己的概念，插件没有任何入参能拿到它。
  */
 const SELF_FILE = fileURLToPath(import.meta.url)
+
+/**
+ * 🔴 **这份代码被加载的那一刻**、磁盘上 package.json 里的版本号。
+ *
+ * 这是"内存里跑的是哪一版"的**唯一可靠来源**，绝不能改成"用到的时候现读"：
+ * 插件装在 profile 里，`pnpm add` 换掉磁盘文件对**已经加载进内存的代码没有任何影响**；
+ * 一旦"装完还没重启"，现读就会读到**新版**，于是插件以为自己在跑新版 ——
+ *
+ *   主人发 `/update` → 回「已经是最新版 1.0.20，不用更新」→ **永远不重启**，
+ *   而他手机那头跑的还是 1.0.18，新功能一个也看不到。
+ *
+ * 2026-10-07 15:2x 主人踩的正是这个（跑 1.0.18、磁盘 1.0.20、`/update` 说已是最新）：
+ * 旧代码把版本号缓存在**第一次用到时**才读，而这一次调用发生在装完 1.0.20 之后。
+ * 加载时读一次就没有这个窗口 —— 文件是这一刻从磁盘读进来的，版本号必然对得上。
+ */
+const RUNNING_VERSION = (() => {
+  try {
+    const root = pluginRootFromFile(SELF_FILE)
+    if (!root) return ''
+    return readPackageVersion(path.join(root, 'package.json'))
+  } catch {
+    return ''
+  }
+})()
+
+/**
+ * 读**磁盘上装的那一份**代码的版本号（可能比内存里跑的这份新，见 {@link RUNNING_VERSION}）。
+ *
+ * 盘上那份的位置是固定的：`<profile>/node_modules/dsh-remote-qqbot/package.json`
+ * （跟安装完读回来用的是同一个路径，见 `installUpdate`）。
+ *
+ * @param {string} [profileDir] - profile 目录；不传就按本模块自己的位置反推。
+ * @returns {string} 读不出来返回空串。
+ */
+function installedVersionOnDisk(profileDir = '') {
+  try {
+    const dir = String(profileDir ?? '').trim()
+      || resolveProfileFromPluginFile(SELF_FILE)?.profileDir
+      || ''
+    if (!dir) return ''
+    return readPackageVersion(path.join(dir, 'node_modules', 'dsh-remote-qqbot', 'package.json'))
+  } catch {
+    return ''
+  }
+}
 
 /** 按码点截断；超长补省略号。空串原样返回。 */
 function clampText(text, maxChars) {
@@ -138,6 +201,23 @@ export function createQqRuntime({
 
   /** askId -> { questions, sessionId, resolve, createdAt }，按加入顺序即最早优先。 */
   const pendingAsks = new Map()
+
+  /**
+   * 最近见过的**入站消息索引**（`message_scene.ext` 的 `msg_idx`），只活在内存里。
+   *
+   * 用途只有一个：观测"平台会不会把同一条消息换个 id 再推一次"（官方要求按 msg_idx 去重）。
+   * 观测到之前**不丢任何消息** —— 见 onC2cMessage 里的用法。
+   */
+  const seenMsgIdx = new Set()
+
+  /**
+   * 已经提示过"你这句话我当闲聊发了，但有个提问在等你回答"的 askId。
+   *
+   * 1.0.24 起普通消息不再自动当作答案（见 routeMessage），agent 那边可能一直卡着，
+   * 所以第一次发生时要提示主人该引用作答；但**同一条提问只提示一次**，否则他每说一句
+   * 就念一遍，比不提示还吵。只活在内存里：重启后最多再提示一次，无所谓。
+   */
+  const answerHinted = new Set()
 
   const l = (m) => log(`[QQ] ${m}`)
 
@@ -265,7 +345,7 @@ export function createQqRuntime({
   // ── 出站：事件 → QQ ──────────────────────────────────────────────────────
 
   /** 由 index.js 的 push() 调用。任何失败都只记日志，不影响 agent。 */
-  async function notify({ kind, summary, project, session, sessionId }) {
+  async function notify({ kind, summary, project, session, sessionId, buttons = null }) {
     const cfg = liveConfig()
     if (!cfg.qqEnabled) return
     // 远程提醒总开关（DSH 输入框下方那个）：关掉时不推送，但**不**断开长连接 ——
@@ -281,7 +361,12 @@ export function createQqRuntime({
     try {
       // markdown 模式：推送里那个 `[👉 查看完整回答](链接)` 才会折叠成一句话。
       // 传 false（或内容过长）时就是普通文本消息，长 URL 会整个显示出来。
-      const res = await bot.sendC2C(openId, text, { markdown: cfg.qqMarkdown === true })
+      //
+      // buttons = 「消息按钮」（QQ 里那些可点的蓝色文字，见 docs/ARCHITECTURE.md 6.8）。
+      // 传了它就强制走 markdown 通路 —— 官方：按钮只能挂在 markdown 消息上。
+      const res = await bot.sendC2C(openId, text, {
+        markdown: cfg.qqMarkdown === true, keyboard: buttons,
+      })
       // ⚠️ 关键：记下这条通知的 ref_idx。
       // 你「引用这条消息」回复时，事件里带的是同一个索引 —— 靠它反查会话。
       const refIdx = res?.ext_info?.ref_idx
@@ -427,12 +512,16 @@ export function createQqRuntime({
    * @param {string} text - 回复正文。
    * @param {{sessionId?: string, session?: string, kind?: string}} [target]
    *   这条回执属于哪个会话；**给了才登记**，好让主人引用这条回执时能回到同一个会话。
+   * @param {object|null} [buttons] - 「消息按钮」（见 qqbridge 的 buildKeyboard）。
+   *   传了它会强制走 markdown 通路 —— 官方：按钮只能挂在 markdown 消息上。
    */
-  async function replyPassive(data, text, target) {
+  async function replyPassive(data, text, target, buttons = null) {
     const openId = data?.author?.user_openid ?? data?.author?.id
     if (!openId) return null
     try {
-      const res = await bot.sendC2C(openId, text, { msgId: data.id })
+      const res = await bot.sendC2C(openId, text, buttons
+        ? { msgId: data.id, keyboard: buttons }
+        : { msgId: data.id })
       if (target?.sessionId) {
         const refIdx = res?.ext_info?.ref_idx
         const kind = target.kind ?? 'ack'
@@ -531,21 +620,89 @@ export function createQqRuntime({
     // 官方明确说同一条 msg_id 可能重复推送
     if (state.markSeen(data?.id)) return
 
+    // 官方还建议「结合 msg_idx 去重」。我们**先只观测、不据此丢消息**：万一 msg_idx 不是
+    // 每条消息唯一，按它去重会把正常消息永久丢掉 —— 那比偶尔重复进一次严重得多。
+    // 真要看到"同一个 idx 配不同正文"，日志会先说出来，那时再决定要不要动真格。
+    const myMsgIdx = extractMsgIdx(data)
+    if (myMsgIdx) {
+      if (seenMsgIdx.has(myMsgIdx)) {
+        l(`⚠️ 同一个 msg_idx 又收到一次（${myMsgIdx.slice(0, 20)}…）：官方说要用它去重，`
+          + '但先只记日志、不丢消息（消息体是另一条 id，说明平台确实会重投）')
+      } else {
+        seenMsgIdx.add(myMsgIdx)
+        if (seenMsgIdx.size > 200) seenMsgIdx.delete(seenMsgIdx.values().next().value)
+      }
+    }
+
     const text = String(data?.content ?? '').trim()
     const pending = oldestPending()
     // 你引用的是哪条消息？—— 引用消息的 message_scene.ext 里有 ref_msg_idx
     const refIdx = extractRefIdx(data)
-    // 先按 ref_idx 精确反查；认不出来时退到「最近一条我发过、且知道属于哪个会话的消息」
-    // （默认 12 小时窗，见 BotState.recentTarget）。不兜底的话这条消息会以 unknown_ref
-    // 被**整条丢掉** —— 用户既没进会话、也看不到任何处理，是最坏的结果。
+    // 官方事件里**还带着被引用那条消息本身**（正文 + 是不是我发的），见 extractQuoted。
+    const quoted = extractQuoted(data, refIdx)
+    // 引用反查按「从确定到不确定」三级走：
+    //   ① ref_idx 精确命中登记表（知道得最准）
+    //   ② 从**被引用消息的正文**里认出会话名（我发的每条消息里都写着会话名）
+    //   ③ 最近一条我知道属于哪个会话的消息（12 小时窗，见 BotState.recentTarget）
+    // 三级全落空时**也绝不丢消息** —— 投进闲聊会话（只读）并说清去了哪，见下面的 unknown_ref。
+    // 不兜底的话这条消息会以 unknown_ref 被整条丢掉：用户既没进会话、也看不到任何处理。
+    // 三级怎么选是纯函数 resolveQuoteTarget 的事，这里只负责把料备齐。
     const exact = state.refTarget(refIdx)
-    const refTarget = exact ?? (refIdx ? state.recentTarget() : null)
-    // 刚发过 /sessions 名单吗？在的话，一个纯数字就是在选会话（见 isPickerFresh）。
-    const pickerActive = isPickerFresh({ pickerAt: state.data.pickerAt, ids: state.data.pickerIds })
+    /** 第三条路（最近一条）的目标：只认带会话的登记，12 小时窗。精确命中时不必算。 */
+    const recent = exact || !refIdx ? null : state.recentTarget()
+    let refTarget = exact
+    let quotedHow = ''
+    if (!exact && quoted?.content) {
+      // 认正文要用会话列表（标题 → id），所以这一步是异步的；失败只是少一条路，不往外抛。
+      let sessions = []
+      try {
+        ensureApi(cfg)
+        sessions = await listSessions()
+      } catch (err) {
+        l(`按引用正文认会话失败（继续走兜底）：${err?.message ?? err}`)
+      }
+      refTarget = resolveQuoteTarget({ exact, quoted, sessions, pending, recent })
+      if (refTarget?.viaContent) quotedHow = refTarget.how
+    } else if (!exact) {
+      refTarget = recent
+    }
+    // 1.0.24 起"刚看过名单 → 裸数字就是选它"这条规则**取消了**：主人要求「不引用、不带 /
+    // 的消息一律当闲聊，无论任何情况」。名单本身照旧有效，按钮也照旧能点（它们发的是
+    // `/pick` `/open` `/use` 这种显式指令）。
+    //
+    // 这里只算"刚刚到底发过哪一份名单"——用途**只有一个**：万一他手打了一个数字，
+    // 消息照样当闲聊投出去（投递不受影响），但顺带回一句提示。三份名单谁后发听谁的，
+    // 顺序（工作区会话 → 工作区 → 会话）只在时间戳相等时才起作用：越具体的越优先。
+    const nowMs = Date.now()
+    const freshList = [
+      {
+        label: '工作区里的会话名单', cmd: '/open ',
+        fresh: isPickerFresh(
+          { pickerAt: state.data.taskSessionAt, ids: state.data.taskSessionIds },
+          nowMs, WORKSPACE_PICK_WINDOW_MS,
+        ),
+      },
+      {
+        label: '工作区名单', cmd: '/pick ',
+        fresh: isPickerFresh(
+          { pickerAt: state.data.taskPickerAt, ids: state.data.taskPickerCwds },
+          nowMs, WORKSPACE_PICK_WINDOW_MS,
+        ),
+      },
+      {
+        label: '会话名单', cmd: '/use ',
+        fresh: isPickerFresh({ pickerAt: state.data.pickerAt, ids: state.data.pickerIds }, nowMs),
+      },
+    ].find((x) => x.fresh) ?? null
     const route = routeMessage({
-      text, refIdx, hasPendingQuestion: Boolean(pending), refTarget, pickerActive,
+      text, refIdx, hasPendingQuestion: Boolean(pending), refTarget,
+      hasQuote: Boolean(refIdx) || Boolean(quoted),
     })
     l(`收到消息 → ${route.kind}（${route.reason}）${refIdx ? ` ref=${String(refIdx).slice(0, 20)}…` : ''}`
+      + (quoted?.content
+        ? `｜引用了${quoted.bot ? '我' : '你'}发的「${quoted.content.split('\n')[0].slice(0, 40)}」`
+        : '')
+      + (quotedHow ? `（按正文认出会话：${quotedHow}）` : '')
       + (refTarget?.viaFallback
         ? `（ref_idx 认不出，已按最近一条消息兜底${refTarget.ageMs ? `：${fmtDuration(refTarget.ageMs)} 前那条` : ''}）`
         : ''))
@@ -554,10 +711,17 @@ export function createQqRuntime({
       // 引用了我发的通知 → 回到那条通知对应的会话
       case 'prompt': {
         const ok = await handlePrompt(route.sessionId, route.session || '那个会话', route.text, data)
-        // 这条走的是**兜底**（ref_idx 没对上，只能按"最近一条通知"猜会话）时必须明说：
-        // 悄悄把话送到另一个会话，是这里最坏的失败方式。带上"那条通知是多久前的"，
-        // 好让主人一眼判断猜得对不对，错了立刻能重发。
-        if (ok && refTarget?.viaFallback) {
+        // 靠**被引用消息的正文**认出会话的（ref_idx 反查没命中）时也必须明说 ——
+        // 认错了主人一眼能看出来，才知道该怎么补救。
+        if (ok && refTarget?.viaContent) {
+          await replyPassive(data, [
+            `（说一声：这条我是按${refTarget.how || '引用正文'}认出会话的 ——「${route.session || '那个会话'}」，你引用的那条我这儿没登记。）`,
+            '如果送错了地方：发 /sessions 挑一个，再把你这句话重发一次。',
+          ].join('\n'), { sessionId: route.sessionId, session: route.session || '' })
+        } else if (ok && refTarget?.viaFallback) {
+          // 这条走的是**兜底**（ref_idx 没对上，只能按"最近一条通知"猜会话）时必须明说：
+          // 悄悄把话送到另一个会话，是这里最坏的失败方式。带上"那条通知是多久前的"，
+          // 好让主人一眼判断猜得对不对，错了立刻能重发。
           const ago = refTarget.ageMs ? `，那条通知是 ${fmtDuration(refTarget.ageMs)} 前发的` : ''
           await replyPassive(data, [
             `（说一声：你引用的那条我认不出是哪次通知 —— 按最近一条通知的会话「${route.session || '那个会话'}」送进去了${ago}。）`,
@@ -566,17 +730,63 @@ export function createQqRuntime({
         }
         break
       }
-      // 显式 /task → 专属会话
-      case 'task':
-        await handlePrompt(await ensureNamedSession('sessionId', cfg.qqCwd, '专属会话'), '专属会话', route.text, data)
+      // 显式 /task → 派活。
+      //   · 选过工作区（/task 挑过）→ 进那个工作区的专属会话
+      //   · 没选过 → 保持老行为：进 qqCwd 上那个「专属会话」
+      case 'task': {
+        const chosen = currentTaskCwd()
+        if (chosen) {
+          await handlePrompt(await ensureTaskSession(chosen), `工作区 ${shortPath(chosen)}`, route.text, data)
+        } else {
+          await handlePrompt(await ensureNamedSession('sessionId', cfg.qqCwd, '专属会话'), '专属会话', route.text, data)
+        }
         break
-      // 没引用也没提问 → 闲聊会话，或者你 /sessions 指定的那个会话
+      }
+      // `/task` 不带内容 → 先列工作区；点按钮，或者发 /pick N
+      case 'task_workspaces':
+        await handleTaskWorkspaces(data)
+        break
+      case 'pick_workspace':
+        await handlePickWorkspace(route.index, data)
+        break
+      // 派活第二步：在挑好的工作区里选一个会话，或者开个新对话（`/open 0` / 点「新对话」）。
+      case 'pick_task_session':
+        await handlePickTaskSession(route.index, data)
+        break
+      // `/new`（也认 `/新`）：在当前工作区开一个新对话。
+      case 'new_task_session':
+        await handleNewTaskSession(data)
+        break
+      // 没引用、也不带 `/` → **一律**闲聊，进 /sessions 指定的那个会话（没指定就是闲聊会话）。
+      //
+      // 🔴 1.0.24 起这里不再有"抢消息"的分支：以前有提问在等就当作答、刚看过名单的数字就当
+      //    选择、光秃秃的数字干脆拦下来问一句 —— 主人要求「不引用、不带 / 就是闲聊，
+      //    无论任何情况」。所以下面只是"投出去之后顺带说一句提示"，**不改投递**：
+      //      · 有提问在等：agent 那边正卡着，不说一声他会以为这句是回答
+      //      · 刚发过名单却手打了一个数字：多半是想选它（2026-10-07 09:09 那次「2」的现场）
       case 'chat': {
         const target = await chatTarget()
-        await handlePrompt(target.id, target.label, route.text, data)
+        const ok = await handlePrompt(target.id, target.label, route.text, data)
         // 指定的会话不在了：退回闲聊会话，但必须说一声 —— 静默换会话是最坏的失败方式。
         if (target.fallbackFrom) {
           await replyPassive(data, `（另外说一声：你之前指定的那个会话已经不在了，这句进了闲聊会话。发 /sessions 可以重新挑一个。）`, { sessionId: target.id, session: target.label })
+        }
+        if (ok) {
+          const digit = /^\d+$/.test(route.text)
+          // 同一条提问只提示一次（问过之后他多半会去引用作答，别每句话都念一遍）。
+          if (pending && !answerHinted.has(pending.askId)) {
+            answerHinted.add(pending.askId)
+            if (answerHinted.size > 50) answerHinted.delete(answerHinted.values().next().value)
+            const where = pending.session ? `（来自「${pending.session}」）` : ''
+            await replyPassive(data, [
+              `（说一声：这句我当闲聊发了 —— 有个提问在等你回答${where}。`,
+              '要回答它：**引用那条提问**再发一次，或者点它下面的按钮，或者发 /answer 你的回答。）',
+            ].join(''))
+            l(`有提问 ${pending.askId} 在等，但那句话被当闲聊发走了 —— 已提示主人引用作答`)
+          } else if (digit && freshList) {
+            await replyPassive(data, `（说一声：这个数字我当闲聊发了。要选刚才那份${freshList.label}：`
+              + `点上面的按钮，或者发 ${freshList.cmd}${route.text}。）`)
+          }
         }
         break
       }
@@ -602,8 +812,13 @@ export function createQqRuntime({
       case 'update':
         await handleUpdate(Boolean(route.check), data)
         break
+      // 「忽略本次」按钮（新版本提醒下面那个）= `/skip`：这一版先不提醒，随时可 /update 装上。
+      case 'update_skip':
+        await handleUpdateSkip(data)
+        break
       case 'help':
-        await replyPassive(data, HELP_TEXT)
+        // 帮助里也挂按钮：命令变成可点的，不用照着抄。
+        await replyPassive(data, HELP_TEXT, undefined, buildHelpKeyboard())
         break
       // 引用的是一条**已经结束的提问**（`/answer` 但没人在等，也走这里）：
       // 以前只说「这会儿没有等你回答的问题」，主人不知道自己的回答去哪了。
@@ -632,8 +847,13 @@ export function createQqRuntime({
         const target = await chatTarget()
         const ok = await handlePrompt(target.id, target.label, route.text, data)
         if (ok) {
+          // 把你引用的那句**摘出来**回给你：这样"我到底看见了什么"是可见的，
+          // 而不是一句笼统的"认不出"（2026-10-05 那次故障里，主人完全不知道发生了什么）。
+          const what = quoted?.content
+            ? `你引用的那条「${quoted.content.split('\n')[0].slice(0, 30)}」`
+            : '你引用的那条'
           await replyPassive(data, [
-            `（说一声：你引用的那条我认不出是哪次通知，所以这句话我放进了「${target.label}」—— 那里只能看、不能动手。）`,
+            `（说一声：${what}我认不出属于哪个会话 —— 没登记过、会话名也没对上，所以这句话我放进了「${target.label}」：那里只能看、不能动手。）`,
             '想接着说某个会话：引用我**别的**通知（跑完了／提问那种）回一句就行；想开新活：发 /task 加上要做的事。',
           ].join('\n'), { sessionId: target.id, session: target.label })
         }
@@ -781,9 +1001,12 @@ export function createQqRuntime({
         pickerIds: sessions.slice(0, recentCount()).map((s) => s.id),
       })
     }
+    // 会话名单也挂数字按钮（发回来的是 `/use 3`，本来就有这条显式指令）——
+    // 手打数字受 5 分钟窗口限制，点按钮不受。
+    const picked = sessions.slice(0, recentCount())
     await replyPassive(data, formatSessionPickerText({
       sessions, currentId: state.data.activeSessionId ?? '', count: recentCount(), listError,
-    }))
+    }), undefined, buildNumberButtons('/use ', picked.length))
   }
 
   /**
@@ -847,6 +1070,328 @@ export function createQqRuntime({
     l(`当前会话已切换为 ${target}（${title}）`)
   }
 
+  // ── 按工作区派活（/task 两步：先挑工作区，再发要做的事）─────────────────────
+
+  /**
+   * 会话列表 → 工作区列表（同一个目录归成一个，按最近活动倒序）。
+   *
+   * 「工作区」就是 DSH 会话的工作目录：你在哪个目录下开过会话，它就是一个可选工作区。
+   * 名字取目录最后一段（完整路径在手机上会把行撑爆），但**完整路径一起带着** ——
+   * 派活时要用它去 `session/create`。
+   *
+   * @returns {Promise<Array<{cwd: string, name: string, sessions: number, updatedAt: number}>>}
+   */
+  async function listWorkspaces() {
+    const sessions = await listSessions()
+    const byCwd = new Map()
+    for (const s of sessions) {
+      const cwd = String(s.cwd ?? '').trim()
+      if (cwd === '') continue
+      const hit = byCwd.get(cwd)
+      if (hit) {
+        hit.sessions += 1
+        hit.updatedAt = Math.max(hit.updatedAt, s.updatedAt)
+      } else {
+        byCwd.set(cwd, { cwd, name: s.project || shortPath(cwd), sessions: 1, updatedAt: s.updatedAt })
+      }
+    }
+    return [...byCwd.values()].sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  /** 当前选定的工作区（没选过返回空串）。 */
+  function currentTaskCwd() {
+    return String(state?.data?.activeTaskCwd ?? '').trim()
+  }
+
+  /**
+   * 取（必要时创建）某个工作区的专属派活会话。
+   *
+   * 一个工作区一个会话（而不是每次新建）：重复派活能接着上下文，也不会在 DSH 里
+   * 堆出一串同名空会话。默认工作区（`qqCwd`）沿用老的 `sessionId` 槽位，
+   * 老状态文件不需要迁移。
+   *
+   * @param {string} cwd - 工作区目录（空 → 配置里的 qqCwd，再空 → 进程 cwd）。
+   * @returns {Promise<string>} 会话 id。
+   */
+  async function ensureTaskSession(cwd) {
+    const cfg = liveConfig()
+    ensureState(cfg)
+    ensureApi(cfg)
+    if (!api) throw new Error(`DSH 会话密钥不可用，无法注入${injectHint() ? `：${injectHint()}` : ''}`)
+
+    const dir = String(cwd ?? '').trim() || String(cfg.qqCwd ?? '').trim()
+      || (() => { try { return process.cwd() } catch { return '.' } })()
+
+    const map = { ...(state.data.taskSessions ?? {}) }
+    let existing = map[dir] ?? ''
+    // 默认工作区：老的「专属会话」就是它，直接认下来，不另建一个。
+    if (!existing && dir === String(cfg.qqCwd ?? '').trim() && state.data.sessionId) {
+      existing = state.data.sessionId
+    }
+    if (existing) {
+      try {
+        if (await api.hasSession(existing)) {
+          if (map[dir] !== existing) state.set({ taskSessions: { ...map, [dir]: existing } })
+          return existing
+        }
+        l(`工作区 ${dir} 的派活会话 ${existing} 已不存在，重新创建`)
+      } catch (err) {
+        // 查不了 ≠ 没了：宁可照原样投递（失败会在 handlePrompt 里如实报出）。
+        l(`检查工作区派活会话失败，沿用原值：${err?.message ?? err}`)
+        return existing
+      }
+    }
+    const sid = await api.createSession(dir)
+    state.set({ taskSessions: { ...map, [dir]: sid } })
+    l(`已创建工作区派活会话 ${sid}（cwd=${dir}）`)
+    return sid
+  }
+
+  /** `/task`（不带内容）：列出工作区名单，并把编号对应的完整路径记下来。 */
+  async function handleTaskWorkspaces(data) {
+    const cfg = liveConfig()
+    ensureState(cfg)
+    ensureApi(cfg)
+    if (!api) {
+      await replyPassive(data, formatWorkspacePickerText({
+        listError: `DSH 接口还没就绪${injectHint() ? `：${injectHint()}` : ''}`,
+      }))
+      return
+    }
+    let workspaces = []
+    let listError = ''
+    try {
+      workspaces = await listWorkspaces()
+    } catch (err) {
+      listError = err?.message ?? String(err)
+      l(`读取工作区列表失败：${listError}`)
+    }
+    if (!listError) {
+      // 名单与发榜时刻**一起存**：你回数字时按**你看到的那个编号**解析，
+      // 中途新开/删掉会话都不会让编号错位。
+      state.set({
+        taskPickerAt: Date.now(),
+        taskPickerCwds: workspaces.slice(0, recentCount()).map((w) => w.cwd),
+      })
+    }
+    // 名单下面挂一排数字按钮：点了发回来的是 `/pick 3`（显式指令），
+    // 不查 24 小时那个窗口 —— 手打数字才查（见 WORKSPACE_PICK_WINDOW_MS）。
+    const picked = workspaces.slice(0, recentCount())
+    await replyPassive(data, formatWorkspacePickerText({
+      workspaces, currentCwd: currentTaskCwd(), count: recentCount(), listError,
+    }), undefined, buildNumberButtons('/pick ', picked.length))
+  }
+
+  /**
+   * 派活第一步：回一个数字 = 选中那个工作区，**然后列出它里面的会话**（第二步）。
+   *
+   * 1.0.19 起这一步不再直接落到"该工作区的专属会话"上：主人要求能在工作区里
+   * 挑已有会话、或者开个新对话（2026-10-07）。所以这里只负责把工作区定下来，
+   * 再用 `showTaskSessions()` 把选择权交回去。
+   *
+   * @param {number} index - 名单里的编号（1 起）。
+   * @param {object} data - 原始事件（用于被动回复）。
+   */
+  async function handlePickWorkspace(index, data) {
+    const cfg = liveConfig()
+    ensureState(cfg)
+    ensureApi(cfg)
+    if (!api) {
+      await replyPassive(data, `❌ DSH 接口还没就绪，等一会儿再试${injectHint() ? `（${injectHint()}）` : ''}`)
+      return
+    }
+    const cwds = Array.isArray(state.data.taskPickerCwds) ? state.data.taskPickerCwds.slice() : []
+    // 🔴 名单没了（重启清了状态、或者压根没发过 /task）**绝不现拉一份顶上**。
+    //    以前这里会"现拉当前列表"充数 —— 可那个编号是你**没看过**的一份列表里的，
+    //    你以为选的是第 3 个"插件"，实际选中的可能是另一个目录。选错工作区 = 把活
+    //    派进了别的项目。宁可让你重发一次 /task。
+    //
+    //    注：`/pick 3`（按钮发的那条）也会走到这里 —— 它跳过时间窗，但同样要求
+    //    "名单真的存在"，因为编号只对着你看过的那份名单才有意义。
+    if (cwds.length === 0) {
+      await replyPassive(data, formatWorkspacePickAck('no-list'))
+      l('有人在没有工作区名单的情况下选了编号 —— 已拒绝，并要求重发 /task')
+      return
+    }
+    const cwd = cwds[index - 1]
+    if (!cwd) {
+      await replyPassive(data, formatWorkspacePickAck('out-of-range', { index, count: cwds.length }))
+      return
+    }
+
+    // 工作区名单用完就作废（第二步换成"会话名单"接着用数字），并把工作区记下来，
+    // 这样 `/new`、`/open 0` 都知道在哪个目录开。
+    state.set({ activeTaskCwd: cwd, taskPickerAt: 0, taskPickerCwds: [] })
+    l(`工作区已选 ${cwd} —— 接着列它里面的会话`)
+    await showTaskSessions(cwd, data)
+  }
+
+  /**
+   * 派活第二步：列出某个工作区里的会话，让你挑一个或者开新对话。
+   *
+   * 一个会话都没有时**直接开新对话**（省掉一次"没得选"的往来），并在回执里说清
+   * 是新建的 —— 因为这时"你没得选"和"你选了第一个"从结果上看是一样的。
+   *
+   * @param {string} cwd - 已选的工作区目录。
+   * @param {object} data - 原始事件（用于被动回复）。
+   */
+  async function showTaskSessions(cwd, data) {
+    let all = []
+    let listError = ''
+    try {
+      all = await listSessions()
+    } catch (err) {
+      listError = err?.message ?? String(err)
+      l(`读取 ${cwd} 的会话列表失败：${listError}`)
+    }
+    if (listError) {
+      await replyPassive(data, formatTaskSessionPickerText({ cwd, name: nameOfWorkspace(cwd), listError }))
+      return
+    }
+    // 只列**这个工作区**的会话：`/sessions` 那份是全局最近会话，混进别的目录就白挑了。
+    const mine = all.filter((s) => String(s.cwd ?? '').trim() === cwd)
+    const picked = mine.slice(0, recentCount())
+    if (picked.length === 0) {
+      l(`${cwd} 里没有任何会话 —— 直接开一个新对话`)
+      await handleNewTaskSession(data, { cwd })
+      return
+    }
+    const map = { ...(state.data.taskSessions ?? {}) }
+    state.set({
+      taskSessionAt: Date.now(),
+      taskSessionIds: picked.map((s) => s.id),
+      taskSessionCwd: cwd,
+    })
+    await replyPassive(data, formatTaskSessionPickerText({
+      cwd,
+      name: nameOfWorkspace(cwd, all),
+      sessions: picked,
+      currentId: String(state.data.activeSessionId ?? ''),
+      lastUsedId: String(map[cwd] ?? ''),
+      count: recentCount(),
+    }), undefined, buildNumberButtons('/open ', picked.length, { extra: [makeCmdButton('新对话', '/new')] }))
+  }
+
+  /**
+   * 派活第二步的落点：选第 N 个会话；**N = 0 表示开一个新对话**。
+   *
+   * 🔴 名单不存在就拒绝（要你先发 /task）：编号只对着你看过的那份名单才成立，
+   *    拿"此刻的列表"顶上等于让你选一个你没见过的会话。
+   *
+   * @param {number} index - 名单编号；0 = 新对话。
+   * @param {object} data - 原始事件（用于被动回复）。
+   */
+  async function handlePickTaskSession(index, data) {
+    const cfg = liveConfig()
+    ensureState(cfg)
+    ensureApi(cfg)
+    if (!api) {
+      await replyPassive(data, `❌ DSH 接口还没就绪，等一会儿再试${injectHint() ? `（${injectHint()}）` : ''}`)
+      return
+    }
+    // 0 = 新对话。放在"名单必须存在"之前判：`/open 0` 是明确的"开新的"，
+    // 只要知道在哪个工作区就该能开（工作区在状态里，见 handlePickWorkspace）。
+    if (index === 0) {
+      await handleNewTaskSession(data)
+      return
+    }
+    const ids = Array.isArray(state.data.taskSessionIds) ? state.data.taskSessionIds.slice() : []
+    const cwd = String(state.data.taskSessionCwd ?? '').trim()
+    if (ids.length === 0 || !cwd) {
+      await replyPassive(data, formatTaskSessionPickAck('no-list'))
+      l('有人在没有工作区会话名单的情况下选了编号 —— 已拒绝，并要求重发 /task')
+      return
+    }
+    const target = ids[index - 1]
+    if (!target) {
+      await replyPassive(data, formatTaskSessionPickAck('out-of-range', { index, count: ids.length }))
+      return
+    }
+    // 会话可能在你看名单之后被删掉了 —— 明说，绝不悄悄换一个。
+    try {
+      if (!(await api.hasSession(target))) {
+        await replyPassive(data, formatTaskSessionPickAck('gone', {
+          index, session: await titleOf(target), count: ids.length,
+        }))
+        state.set({ taskSessionAt: 0, taskSessionIds: [] })
+        return
+      }
+    } catch (err) {
+      // 查不了 ≠ 没了：宁可照原样选中（投递失败会在 handlePrompt 里如实报出）。
+      l(`检查会话 ${target} 是否存在失败，仍按它选中：${err?.message ?? err}`)
+    }
+    const map = { ...(state.data.taskSessions ?? {}) }
+    state.set({
+      activeTaskCwd: cwd,
+      activeSessionId: target,
+      taskSessions: { ...map, [cwd]: target },
+      taskSessionAt: 0,
+      taskSessionIds: [],
+      taskSessionCwd: '',
+    })
+    const title = (await titleOf(target)) || target.slice(0, 12)
+    await replyPassive(data, formatTaskSessionPickAck('ok', {
+      name: nameOfWorkspace(cwd), cwd, session: title,
+    }))
+    l(`派活会话已选 ${target}（${title}，cwd=${cwd}）`)
+  }
+
+  /**
+   * 在当前工作区开一个**新对话**，并把它设成当前派活会话。
+   *
+   * 与 `ensureTaskSession` 的区别：那个是"复用该工作区的专属会话"，这个是**明确新建**
+   * ——主人说"新对话"的时候不该又把他送回上次那个会话里。
+   *
+   * @param {object} data - 原始事件（用于被动回复）。
+   * @param {{cwd?: string}} [opts] - 指定工作区；不给就用 `activeTaskCwd`。
+   */
+  async function handleNewTaskSession(data, { cwd = '' } = {}) {
+    const cfg = liveConfig()
+    ensureState(cfg)
+    ensureApi(cfg)
+    if (!api) {
+      await replyPassive(data, `❌ DSH 接口还没就绪，等一会儿再试${injectHint() ? `（${injectHint()}）` : ''}`)
+      return
+    }
+    const dir = String(cwd || state.data.taskSessionCwd || currentTaskCwd()).trim()
+    // 连工作区都不知道是哪个：**绝不猜一个目录**去建会话。
+    if (!dir) {
+      await replyPassive(data, formatTaskSessionPickAck('no-workspace'))
+      l('有人要开新对话，但还没挑过工作区 —— 已拒绝，并要求先发 /task')
+      return
+    }
+    let sid = ''
+    try {
+      sid = await api.createSession(dir)
+    } catch (err) {
+      await replyPassive(data, `❌ 在「${shortPath(dir)}」建新对话失败：${err?.message ?? err}`)
+      return
+    }
+    const map = { ...(state.data.taskSessions ?? {}) }
+    state.set({
+      activeTaskCwd: dir,
+      activeSessionId: sid,
+      taskSessions: { ...map, [dir]: sid },
+      taskSessionAt: 0,
+      taskSessionIds: [],
+      taskSessionCwd: '',
+    })
+    const title = (await titleOf(sid)) || sid.slice(0, 12)
+    await replyPassive(data, formatTaskSessionPickAck('new', {
+      name: nameOfWorkspace(dir), cwd: dir, session: title,
+    }))
+    l(`已在 ${dir} 开新对话 ${sid}`)
+  }
+
+  /** 工作区显示名：优先用会话列表里的项目名，取不到就退回目录名。 */
+  function nameOfWorkspace(cwd, sessions = []) {
+    const dir = String(cwd ?? '').trim()
+    if (!dir) return ''
+    const hit = (Array.isArray(sessions) ? sessions : [])
+      .find((s) => String(s?.cwd ?? '').trim() === dir && s?.project)
+    return hit?.project || shortPath(dir)
+  }
+
   /**
    * 把一条消息注入指定会话。
    *
@@ -869,10 +1414,20 @@ export function createQqRuntime({
       // 闲聊会话：投递**之前**先把它按成只读（主人要求"闲聊只能看、不能动手"）。
       // 放在 prompt 之前是关键 —— 沙箱模式是会话事件，必须在这一轮开跑前就写进去，
       // 否则第一轮就带着旧权限跑了。只读本身失败不阻断投递（可读性优先）。
+      //
+      // 🔴 但**失败必须说出来**（1.0.25）：以前失败只写日志，界面上那个开关还显示着"开"，
+      // 主人以为闲聊动不了手，实际这一轮是按会话原权限（本机默认 danger-full-access）跑的。
+      // 契约：钩子返回 `false` = 「要求只读但没能生效」；`true` = 已就绪或压根没要求。
+      let readOnlyWarn = ''
       if (beforeChatPrompt && sessionId === state?.data?.chatSessionId) {
         try {
-          beforeChatPrompt(sessionId)
+          if (beforeChatPrompt(sessionId) === false) {
+            readOnlyWarn = '\n⚠️ 这次没能把闲聊会话切成只读，这句是在它的原权限下跑的'
+              + '（原因见设置页「运行状态」里的「闲聊只读」一行）'
+            l('闲聊只读没能生效，已在回执里说明（不影响投递）')
+          }
         } catch (err) {
+          readOnlyWarn = `\n⚠️ 这次没能把闲聊会话切成只读，这句是在它的原权限下跑的：${err?.message ?? err}`
           l(`设定闲聊会话只读失败（不影响投递）：${err?.message ?? err}`)
         }
       }
@@ -982,11 +1537,14 @@ export function createQqRuntime({
         l(`读取会话列表失败：${listError}`)
       }
     }
+    // 「用 /task 派活会进这里」：选过工作区就报那个工作区的派活会话，否则报默认的专属会话。
+    const taskCwd = currentTaskCwd()
+    const taskId = (taskCwd && state.data.taskSessions?.[taskCwd]) || state.data.sessionId || ''
     return formatStatusText({
       channelOn: bot?.ready === true,
       pending: pendingAsks.size,
       sessions,
-      taskId: state.data.sessionId ?? '',
+      taskId,
       chatId: state.data.chatSessionId ?? '',
       activeId: state.data.activeSessionId ?? '',
       listError,
@@ -994,6 +1552,10 @@ export function createQqRuntime({
       // 引用回复也没问题 —— 2026-10-04 就是这么误诊了半天。
       injectError: api ? '' : (injectHint() || 'DSH 会话密钥不可用'),
       injectNote: api ? apiNote : '',
+      // 「我在跑哪一版」：主人 2026-10-07 反复问这个（磁盘装了新版、内存还是旧版，
+      // 界面上看不见、/update 又只会说"已是最新"）。放进 /status 让他一句话问到。
+      runningVersion: ownVersion(),
+      installedVersion: installedVersionOnDisk(),
     })
   }
 
@@ -1237,10 +1799,16 @@ export function createQqRuntime({
             delivered(false, askId)
             return
           }
+          // 单选的提问额外挂一排按钮：点一下就把序号发回来 ⇒ 一键作答。
+          // 多选/多个问题的情形 buildOptionKeyboard 会返回 null（那时按钮帮不上忙）。
+          // ⚠️ 传了 keyboard 就必须 markdown —— 官方：按钮只能挂在 markdown 消息上。
           const res = await bot.sendC2C(openId, formatQuestion(questions, {
             project: projectOf(request?.agent),
             session: sessionTitleOf(request?.agent),
-          }))
+          }), {
+            markdown: true,
+            keyboard: buildOptionKeyboard(questions),
+          })
           // ⚠️ 提问也**必须**登记 ref_idx：否则"引用提问那条消息来作答"永远
           //    认不出来（会掉进 unknown_ref），这条引用路径就成了死代码。
           state.addSentRef(res?.ext_info?.ref_idx, {
@@ -1275,16 +1843,15 @@ export function createQqRuntime({
   let updateChecking = false
   /** 正在装（同一时刻只允许一个安装；两个 pnpm 同时改一个 profile 会互相踩）。 */
   let updating = false
-  /** 自己的版本号缓存（进程活着期间不会变）。 */
-  let ownVersionCache = ''
 
-  /** 读自己的版本号（从安装目录的 package.json）。读不到返回空串。 */
+  /**
+   * 读**现在跑着的这份代码**的版本号。读不到返回空串。
+   *
+   * ⚠️ 直接返回模块加载时读到的 {@link RUNNING_VERSION}，**不要**在这里现读磁盘 ——
+   * 那样在"装完还没重启"的窗口里会读到新版，插件就以为自己已经是最新版了（说明见 RUNNING_VERSION）。
+   */
   function ownVersion() {
-    if (ownVersionCache) return ownVersionCache
-    const root = pluginRootFromFile(SELF_FILE)
-    if (!root) return ''
-    ownVersionCache = readPackageVersion(path.join(root, 'package.json'))
-    return ownVersionCache
+    return RUNNING_VERSION
   }
 
   /**
@@ -1311,7 +1878,7 @@ export function createQqRuntime({
    * 与 `notify` 的区别：这里不套通知模板、不写 notes、不带会话 —— 发的是完整一句话。
    * 永不 reject，发不出去只记日志并返回 false。
    */
-  async function sendProactive(text) {
+  async function sendProactive(text, { buttons = null } = {}) {
     const cfg = liveConfig()
     if (cfg.qqEnabled !== true) return false
     if (!(await ensureStarted())) return false
@@ -1322,8 +1889,11 @@ export function createQqRuntime({
       return false
     }
     try {
-      // markdown: false —— 内容里有 `/update` 这种字面量，纯文本最稳、也不会被平台改写。
-      const res = await bot.sendC2C(openId, text, { markdown: false })
+      // 没按钮时 markdown: false —— 内容里有 `/update` 这种字面量，纯文本最稳、也不会被平台改写。
+      // 有按钮时按钮自己会把这条消息顶到 markdown 通路上（官方：按钮只能挂在 markdown 上）。
+      const res = await bot.sendC2C(openId, text, buttons
+        ? { keyboard: buttons }
+        : { markdown: false })
       // 登记 ref_idx 但**不带 sessionId**：它不属于任何会话，不该被"引用兜底"路由到某个会话里去。
       state.addSentRef(res?.ext_info?.ref_idx, { kind: 'update' })
       return true
@@ -1383,11 +1953,20 @@ export function createQqRuntime({
         return { ok: true, notified: false, latest: got.version, current: env.version, remoteOlder: true }
       }
       ensureState(env.cfg)
+      // 主人点过「忽略本次」的版本：安静。比 updateNotified 更明确 —— 日志里能看出是"人说的别提醒"。
+      if (state.data.updateSkipped === got.version) {
+        l(`新版本 ${got.version} 主人选过「忽略本次」，不再提醒`)
+        return { ok: true, notified: false, latest: got.version, current: env.version, skipped: true }
+      }
       if (state.data.updateNotified === got.version) {
         l(`新版本 ${got.version} 已经提醒过，不再重复打扰`)
         return { ok: true, notified: false, latest: got.version, current: env.version }
       }
-      const sent = await sendProactive(formatUpdateAvailable({ latest: got.version, current: env.version }))
+      const sent = await sendProactive(formatUpdateAvailable({
+        latest: got.version, current: env.version, notes: got.notes,
+      }), {
+        buttons: buildUpdateNoticeKeyboard(),
+      })
       if (sent) {
         state.set({ updateNotified: got.version })
         l(`已提醒新版本 ${got.version}（当前 ${env.version}）`)
@@ -1412,11 +1991,30 @@ export function createQqRuntime({
       l('远程更新提醒已关闭（qqUpdateEnabled=false），不查新版本')
       return false
     }
-    void checkUpdate()
+    // 启动这一次检查**必须补一次重试**：插件 apply 的那一刻配置可能还没就绪
+    // （`qqEnabled` 来自 profile 补丁层 / settings，apply 时可能还停在 DEFAULTS 的 false），
+    // 这时 `checkUpdate()` 直接返回 'qq-disabled' 就收工 —— 下一次机会要等一整个轮询周期。
+    // 表现就是"新版本永远不提醒"，而主人 2026-10-07 报的正是这个。
+    let lateRetries = 0
+    const runCheck = async () => {
+      const result = await checkUpdate()
+      if (result?.reason === 'qq-disabled' && lateRetries < UPDATE_LATE_RETRY_MAX) {
+        lateRetries += 1
+        l(`配置还没就绪（qqEnabled 还没读到），${UPDATE_LATE_RETRY_MS / 1000} 秒后补查一次`
+          + `（第 ${lateRetries}/${UPDATE_LATE_RETRY_MAX} 次）`)
+        const timer = setTimeout(() => { void runCheck() }, UPDATE_LATE_RETRY_MS)
+        if (timer.unref) timer.unref()
+      }
+    }
+    void runCheck()
     if (updateTimer) return true
+    // ⚠️ 这里的兜底值必须跟 `DEFAULTS.qqUpdateCheckHours` 一致（1 小时，1.0.20 从 6 改的）：
+    //    自动提醒只在"启动时 + 每 N 小时"发，N 太大时，两跳之间发布的版本要等很久才提醒 ——
+    //    主人 2026-10-07 遇到的就是这个（10:22 启动时线上还是 1.0.18，11:14 才发出 1.0.19）。
+    //    同一个版本只提醒一次（updateNotified），所以查得勤不会变吵。
     const hours = Number.isFinite(cfg.qqUpdateCheckHours) && cfg.qqUpdateCheckHours > 0
       ? cfg.qqUpdateCheckHours
-      : 6
+      : 1
     updateTimer = setInterval(() => { void checkUpdate() }, hours * 60 * 60 * 1000)
     if (updateTimer.unref) updateTimer.unref()
     l(`远程更新：每 ${hours} 小时查一次新版本（源 ${cfg.qqUpdateSource || DEFAULT_UPDATE_SOURCE}）`)
@@ -1465,27 +2063,51 @@ export function createQqRuntime({
    * `pnpm add` 是装不上的。
    * 永不抛。
    */
-  async function installUpdate({ env, latest, spec }) {
-    const cmd = buildAddCommand({ profile: env.profile.profileName, spec: spec || env.parsed.spec })
-    if (!cmd.ok) return { ok: false, reason: cmd.error, run: null }
-    const logFile = path.join(os.tmpdir(), `dsh-remote-update-${Date.now()}.log`)
-    l(`开始更新到 ${latest}：${cmd.display}（输出 → ${logFile}）`)
-    const run = await runProcess({
-      file: cmd.file,
-      args: cmd.args,
-      cwd: cmd.cwd,
-      env: cmd.env,
-      timeoutMs: UPDATE_INSTALL_TIMEOUT_MS,
-      logFile,
-      log: l,
-    })
-    // 版本号从**安装目录**读，不从"命令成功"推断 —— 命令可能成功但什么都没装
-    // （pnpm 的 `Already up to date` 就是这种情况：exit 0、文件没换）。
-    const installedFile = path.join(
-      env.profile.profileDir, 'node_modules', 'dsh-remote-qqbot', 'package.json',
-    )
-    const installed = readPackageVersion(installedFile)
-    return { ok: run.ok, run, installed, reason: '' }
+  async function installUpdate({ env, latest, spec, sha256, size }) {
+    const target = String(spec || env.parsed.spec || '').trim()
+    // 🔴 从 http(s) 直接下载的包：**先在本机校验 sha256，再交给 pnpm 装**（2026-10-07 安全审查）。
+    //
+    // 为什么非得自己算一遍：索引（update.json）与压缩包是两份文件，可以**一起**被换掉，
+    // 索引里自报的 sha256 因此不构成证据 —— 只有在本机重新算出来的摘要才算。校验通过后
+    // 用**本地文件**当安装源，pnpm 不再去网上取那份没验过的包。
+    // github: / npm 名这类源走 pnpm 自己的完整性校验，这里不插手（也不该插手）。
+    let installSpec = target
+    let verifiedFile = ''
+    if (/^https?:\/\//i.test(target)) {
+      const verified = await fetchAndVerifyPackage({ url: target, sha256, size, log: l })
+      if (!verified.ok) {
+        l(`拒绝安装 ${latest}：${verified.error}`)
+        return { ok: false, reason: verified.error, run: null }
+      }
+      installSpec = verified.file
+      verifiedFile = verified.file
+      l(`安装包校验通过（${verified.bytes} 字节，sha256 ${String(verified.sha256).slice(0, 16)}…），改用本地文件安装`)
+    }
+    try {
+      const cmd = buildAddCommand({ profile: env.profile.profileName, spec: installSpec })
+      if (!cmd.ok) return { ok: false, reason: cmd.error, run: null }
+      const logFile = path.join(os.tmpdir(), `dsh-remote-update-${Date.now()}.log`)
+      l(`开始更新到 ${latest}：${cmd.display}（输出 → ${logFile}）`)
+      const run = await runProcess({
+        file: cmd.file,
+        args: cmd.args,
+        cwd: cmd.cwd,
+        env: cmd.env,
+        timeoutMs: UPDATE_INSTALL_TIMEOUT_MS,
+        logFile,
+        log: l,
+      })
+      // 版本号从**安装目录**读，不从"命令成功"推断 —— 命令可能成功但什么都没装
+      // （pnpm 的 `Already up to date` 就是这种情况：exit 0、文件没换）。
+      const installed = installedVersionOnDisk(env.profile.profileDir)
+      return { ok: run.ok, run, installed, reason: '' }
+    } finally {
+      // 校验用的临时包：装完就删（`pnpm add <本地 tgz>` 是把它解包进 node_modules，
+      // 不依赖这个文件继续存在）。删失败只记日志，绝不因此把"装成功"说成失败。
+      if (verifiedFile !== '' && !removeVerifiedPackage(verifiedFile)) {
+        l(`临时包没能删掉（不影响安装结果）：${verifiedFile}`)
+      }
+    }
   }
 
   /**
@@ -1554,11 +2176,69 @@ export function createQqRuntime({
    * 装 → 按**安装目录里真实的版本号**决定说成功还是"没变化" → 排定重启。
    * 任何一步失败都只回一句人话 + 错误摘要，绝不抛进事件处理主流程。
    */
+  /**
+   * 「忽略本次」（`/skip`，也就是新版本提醒下面那个按钮）。
+   *
+   * 记的是 `updateNotified` 里那个版本 —— 那是**刚提醒过、主人正看着的那一版**。
+   * 这里**故意不再查一次远端**：忽略只针对眼前这条提醒，多一次网络请求只会让回执更慢，
+   * 而且真查出来一个更新的版本，反而会让"忽略"这件事变得含糊。
+   *
+   * 注意它只影响"提不提醒"，不影响 `/update` —— 想装随时能装。
+   */
+  async function handleUpdateSkip(data) {
+    const cfg = liveConfig()
+    ensureState(cfg)
+    const pending = String(state.data.updateNotified ?? '').trim()
+    if (!pending) {
+      await replyPassive(data, formatNothingToSkip({ current: ownVersion() }))
+      return
+    }
+    if (state.data.updateSkipped === pending) {
+      await replyPassive(data, `好，${pending} 这版本来就不提醒了。想装发 /update。`)
+      return
+    }
+    state.set({ updateSkipped: pending })
+    await replyPassive(data, formatUpdateSkipped({ version: pending }))
+    l(`已忽略新版本 ${pending}：不再提醒（/update 仍可安装）`)
+  }
+
+  /**
+   * 「磁盘上装了新版、内存里跑的还是旧版」：回主人一句人话，能自动重启就顺手重启。
+   *
+   * 与安装路径共用同一套重启机制（写标记 → 写脚本 → 分离启动），所以**回执必须先发**：
+   * 脚本 10 秒后会杀掉这个进程，发晚了就发不出去了。
+   */
+  async function replyPendingRestart({ env, installed, data }) {
+    const wantRestart = env.cfg.qqUpdateAutoRestart !== false
+    const canRestart = wantRestart && desktopExe() !== ''
+    l(`磁盘上已装 ${installed}，现在跑的是 ${env.version}：`
+      + (canRestart
+        ? '自动重启'
+        : (wantRestart ? '认不出桌面版主程序，只能手动重启' : 'qqUpdateAutoRestart 关着，只能手动重启')))
+    const launched = canRestart ? await restartDSH({ version: installed }) : false
+    await replyPassive(data, formatPendingRestart({
+      running: env.version, installed, autoRestart: wantRestart, scheduled: launched,
+    }))
+  }
+
   async function handleUpdate(checkOnly, data) {
     const env = updateEnv()
     if (!env.ok) {
       l(`/update 不能执行：${env.reason}`)
       await replyPassive(data, formatUpdateMisconfigured({ reason: env.reason }))
+      return
+    }
+
+    // ⓪ 磁盘比内存新：装是装过了，只是这份进程还在跑旧代码。
+    //
+    // DSH 没有插件热重载 —— 换掉磁盘上的文件对已经跑着的进程毫无影响，**只有重启**才换得过来。
+    // 这是旧版插件最容易骗人的一格：跑 1.0.18、磁盘上已是 1.0.20 时，它会现读磁盘版本号，
+    // 于是回一句「已经是最新版 1.0.20，不用更新」，把"装了但没生效"说成"你不用更新"，
+    // 主人于是既看不到新功能、也没有任何按钮可点（2026-10-07 15:2x 的主人正是这样被卡住的）。
+    // 这一格必须**排在版本比较之前**：磁盘上那份才是"将要生效"的那份。
+    const diskVersion = installedVersionOnDisk(env.profile.profileDir)
+    if (diskVersion && compareVersions(diskVersion, env.version) > 0) {
+      await replyPendingRestart({ env, installed: diskVersion, data })
       return
     }
 
@@ -1572,7 +2252,11 @@ export function createQqRuntime({
     // 三个分支必须分清，**绝不能"版本不一样就装"** —— 远端比本机旧时那样做等于把用户降级。
     const cmp = compareVersions(got.version, env.version)
     if (cmp === 0) {
-      await replyPassive(data, formatAlreadyLatest({ current: env.version }))
+      // 这句话必须自带证据：主人 2026-10-07 就是被「已经是最新版 X」这句单独出现的结论骗到的
+      // （跑 1.0.18、磁盘 1.0.20）。现在把"跑的是哪一版、磁盘上装的是哪一版"一起写出来。
+      await replyPassive(data, formatAlreadyLatest({
+        current: env.version, installed: diskVersion,
+      }))
       return
     }
     if (cmp < 0) {
@@ -1581,7 +2265,27 @@ export function createQqRuntime({
       return
     }
     if (checkOnly) {
-      await replyPassive(data, formatUpdateCheck({ latest: got.version, current: env.version }))
+      // 主人 2026-10-07：「有新版本，并没有给我的 QQ 机器人推送通知，我也没办法选择
+      // 立即更新，或者是忽略此版本」。
+      //
+      // 自动提醒只在"启动时 + 每 qqUpdateCheckHours 小时"这两个时刻发 —— 新版本要是
+      // 刚好在两跳之间发布（这次正是：10:22 启动时线上还是 1.0.18，11:14 才发出 1.0.19），
+      // 最长要等一整轮才提醒。所以**手动查的这一次也把同一条提醒连同两个按钮回过去**：
+      // 就地回在你发的那条下面，比再单独推一条更直接，忽略 / 立即更新两个按钮一样在。
+      ensureState(env.cfg)
+      const skipped = String(state.data.updateSkipped ?? '').trim() === got.version
+      const notice = formatUpdateAvailable({ latest: got.version, current: env.version, notes: got.notes })
+      await replyPassive(
+        data,
+        skipped
+          ? `${notice}\n（这一版你点过「忽略本次」—— 这是你手动查的，所以照样给你看。）`
+          : notice,
+        undefined,
+        buildUpdateNoticeKeyboard(),
+      )
+      // 记账：这一版已经让主人看过带按钮的提醒了，几小时后的自动检查别再重复推一遍。
+      state.set({ updateNotified: got.version })
+      l(`/update check：有新版本 ${got.version}（当前 ${env.version}），已把提醒与按钮回过去`)
       return
     }
     if (updating) {
@@ -1594,7 +2298,9 @@ export function createQqRuntime({
 
     updating = true
     try {
-      const result = await installUpdate({ env, latest: got.version, spec: got.spec })
+      const result = await installUpdate({
+        env, latest: got.version, spec: got.spec, sha256: got.sha256, size: got.size,
+      })
       if (!result.ok) {
         const reason = result.run?.timedOut
           ? `安装命令超过 ${Math.round(UPDATE_INSTALL_TIMEOUT_MS / 1000)} 秒没结束（已终止）`
@@ -1674,6 +2380,14 @@ export function createQqRuntime({
     checkUpdate,
     /** 启动检查 + 每 `qqUpdateCheckHours` 小时轮询一次；重复调用无副作用。 */
     startUpdateCheck,
+    /**
+     * **内存里跑着的**插件版本号（模块加载时读的，见 {@link RUNNING_VERSION}）。
+     *
+     * 给界面「运行状态」用：它和 {@link installedVersion} 不一致，就说明"装完还没重启"。
+     */
+    runningVersion: () => ownVersion(),
+    /** **磁盘上装好的**插件版本号；读不出来返回空串。 */
+    installedVersion: () => installedVersionOnDisk(),
     /** 停掉轮询（卸载时调用）。 */
     stopUpdateCheck,
     /**
@@ -1700,6 +2414,39 @@ export function createQqRuntime({
         return state?.data?.chatSessionId === sessionId
       } catch {
         return false
+      }
+    },
+    /**
+     * 记下「每个 agent 上次已知的状态」，落盘到 `qq-bot-state.json`。
+     *
+     * 由 index.js 在每次 `agent/status` 变化时调用。存在的唯一理由：判断"这一轮跑完了"
+     * 用的是 `running → idle` 这个**边**，而边只活在内存里 —— 插件中途重装或 DSH 中途重启，
+     * 边就没了，"跑完了"的通知和 agentmd 日志会一起静默消失（2026-10-05 事故）。
+     * 落盘之后 {@link agentStatusMap} 能把起点读回来。
+     *
+     * @param {string} agentId
+     * @param {string} status - 只认 `running` / `idle`。
+     */
+    markAgentStatus(agentId, status) {
+      try {
+        ensureState(liveConfig())
+        state?.markAgentStatus?.(agentId, status)
+      } catch { /* 存不下不影响主流程 */ }
+    },
+    /**
+     * 读回落盘的「每个 agent 上次已知状态」，`{ [agentId]: { s, at } }`。
+     * 插件加载时调一次：没有这一步，中途重启过的那一轮就再也认不出"它刚才在跑"。
+     *
+     * @returns {Record<string, {s?: string, at?: number}>}
+     */
+    agentStatusMap() {
+      try {
+        ensureState(liveConfig())
+        const map = state?.agentStatusMap?.()
+        if (map && typeof map === 'object') return map
+        return Object.freeze({})
+      } catch {
+        return Object.freeze({})
       }
     },
     /** 供自检/测试观察。 */

@@ -82,6 +82,31 @@
 }
 .doc-code code { background: none; border: 0; padding: 0; font-size: 13px; word-break: normal; }
 
+/* 「复制这段发给 DSH」：按钮在文本块上方一条，窄屏换行也不许撑破视口。
+   文本块自己仍然是 .doc-code（横向滚动的容器）—— 390px 下靠它收住溢出。 */
+.doc-copy {
+  margin: 0 0 var(--sp-5);
+  border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--soft); overflow: hidden;
+}
+.doc-copy-head {
+  display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface); border-bottom: 1px solid var(--line-2);
+}
+.doc-copy-btn {
+  flex: none; font: inherit; font-size: 13px; line-height: 1.4; cursor: pointer;
+  padding: 5px 12px; border-radius: var(--r-sm);
+  border: 1px solid var(--brand); background: var(--brand-soft); color: var(--brand-ink);
+}
+.doc-copy-btn:hover { background: var(--brand); border-color: var(--brand); color: #fff; }
+.doc-copy-btn.is-done {
+  border-color: var(--ok); background: transparent; color: var(--ok);
+}
+.doc-copy-hint { font-size: 12px; color: var(--muted); }
+/* 文本块在卡片里不再自带外边距与边框（外层 .doc-copy 已经给了） */
+.doc-copy .doc-copy-text { margin: 0; border: 0; border-radius: 0; background: none; }
+
 /* 表格：窄屏也不横向滚动 */
 .doc-table {
   width: 100%; border-collapse: collapse; margin: 0 0 var(--sp-5);

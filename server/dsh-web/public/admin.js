@@ -256,7 +256,7 @@ async function tryLogin() {
   if (capRequired) {
     if (!capId) { msg('gateMsg', '验证码还没加载出来，点「换一张」重试', 'err'); loadCaptcha(); return; }
     // 空着就别白跑一趟（服务端也会拒，但那是一次没必要的往返）
-    if (!($('capText_admin').value || '').trim()) { msg('gateMsg', '请照图填写这 4 位验证码（看不清就点「换一张」）', 'err'); return; }
+    if (!($('capText_admin').value || '').trim()) { msg('gateMsg', '请填写图中的 4 位验证码', 'err'); return; }
   }
   mode = 'account';
   who = name;

@@ -77,6 +77,29 @@ const CASES = [
     apply: (dir) => cut(path.join(dir, 'docs.js'),
       'if (atBottom) hit = state.headings[state.headings.length - 1].id;', ''),
   },
+  /* 2026-10-05 新增两刀：一键安装的复制块 */
+  {
+    name: 'E 拆掉复制按钮的接线（点了没反应）',
+    expect: ['★ 点一下复制按钮，界面上有明确反馈（按钮文案变了，或弹了提示）',
+      '反馈是三级兜底里真的落地的那一级（已复制 / 长按选中复制）'],
+    apply: (dir) => cut(path.join(dir, 'docs.js'),
+      "      const copyBtn = t.closest('.doc-copy-btn');\n"
+      + "      if (copyBtn) { ev.preventDefault(); doCopy(copyBtn); return; }\n", ''),
+  },
+  {
+    name: 'F 要复制的那段文字里没有安装命令（复制出去是空话）',
+    expect: ['★ 要复制的那段文字里就是 GitHub 安装命令'],
+    apply: (dir) => cut(path.join(dir, 'docs.js'),
+      "+ 'dsh plugin --profile desktop add github:cyanovo/dsh-remote-qqbot\\n'", ''),
+  },
+  /* 2026-10-07 新增一刀：第 2 章里的**插件仓库地址**（主人要求官网上要能看到仓库） */
+  {
+    name: 'G 去掉第 2 章的插件仓库地址（想先看代码的人没地方去）',
+    expect: ['★ 第 2 章「从 GitHub 装」里给了插件仓库地址'],
+    apply: (dir) => cut(path.join(dir, 'docs.js'),
+      "        + '<p>插件仓库：<a href=\"https://github.com/cyanovo/dsh-remote-qqbot\" target=\"_blank\" rel=\"noopener noreferrer\">github.com/cyanovo/dsh-remote-qqbot</a>'\n"
+      + "        + '（想先看代码再装、装完想提问题、或想自己改，都从这里进；上面的命令就是从这个仓库装的）。</p>'\n", ''),
+  },
 ]
 
 async function main() {

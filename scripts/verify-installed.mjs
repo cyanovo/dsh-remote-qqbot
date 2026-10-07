@@ -361,16 +361,96 @@ check('列表里说明「回 0 = 不指定」', pickText.includes('回 0 = 不�
 check('列表里说明「引用通知仍然优先」', pickText.includes('引用我某条通知'), true)
 
 const digit = (opts) => routeMessage({ text: '3', refIdx: '', refTarget: null, ...opts })
-check('刚看过名单 + 回「3」→ pick_session(3)', digit({ hasPendingQuestion: false, pickerActive: true }).kind === 'pick_session'
-  && digit({ hasPendingQuestion: false, pickerActive: true }).index === 3, true)
-check('★ 有提问在等 + 回「3」→ 仍然当作答（绝不抢走答案）', digit({ hasPendingQuestion: true, pickerActive: true }).kind, 'answer')
-check('没看过名单 + 回「3」→ 还是闲聊', digit({ hasPendingQuestion: false, pickerActive: false }).kind, 'chat')
+// ⚠️ 这三条（下同）2026-10-07 被**改过两次期望**，别再改回去：
+//    第一次是「没看过名单就拦下来问一句」（stray_number）；当天主人明确要求
+//    「只要我不引用信息、前面也不带 /，就是闲聊，**无论任何情况**」—— 于是三条抢消息的规则
+//    （有提问在等就自动当作答 / 刚看过名单的裸数字就是选择 / 别的裸数字拦下来问）全删，
+//    裸数字现在**一律闲聊**。作答与选名单改成显式：引用那条提问，或点按钮
+//    （提问按钮发 `/answer N`、名单按钮发 `/pick N` `/open N` `/use N`）。
+//    所以这里断言的是"它必须是 chat"，而不是以前那种"必须被某条规则接管"。
+check('刚看过名单 + 回「3」→ 仍然是闲聊（数字不再自己"认领"名单）',
+  digit({ hasPendingQuestion: false, pickerActive: true }).kind, 'chat')
+check('★ 有提问在等 + 回「3」→ 仍然是闲聊（作答得引用提问或点按钮）',
+  digit({ hasPendingQuestion: true, pickerActive: true }).kind, 'chat')
+check('★ 没看过名单 + 回「3」→ 闲聊（1.0.24 删掉了"拦下来问一句"）',
+  digit({ hasPendingQuestion: false, pickerActive: false }).kind, 'chat')
+check('★ 光秃秃的数字绝不当成派活正文（它是闲聊，不是派活内容）',
+  digit({ hasPendingQuestion: false, pickerActive: false, workspacePickerActive: false }).kind === 'chat', true)
 check('/sessions → 列名单', routeMessage({ text: '/sessions', refIdx: '', hasPendingQuestion: false, refTarget: null }).kind, 'sessions')
 check('/use 2 → 切到第 2 个', routeMessage({ text: '/use 2', refIdx: '', hasPendingQuestion: false, refTarget: null }).index, 2)
 check('名单有效期：刚发的算有效', isPickerFresh({ pickerAt: Date.now() - 1000, pickerIds: ['a'] }), true)
 check('名单失效：一小时前发的不算', isPickerFresh({ pickerAt: Date.now() - 3600 * 1000, pickerIds: ['a'] }), false)
 check('/status 里能看到「你说的话现在进哪儿」',
   formatStatusText({ channelOn: true, sessions: pickSix, activeId: 's2' }).includes('你说的话现在进'), true)
+
+// ── 五之二、派活第二步：在工作区里挑会话 / 开新对话（1.0.19）────────────────
+// 主人 2026-10-07：「我不仅需要挑工作区，还需要在工作区里挑选会话或者新对话」。
+console.log('\n── 五之二、派活第二步（工作区里挑会话 / 开新对话） ──')
+const { routeIncoming, formatTaskSessionPickerText, formatTaskSessionPickAck, buildNumberButtons, makeCmdButton } = mod
+check('/open 2 → 选本工作区第 2 个会话', routeIncoming('/open 2').kind, 'pick_task_session')
+check('/open 0 → 也是这条路（0 = 新对话）', routeIncoming('/open 0').index, 0)
+check('/new → 开新对话', routeIncoming('/new').kind, 'new_task_session')
+check('★ /open 与 /use 不是一回事（作用域不同）',
+  routeIncoming('/open 2').kind !== routeIncoming('/use 2').kind, true)
+const taskKb = buildNumberButtons('/open ', 6, { extra: [makeCmdButton('新对话', '/new')] })
+check('第二步的按钮：6 个数字两行 + 「新对话」一行',
+  taskKb.content.rows.length === 3 && taskKb.content.rows[2].buttons[0].render_data.label === '新对话', true)
+check('★ 数字按钮点出来真的能选（不是画着好看）',
+  routeIncoming(taskKb.content.rows[0].buttons[0].action.data).kind === 'pick_task_session', true)
+check('「新对话」按钮点出来真的能开', routeIncoming(taskKb.content.rows[2].buttons[0].action.data).kind, 'new_task_session')
+check('第二步的名单写清了「回 0 = 开新对话」',
+  formatTaskSessionPickerText({ cwd: 'D:/a', name: 'a', sessions: pickSix }).includes('回 0 = 在这个工作区开一个新对话'), true)
+check('★ 不知道哪个工作区时不猜目录（让你先发 /task）',
+  formatTaskSessionPickAck('no-workspace').includes('先发 /task'), true)
+check('★ 没有会话名单时不拿此刻的列表顶上',
+  formatTaskSessionPickAck('no-list').includes('先发 /task'), true)
+// 裸数字在第二步（工作区挑会话）同样不再自己认领：选择只能来自按钮（`/open N`）或显式指令。
+// （按钮那条路由由上一条断言钉住：`taskKb` 按钮的 data 走 routeIncoming → pick_task_session。）
+check('第二步的裸数字也是闲聊（只有按钮 / 显式 `/open N` 才算选择）',
+  routeMessage({ text: '2', refIdx: '', hasPendingQuestion: false, refTarget: null, taskSessionPickerActive: true }).kind,
+  'chat')
+
+// ── 五之三、新版本提醒（1.0.20）：手动查一次也带两个按钮 + 推送开关在设置里 ──────
+// 现场（2026-10-07）：主人知道有 1.0.19，QQ 里却一直没提醒，也没处点「忽略本次 / 立即更新」。
+// 根因是**时机**：自动提醒只在"启动时 + 每 qqUpdateCheckHours 小时"发，而 1.0.19 是在
+// 启动之后 50 分钟才发布的，默认 6 小时的间隔让提醒排到了 6 小时以后（见 docs/ARCHITECTURE.md 3.6g）。
+console.log('\n── 五之三、新版本提醒：手动要一次也带两个按钮（1.0.20） ──')
+const upd = await import(pathToFileURL(DIR + 'update.js').href)
+const { formatUpdateAvailable } = upd
+const { HELP_TEXT, buildUpdateNoticeKeyboard, routeIncoming: route2 } = mod
+const notice = formatUpdateAvailable({ latest: '1.0.20', current: '1.0.19' })
+check('安装的那份产物里，提醒正文说清了「点按钮」和「发 /update」',
+  /按钮/.test(notice) && /\/update/.test(notice), true)
+const kb2 = buildUpdateNoticeKeyboard().content.rows.flatMap((r) => r.buttons)
+check('提醒底下的两个按钮：忽略本次 / 立即更新',
+  kb2.map((b) => b.render_data.label).join('|'), '忽略本次|立即更新')
+check('★ 这两个按钮点出来真的能执行',
+  route2(kb2[0].action.data).kind === 'update_skip' && route2(kb2[1].action.data).kind === 'update', true)
+check('帮助里能查到 `/update check`', HELP_TEXT.includes('/update check'), true)
+check('`/update check` 真的走"只查不装"', route2('/update check').check, true)
+
+// handleUpdate 的 checkOnly 分支不是导出函数，这里只能扫**安装产物**的字面
+// （行为由 tests/update.test.mjs 的 [7] 组跑形状钉住；这条只确认装进去的字节里有它）。
+const rtSrc = readFileSync(DIR + 'qqruntime.js', 'utf8')
+const checkOnlyAt = rtSrc.indexOf('if (checkOnly) {')
+const checkOnlyBody = checkOnlyAt > 0 ? rtSrc.slice(checkOnlyAt, rtSrc.indexOf('if (updating) {', checkOnlyAt)) : ''
+check('★ 装进去的 handleUpdate：checkOnly 分支把带按钮的提醒回给你',
+  checkOnlyBody.includes('buildUpdateNoticeKeyboard()'), true)
+check('★ 并且记了"这一版已经提醒过"（自动检查不会重复推同一条）',
+  checkOnlyBody.includes('state.set({ updateNotified: got.version })'), true)
+check('查新版本的默认间隔是 1 小时（DEFAULTS 与 startUpdateCheck 兜底两处）',
+  /qqUpdateCheckHours: 1,/.test(readFileSync(DIR + 'index.js', 'utf8'))
+    && /\n      : 1\n/.test(rtSrc), true)
+
+// 设置页那张卡：字段表（host 单一真源）+ client 渲染，都要在**安装产物**里。
+const pushSpec = (api.FIELD_SPECS ?? []).find((f) => f.key === 'qqNotifyEnabled')
+check('★ 安装产物的设置字段表里有「接收 QQ 推送」（qqNotifyEnabled / boolean）',
+  pushSpec?.label === '接收 QQ 推送' && pushSpec?.type === 'boolean', true)
+check('  说明里写清了它管新版本提醒、关掉后长连接照旧',
+  /新版本/.test(pushSpec?.description ?? '') && /长连接/.test(pushSpec?.description ?? ''), true)
+const clientSrc = readFileSync(DIR + 'client.js', 'utf8')
+check('★ 安装产物的设置页把这张卡渲染在最上面，且分组表里不重复',
+  clientSrc.includes("key: 'push-switch'") && clientSrc.includes("field.key !== 'qqNotifyEnabled'"), true)
 
 // ── 六、QQ 答完，DSH 那张提问卡片必须自己收掉（v0.9.1） ──────────────────────
 // 主人报的现象：「我用 QQ 机器人把回答带过去之后，DSH 里那张提问卡片还挂着」。
@@ -446,5 +526,5 @@ if (typeof relaySrc === 'string') {
 }
 
 if (bad === 0 && exact) console.log('\n>>> 安装目录里的实现行为正确 ✅')
-console.log(bad === 0 && exact ? '>>> 六节全部通过 ✅' : `>>> 有问题 ❌（错 ${bad} 项 / 尺寸不符 ${exact ? 0 : 1} 项）`)
+console.log(bad === 0 && exact ? '>>> 每一节全部通过 ✅' : `>>> 有问题 ❌（错 ${bad} 项 / 尺寸不符 ${exact ? 0 : 1} 项）`)
 process.exit(bad === 0 && exact ? 0 : 1)
