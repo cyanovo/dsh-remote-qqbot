@@ -82,6 +82,12 @@ export const FIELD_SPECS = [
     description: '会话跑完一轮时推一条。' },
   { key: 'onQuestion', group: 'qq', label: '提问时提醒', type: 'boolean',
     description: 'agent 需要你回答时推一条。' },
+  { key: 'qqAskDesktop', group: 'qq', label: '提问显示在哪', type: 'string',
+    placeholder: 'both',
+    options: ['both', 'qq-first'],
+    description: 'both（默认）＝DSH 界面立刻弹出提问卡片，同时发一条到 QQ，谁先答算谁：'
+      + 'QQ 先答那张卡片会自动收掉，桌面先答 QQ 会收到一句「已经在电脑上答过了」。'
+      + 'qq-first＝先只发 QQ，桌面一开始不弹（90 秒没人答才补一张）—— 人在电脑前却看不到弹窗就选错了这项。' },
   { key: 'onError', group: 'qq', label: '出错时提醒', type: 'boolean',
     description: '执行出错时推一条。' },
   { key: 'notifySubagents', group: 'qq', label: '子智能体也提醒', type: 'boolean',

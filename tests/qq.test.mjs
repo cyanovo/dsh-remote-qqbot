@@ -1907,17 +1907,28 @@ await t('闲聊直回可被配置关掉（qqChatReply !== false 语义：缺省�
   assert.ok(indexSrc.includes('qqChatReadOnly'), '只读开关必须可配')
 })
 
-// ── [10] 提问中继：QQ 优先 + 桌面兜底 ─────────────────────────────────────
-// 修的是 2026-10-02 报的现象：「QQ 里明明回答过了、机器人也回了 ✅，但 DSH 聊天窗口里
+// ── [10] 提问中继：桌面 + QQ 同时问（谁先答算谁）／可选 QQ 优先 ─────────────
+// 修的第一件（2026-10-02 报的现象）：「QQ 里明明回答过了、机器人也回了 ✅，但 DSH 聊天窗口里
 // 那张提问卡片一直挂着」。
 // 根因在 DSH 框架侧：桌面那张卡片由 api-proxy 自己持有（pendingQuestions），
 // **只有它自己的 respond()（浏览器里作答）和 abort 回调**能摘掉条目并广播
 // question/resolved（源码 `packages/host/apiproxy/src/api-proxy.ts` 的 claimQuestion）。
 // 插件这边 resolve 掉 ask() 只能让 agent 继续跑，**清不掉卡片**。
-// 所以「两边同时等，谁先答算谁」的写法（0.7.6 及以前的 `Promise.race`）**注定留残影**：
+// 所以「两边同时等，谁先答算谁」的老写法（0.7.6 及以前的 `Promise.race`）**注定留残影**：
 // 哪怕插件先拿到 QQ 的答案，那张卡片也还在，还会被重连的客户端重放。
-// 现在改成 QQ 优先：发得出去就先不给桌面显示卡片；只有「发不出去」或「超时没人答」
-// 才把桌面提问接上来（那时卡片由桌面自己管生命周期，同样不会残留）。
+// 当时的修法是「QQ 优先」：发得出去就先不给桌面显示卡片；只有「发不出去」或「超时没人答」
+// 才把桌面提问接上来。
+//
+// 修的第二件（2026-10-12 主人报的「提问弹窗不会显示了，目前只能通过 QQ 机器人会话」）：
+// QQ 优先有个他在实际使用里必然踩到的副作用 —— 他随手在手机上答了，90 秒的兜底窗口
+// **永远等不到**，桌面上一次都没弹过卡片。
+// 所以 1.0.27 起默认改成 **`qqAskDesktop: 'both'`**：一进来就把卡片挂到桌面，
+// **同时**照常发 QQ，谁先答算谁。残影问题由**影子 signal** 兜住（QQ 先答 → 中止它 →
+// api-proxy 自己 claimQuestion(…,'cancelled')，卡片在所有客户端上消失），
+// 所以 both 模式不会退回老毛病。「先 QQ、桌面兜底」作为 `'qq-first'` 保留。
+//
+// ⚠️ 本节里验老行为的用例都**显式**写了 `config: { qqAskDesktop: 'qq-first' }`；
+//    验新默认的用例不写 config（走 makeRelay 的默认 both）—— 默认是哪一档因此也有人盯着。
 
 /** 从源码里抠出某个函数的完整函数体（含首尾大括号），用于在受控环境里真跑。 */
 function extractFunction(src, header) {
@@ -1936,14 +1947,35 @@ function extractFunction(src, header) {
 
 const relaySrc = extractFunction(qqruntimeSrc, 'function relayAsk(request, original) {')
 
-/** 把 relayAsk 放进受控环境跑：日志 / pendingAsks / askViaQq / 兜底时长全部由测试注入。 */
-function makeRelay({ fallbackMs = 20, pendingAsks = new Map(), askViaQq }) {
+/** 把 relayAsk 放进受控环境跑：日志 / pendingAsks / askViaQq / 兜底时长 / 配置全部由测试注入。 */
+function makeRelay({
+  fallbackMs = 20,
+  pendingAsks = new Map(),
+  askViaQq,
+  // 默认取**生产默认值**（both：卡片立刻出现 + QQ 同时收到）。
+  // 要验老行为（先 QQ、桌面兜底）的用例必须**显式**写 `config: { qqAskDesktop: 'qq-first' }` ——
+  // 这样"默认是哪一档"本身就有人盯着，不会被悄悄改回 QQ 优先。
+  config = { qqAskDesktop: 'both' },
+}) {
   const logs = []
+  const sentToQq = []
   const build = new Function(
-    'l', 'pendingAsks', 'askViaQq', 'ASK_DESKTOP_FALLBACK_MS',
+    'l', 'pendingAsks', 'askViaQq', 'ASK_DESKTOP_FALLBACK_MS', 'liveConfig', 'sendProactive',
     `${relaySrc}\nreturn relayAsk`,
   )
-  return { relay: build((m) => logs.push(String(m)), pendingAsks, askViaQq, fallbackMs), logs, pendingAsks }
+  return {
+    relay: build(
+      (m) => logs.push(String(m)),
+      pendingAsks,
+      askViaQq,
+      fallbackMs,
+      () => config,
+      (text) => { sentToQq.push(String(text)) },
+    ),
+    logs,
+    pendingAsks,
+    sentToQq,
+  }
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -1952,6 +1984,156 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 // 自己留一个 ref 的定时器保活 —— 否则 Node 发现事件循环空了，会直接以
 // "unsettled top-level await" 退出，看起来像测试挂死。
 const keepAlive = () => setTimeout(() => {}, 300)
+
+// ── ★ 1.0.27 新默认：`qqAskDesktop: 'both'`（桌面和 QQ 同时问，谁先答算谁）────────────
+// 现场（2026-10-12 主人原话）：「插件出现bug，提问弹窗不会显示了，目前只能通过qq机器人会话」。
+// 根因不是弹窗坏了，是**设计如此**：老行为（qq-first）先把问题发 QQ，只有「发不出去」或
+// 「90 秒没人答」才把卡片显示到桌面；他随手在手机上答了 ⇒ 兜底窗口永远等不到 ⇒ 桌面一次没弹过。
+// 所以默认改成 both：卡片立刻出现 + QQ 同时发，两条线谁先答算谁；残影由影子 signal 兜住。
+
+await t('【行为】both（默认）：提问一进来桌面卡片立刻出现、QQ 也同时收到；QQ 先答则卡片被中止', async () => {
+  const outer = new AbortController()
+  const pendingAsks = new Map()
+  let cardSignal = null
+  let desktopCalls = 0
+  let release = null
+  const { relay, logs, sentToQq } = makeRelay({
+    config: { qqAskDesktop: 'both' },
+    fallbackMs: 60_000, // 故意极长：卡片必须在「谁都没答、也没超时」之前就出现
+    pendingAsks,
+    askViaQq: (request, hooks) => {
+      pendingAsks.set('ask-both-1', { questions: request.questions, createdAt: Date.now() })
+      hooks.onDelivered(true, 'ask-both-1')
+      return new Promise((resolve) => { release = resolve })
+    },
+  })
+  const pending = relay({ questions: [{ id: 'q1' }], signal: outer.signal }, (req) => {
+    desktopCalls += 1
+    cardSignal = req.signal
+    return new Promise(() => {}) // 主人在 DSH 里没点
+  })
+  // 同步断言：relayAsk 的 executor 是同步跑的，返回时卡片就该已经挂上（60 秒的闹钟不可能响过）
+  assert.equal(desktopCalls, 1, '默认 both：不许再等兜底窗口，提问必须立刻显示在 DSH 界面')
+  assert.ok(cardSignal, '要给桌面递影子 signal，否则 QQ 答完收不掉那张卡片')
+  assert.notEqual(cardSignal, outer.signal, '递的必须是影子 signal，不是调用方那个')
+  assert.equal(cardSignal.aborted, false, '还没人作答，卡片不该被中止')
+  assert.equal(pendingAsks.get('ask-both-1')?.desktopShown, true,
+    'both 模式下 QQ 那条待答条目要标 desktopShown，回执才会提醒主人「那张卡片已作废」')
+  assert.equal(sentToQq.length, 0, '还没人作答，不该往 QQ 发任何提示')
+  assert.ok(logs.some((m) => m.includes('同时挂到 DSH 界面和 QQ')),
+    `日志要写清这一轮两边都发了：${logs.join('｜')}`)
+
+  release('qq-answer') // 主人在 QQ 里先答了
+  assert.equal(await pending, 'qq-answer', 'QQ 的答案必须算数')
+  assert.equal(cardSignal.aborted, true, 'QQ 答完必须中止影子 signal —— DSH 才会自己收掉卡片')
+  assert.equal(outer.signal.aborted, false, '外层 signal 属于调用方，插件无权中止它')
+})
+
+await t('【行为】both：主人在电脑上答了 → QQ 条目摘掉，并回一句「已经在电脑上答过了」', async () => {
+  const pendingAsks = new Map()
+  let resolveDesktop = null
+  let release = null
+  const desktopAnswer = { answers: [{ id: 'q1', selected: ['B'] }] }
+  const { relay, sentToQq } = makeRelay({
+    config: { qqAskDesktop: 'both' },
+    fallbackMs: 20,
+    pendingAsks,
+    askViaQq: (request, hooks) => {
+      pendingAsks.set('ask-both-2', { questions: request.questions, createdAt: Date.now() })
+      hooks.onDelivered(true, 'ask-both-2')
+      return new Promise((resolve) => { release = resolve })
+    },
+  })
+  const ka = keepAlive()
+  const pending = relay({ questions: [{ id: 'q1' }] }, () => new Promise((resolve) => {
+    resolveDesktop = resolve
+  }))
+  assert.equal(pendingAsks.size, 1, 'both 模式下 QQ 那条应该正在等')
+  resolveDesktop(desktopAnswer)
+  assert.deepEqual(await pending, desktopAnswer, '桌面答的答案要交给 agent')
+  assert.equal(pendingAsks.size, 0,
+    '桌面答完必须摘掉 QQ 条目，否则之后某条 QQ 回复会被误配到这个已经结束的提问上')
+  assert.equal(sentToQq.length, 1, `QQ 里要恰好回一句提示，实际：${JSON.stringify(sentToQq)}`)
+  assert.ok(sentToQq[0].includes('已经在电脑上的 DSH 界面里答过了'), `提示文案要写清：${sentToQq[0]}`)
+
+  release('late-qq-answer') // 主人后来又在 QQ 里回了一句
+  await sleep(20)
+  clearTimeout(ka)
+  assert.equal(sentToQq.length, 1, 'QQ 后到的答案不该再产生第二条提示（那纯属噪音）')
+})
+
+await t('【行为】both：QQ 发不出去时桌面卡片**只有一张**（不会再来第二张）', async () => {
+  let desktopCalls = 0
+  const { relay, logs } = makeRelay({
+    config: { qqAskDesktop: 'both' },
+    fallbackMs: 5, // 就算真排了兜底闹钟，窗口一到也会再调一次 showDesktop
+    askViaQq: (request, hooks) => { hooks.onDelivered(false, 'ask-both-3'); return new Promise(() => {}) },
+  })
+  const ka = keepAlive()
+  const pending = relay({ questions: [] }, () => {
+    desktopCalls += 1
+    return new Promise(() => {})
+  })
+  assert.equal(desktopCalls, 1, 'both 模式下卡片在提问进来的那一刻就挂上了')
+  await sleep(30)
+  clearTimeout(ka)
+  assert.equal(desktopCalls, 1, 'showDesktop 必须挡住第二次，否则桌面上会出现两张一样的卡片')
+  assert.ok(logs.some((m) => m.includes('没能发到 QQ')), `要说清 QQ 那条没发出去：${logs.join('｜')}`)
+  assert.ok(!logs.some((m) => m.includes('改为在 DSH 界面里提问')),
+    '这时不该再写「改为在 DSH 界面里提问」—— 卡片早就在桌面上了')
+  void pending
+})
+
+await t('【行为】配置写坏（未知取值）→ 当 both 处理：宁可多弹一张卡片，也不让提问在桌面上消失', async () => {
+  let desktopCalls = 0
+  const { relay } = makeRelay({
+    config: { qqAskDesktop: 'BOTH' }, // 手改 settings.yaml 写成大写 / 写成别的词
+    fallbackMs: 60_000,
+    askViaQq: (request, hooks) => { hooks.onDelivered(true, 'ask-bad'); return new Promise(() => {}) },
+  })
+  const ka = keepAlive()
+  void relay({ questions: [] }, () => {
+    desktopCalls += 1
+    return new Promise(() => {})
+  })
+  await sleep(10)
+  clearTimeout(ka)
+  assert.equal(desktopCalls, 1, '未知取值必须退回「能看见弹窗」那一档，而不是静默变成 qq-first')
+})
+
+await t('默认值四处一致：DEFAULTS / schema / 设置界面选项 / 状态行都必须是 both 这一档（含反向校验）', () => {
+  const configApiSrc = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'config-api.js'), 'utf8')
+  /** 从 DEFAULTS 里读出 qqAskDesktop 的默认值 —— 抽成函数，好在反向用例里证明它真能认出坏值。 */
+  const readDefault = (src) => {
+    const m = /qqAskDesktop:\s*'([^']*)'/.exec(src)
+    return m ? m[1] : null
+  }
+  assert.equal(readDefault(indexSrc), 'both', 'config 默认值必须是把提问同时显示在桌面和 QQ')
+  assert.equal(readDefault("const DEFAULTS = { qqAskDesktop: 'qq-first' }"), 'qq-first',
+    '检查器本身失效了：把老默认值放回去它也认不出来')
+  assert.ok(indexSrc.includes('qqAskDesktop: z.string().default(DEFAULTS.qqAskDesktop)'),
+    'schema 里少了 qqAskDesktop —— 这个配置在 settings.yaml 里会被丢掉')
+  assert.match(configApiSrc, /key: 'qqAskDesktop', group: 'qq'/,
+    '设置界面（FIELD_SPECS）里没有这一项，主人就没法把它改成 qq-first')
+  assert.ok(configApiSrc.includes("options: ['both', 'qq-first']"),
+    '设置界面要给这两个取值，别让人手打（打错了会静默退回 both）')
+  assert.ok(indexSrc.includes('桌面和 QQ 同时弹，谁先答算谁'),
+    '状态行要说清当前是哪一档，否则主人没法判断自己选对了没有')
+})
+
+await t('both 模式的实现要点（源码级）：卡片在 askViaQq 之前挂、且不为它排兜底闹钟', () => {
+  const bothAt = relaySrc.indexOf("if (desktopMode === 'both') showDesktop(")
+  const askAt = relaySrc.indexOf('const viaQq = askViaQq(')
+  assert.notEqual(bothAt, -1, '找不到 both 模式挂卡片的那一行 —— 测试已与源码脱节')
+  assert.notEqual(askAt, -1, '找不到 askViaQq 的调用点')
+  assert.ok(bothAt < askAt, '卡片必须**先**挂到桌面再去发 QQ，否则「同时」就变成了「发完才显示」')
+  assert.ok(relaySrc.includes("liveConfig().qqAskDesktop === 'qq-first' ? 'qq-first' : 'both'"),
+    '模式判定要「只认 qq-first，其余全当 both」—— 配置写坏时宁可多弹一张卡片')
+  assert.ok(/if \(desktopMode === 'both'\) {/.test(relaySrc),
+    'both 模式下不许再排兜底闹钟（卡片已经在了，闹钟只会白排一个定时器）')
+  assert.ok(relaySrc.includes('deliveredToQq'),
+    '只有真的发到了 QQ，才该回那句「已经在电脑上答过了」—— 否则会出现一条对不上号的提示')
+})
 
 await t('提问中继不许再用 Promise.race —— 那正是「卡片一直挂着」的根因写法', () => {
   const at = qqruntimeSrc.indexOf('svc.ask = (request) =>')
@@ -1989,6 +2171,7 @@ await t('【行为】QQ 发得出去且主人答了 → 桌面提问**一次都�
   let desktopCalls = 0
   const answer = { answers: [{ id: 'q1', selected: ['A'] }] }
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 20,
     askViaQq: (request, hooks) => {
       hooks.onDelivered(true, 'ask-1')
@@ -2008,6 +2191,7 @@ await t('【行为】QQ 发不出去 → 立刻回到桌面提问，不等兜底
   let desktopCalls = 0
   const t0 = Date.now()
   const { relay, logs } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 60_000, // 故意设长：回落只能由「发不出去」触发，不能靠超时
     askViaQq: (request, hooks) => { hooks.onDelivered(false, 'ask-2'); return new Promise(() => {}) },
   })
@@ -2026,6 +2210,7 @@ await t('【行为】QQ 发得出去但没人答 → 过了兜底窗口桌面才
   let desktopCalls = 0
   let seenFlag = null
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 20,
     pendingAsks,
     askViaQq: (request, hooks) => {
@@ -2054,6 +2239,7 @@ await t('【行为】QQ 答得晚（桌面卡片已出现）→ 答案照样算�
   let desktopCalls = 0
   let release = null
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 10,
     pendingAsks,
     askViaQq: (request, hooks) => {
@@ -2078,6 +2264,7 @@ await t('【行为】主人改在 DSH 里取消 → 外层 reject，且 QQ 条�
   const pendingAsks = new Map()
   let desktopCalls = 0
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 10,
     pendingAsks,
     askViaQq: (request, hooks) => {
@@ -2123,6 +2310,7 @@ await t('【行为】兜底卡片已出现、随后在 QQ 里作答 → 影子 s
   let cardSignal = null
   let release = null
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 10,
     askViaQq: (request, hooks) => {
       hooks.onDelivered(true, 'ask-6')
@@ -2151,6 +2339,7 @@ await t('【行为】正常路径（卡片从未出现）→ 任何 signal 都�
   const outer = new AbortController()
   let desktopCalls = 0
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 10,
     askViaQq: (request, hooks) => { hooks.onDelivered(true, 'ask-7'); return Promise.resolve('qq-answer') },
   })
@@ -2168,6 +2357,7 @@ await t('【行为】发不出去、改为桌面提问 → 递进桌面的同样
   const outer = new AbortController()
   let cardSignal = null
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 60_000,
     askViaQq: (request, hooks) => { hooks.onDelivered(false, 'ask-8'); return new Promise(() => {}) },
   })
@@ -2185,6 +2375,7 @@ await t('【行为】这一轮 turn 被取消 → 影子 signal 跟着中止（�
   const outer = new AbortController()
   let cardSignal = null
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 10,
     askViaQq: (request, hooks) => { hooks.onDelivered(true, 'ask-9'); return new Promise(() => {}) },
   })
@@ -2211,6 +2402,7 @@ await t('【行为】中止影子 signal ⇒ 桌面那条以 ASK_ABORTED 落定�
     let desktopErr = null
     let release = null
     const { relay } = makeRelay({
+      config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
       fallbackMs: 10,
       askViaQq: (request, hooks) => {
         hooks.onDelivered(true, 'ask-10')
@@ -2329,6 +2521,7 @@ await t('【行为】turn 被取消 → QQ 那条待答条目必须跟着摘掉�
   let desktopCalls = 0
   let release = null
   const { relay, logs } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 10,
     pendingAsks,
     askViaQq: (request, hooks) => {
@@ -2361,6 +2554,7 @@ await t('【行为】signal 进来时就已中止 → 一个字都不发到 QQ�
   outer.abort()
   let asked = 0
   const { relay } = makeRelay({
+    config: { qqAskDesktop: 'qq-first' }, // 老行为：先 QQ、桌面兜底
     fallbackMs: 5,
     askViaQq: () => { asked += 1; return new Promise(() => {}) },
   })

@@ -212,6 +212,8 @@ agent 事件
 | 去重 | 同内容在 `dedupeMs` 内已推过 | 静默 |
 
 三类事件各有开关（`onTurnComplete` / `onQuestion` / `onError`）。
+提问**显示在哪里**另有一个开关 `qqAskDesktop`（1.0.27 起默认 `both`：桌面卡片和 QQ 同时弹，
+谁先答算谁；改成 `qq-first` 就回到「先 QQ、桌面 90 秒兜底」）—— 详见 3.7。
 
 **推送里怎么出现「查看完整回答」链接：** 长回答会先走 `notes.publishTurnNote()`
 （渲染 markdown → 上传中枢 → 换回 `<id>`），推送正文只留摘要 + 一个链接。
@@ -774,29 +776,66 @@ function ownVersion() {
   不许再出现 `readPackageVersion`。
 
 
+### 3.7 提问中继：桌面和 QQ **同时**问，谁先答算谁（1.0.27 起；0.7.7~1.0.26 是「先 QQ、桌面兜底」）
+
 ```
 agent 要提问 ──▶ svc.ask(request)
                     │
-                    ├─ 先发 QQ：发失败 → 立刻 original(request)（与原生提问一致）
+                    ├─ 立刻挂一张桌面卡片（original(request)，带「影子 signal」）
+                    │         └─ 你在 DSH 里答了 → 答案算数
+                    │                            + 摘掉 QQ 的待答条目
+                    │                            + QQ 回一句「已经在电脑上答过了」
                     │
-                    └─ 发成功 → 只等 QQ 的回答
-                                │
-                                └─ 90 秒（ASK_DESKTOP_FALLBACK_MS）没回
-                                     → 才补一张桌面卡片
+                    └─ 同时发 QQ
+                              ├─ 发出去 → 在 QQ 里等你答
+                              │            └─ 你答了 → 中止影子 signal
+                              │                       ⇒ api-proxy 自己 claimQuestion(…,'cancelled')
+                              │                         卡片在**所有已连上的客户端**上消失
+                              └─ 发不出去 → 桌面那张已经在，什么都不用补
 ```
 
-**为什么要这么设计（这是 0.7.7 修的一个真 bug）：**
-桌面那张提问卡片**只能由 DSH 自己收起**。旧写法 `Promise.race([viaQq, original(request)])`
-一开头就在桌面创建了一条 pending 记录，于是「QQ 里答完了、agent 继续跑，卡片却永远挂着」，
-而且新连上的客户端还会被重放。正确解法是**一开始就别创建那条记录**，
-而不是答完了再去清（清不掉）。
+「提问显示在哪」由一个配置项决定：`qqAskDesktop`（默认 `both`，1.0.27 起）。
 
-配套细节：
-- 兜底卡片真出现、你随后又在 QQ 里回答 → 答案照算，回执末尾追加一行提示你怎么把卡片收掉；
+| 取值 | 行为 | 适合谁 |
+|---|---|---|
+| `both`（默认） | 卡片**立刻**出现，**且**推 QQ；谁先答算谁 | 人可能坐在电脑前、也可能只看手机 |
+| `qq-first` | 先只发 QQ；发不出去、或 90 秒（`ASK_DESKTOP_FALLBACK_MS`）没人答，才补桌面卡片 | 人基本不在电脑前；0.7.7~1.0.26 的行为 |
+
+**为什么 1.0.27 要把默认从 qq-first 改成 both（主人报的真事故）：**
+
+他的原话是「插件出现bug，提问弹窗不会显示了，目前只能通过qq机器人会话」。
+**弹窗没坏，那是 qq-first 的设计后果**：他随手在手机上把问题答了，90 秒的兜底窗口
+**永远等不到**，桌面上一次都没弹过卡片。只要「人在电脑前」和「只看手机」两种情况混着出现，
+qq-first 就必然制造"弹窗不见了"的观感 —— 而提问恰恰是最不能靠猜的一件事。
+
+那 0.7.7 为什么不敢两边同时等？因为老写法 `Promise.race([viaQq, original(request)])`
+会留下一张永远收不掉的卡片（见下）。1.0.27 把那个理由消掉了：卡片是 api-proxy 自己的
+`pendingQuestions` 条目，而它会**监听 `request.signal`**（`api-proxy.ts` 的 `ask()` 记下
+`request.signal` 并挂 `abort` 回调），abort 时它自己 `claimQuestion(pending, 'cancelled')`
+—— **删条目 + 广播 `question/resolved`**。所以插件递一个**影子 signal** 进 `original()`，
+QQ 那边一答完就中止它，卡片立刻消失，新连上的客户端也不会被 mux 重放。
+「两边同时等」于是既没有残影，也不用再赌你在不在电脑前。
+
+**为什么绝不能退回 `Promise.race`（0.7.7 修的那个真 bug）：**
+桌面那张提问卡片**只能由 DSH 自己收起**。旧写法一开头就在桌面创建 pending 记录，
+于是「QQ 里答完了、agent 继续跑，卡片却永远挂着」。当年的解法是"一开始就别创建那条记录"，
+现在的解法是"创建了也能让 DSH 自己收掉"（影子 signal）—— **两个方向都不许退回 race**。
+
+配套细节（两种模式共用）：
 - 桌面那条 Promise 落定后**删掉** `pendingAsks` 里对应条目（否则在更长的 TTL 内全局 FIFO
   可能把下一条消息投错）；
-- 兜底定时器在 QQ 回答到达后必须 `clearTimeout` —— 否则 90 秒后一个**已经答过**的提问
-  会突然弹到桌面上（写测试时抓到的第二个 bug）。
+- QQ 先答完 → 中止影子 signal；桌面 Promise 随后以 `ASK_ABORTED` 落定，但外层已经 resolve
+  （Promise 只认第一次落定）⇒ **QQ 的答案总是赢**，也不会产生 unhandledRejection；
+- QQ 先答完时**必撤**兜底闹钟（`qq-first` 专用）—— 否则 90 秒后一个**已经答过**的提问
+  会突然弹到桌面上（写测试时抓到的第二个 bug）；
+- `both` 模式下 QQ 只多收一句「已经在电脑上答过了」，且只在**真的发到过 QQ**
+  （`deliveredToQq`）且这轮不是被取消时才发 —— 发失败时压根没有"待答的那条消息"，回它纯属噪音；
+- 配置写坏（未知取值）**一律按 both** 处理：宁可多弹一张卡片，也不能让提问在桌面上静默消失。
+
+**回归与反向校验（1.0.27）**：`tests/qq.test.mjs` 新增 6 条（4 条行为 + 2 条源码/默认值），
+原有 12 个 `relayAsk` 用例**全部显式**改成 `config: { qqAskDesktop: 'qq-first' }`
+（这样"默认是哪一档"本身也有人盯着）。反向校验：删掉 both 模式那行
+`showDesktop(...)` 并把 `DEFAULTS` 改回 `qq-first` → 6 条**全红**；恢复后全绿。
 
 **提问的「待答条目」跟提问同生共死（2026-10-05 修的 bug）：**
 
@@ -1327,6 +1366,7 @@ DEFAULTS < settings 用户层 < cordis.patch.yml 显式键 < remote-qqbot-overri
 | `timeoutMs` | `10000` | 单次请求超时 |
 | `onTurnComplete` | `true` | 任务完成推送 |
 | `onQuestion` | `true` | 提问推送 |
+| `qqAskDesktop` | `'both'` | 提问显示在哪：`both` 桌面卡片与 QQ **同时**（默认，谁先答算谁）/ `qq-first` 先只发 QQ、桌面 90 秒兜底。**只认 `qq-first` 这个字面值，其余一律当 `both`** —— 配置写坏时宁可多弹一张卡片，也不能让提问在桌面上静默消失（1.0.27，见 3.7） |
 | `onError` | `true` | 出错推送 |
 | `notifySubagents` | `false` | 子智能体完成是否推送 |
 | `notifyChatSession` | `false` | 闲聊会话完成是否推送 |
@@ -1776,7 +1816,7 @@ npm test    # 19 组，全部零外部依赖（cloud-integration 会顺手做一
 | `tests/client-render.test.mjs` | 8 | **浏览器侧设置页的真渲染**（1.0.20 新增：假 `window.__ModuleLoader__` + 假 React + 假 `fetch` 返回真 `configView()` 产物，把 `NotifyMemorySettings` 渲染出来遍历元素树）：最上面那张「接收 QQ 推送」卡画出来了、开关跟着 host 走、缺省按"开"显示、整页只有一个同名开关、loading 与"服务不可用"都不白屏 |
 | `tests/fulltext.test.mjs` | 49 | **三档全文模式**：`normalizeFulltextMode` 非法值必落 `chat`、`uploadsFulltext`/`showsFulltextLink` 语义、切分**不丢字符**、**带序号不超限**（★`limit=100` 边界）、`maxChars` 下限 100 的契约 |
 | `tests/ui-persist.test.mjs` | 34 | 开关落盘：桌面拒绝原生写入 → 落插件自有覆盖文件；写失败必抛；`ok:false` 不被 success spread 掩盖；secret 不回显；**`[C2]` 安全护栏（1.0.25）：`cloudUrl` / `hubUrl` / `qqUpdateSource` 从这个无认证面写不动（服务端硬拒 + `rejected` 如实回报 + 不落盘 + 前端只读渲染）** |
-| `tests/qq.test.mjs` | 259 | QQ 文案、引用索引、入站路由、`qqPreviewUrl`、提问中继行为、**引用反查四级兜底（回执登记 `ref_idx` / 用官方 `msg_elements` 的正文认会话 / 12 小时兜底窗口 / 认不出也必须投递）**、**工作区派活（`/task` 两步、两份名单的优先级、`cwd` 带出、老状态文件升级）**、**消息按钮（发出去的形状、选项按钮构造、`@机器人` 前缀剥离、更新提醒与帮助的按钮、`/skip`）**、**1.0.24 的硬要求：不引用不带 / 一律闲聊（`stray_number` 被删干净、三个"名单新鲜"开关传了也不改道、`/pick` `/open` `/use` 三写法、24 小时 vs 5 分钟两个窗口、名单数字按钮的 data 能被路由认出来、按钮超限返回 null、提问按钮发 `/answer N`、提示发生在投递之后且按 `askId` 去重）**、**派活第二步（`/open` 与 `/new`、三种别名、只认本工作区那份名单、数字按钮 +「新对话」按钮、0 条名单不装按钮、六种回执互不相同）**、**1.0.26 提问按钮的可读性（一行一个、标签剥前缀与「（推荐）」、`optionLabelRoom` 口径、装了按钮时正文不重复选项名、按钮装不上时一个字都不省、选项名会被切又没说明时正文补全）** |
+| `tests/qq.test.mjs` | 265 | QQ 文案、引用索引、入站路由、`qqPreviewUrl`、提问中继行为（**1.0.27 起含 both/qq-first 两档：卡片立刻出现、QQ 先答中止影子 signal、桌面先答摘条目并回一句「已经在电脑上答过了」、QQ 发不出去只有一张卡片、未知配置一律当 both**）、**引用反查四级兜底（回执登记 `ref_idx` / 用官方 `msg_elements` 的正文认会话 / 12 小时兜底窗口 / 认不出也必须投递）**、**工作区派活（`/task` 两步、两份名单的优先级、`cwd` 带出、老状态文件升级）**、**消息按钮（发出去的形状、选项按钮构造、`@机器人` 前缀剥离、更新提醒与帮助的按钮、`/skip`）**、**1.0.24 的硬要求：不引用不带 / 一律闲聊（`stray_number` 被删干净、三个"名单新鲜"开关传了也不改道、`/pick` `/open` `/use` 三写法、24 小时 vs 5 分钟两个窗口、名单数字按钮的 data 能被路由认出来、按钮超限返回 null、提问按钮发 `/answer N`、提示发生在投递之后且按 `askId` 去重）**、**派活第二步（`/open` 与 `/new`、三种别名、只认本工作区那份名单、数字按钮 +「新对话」按钮、0 条名单不装按钮、六种回执互不相同）**、**1.0.26 提问按钮的可读性（一行一个、标签剥前缀与「（推荐）」、`optionLabelRoom` 口径、装了按钮时正文不重复选项名、按钮装不上时一个字都不省、选项名会被切又没说明时正文补全）** |
 | `tests/status.test.mjs` | 25 | `/status` 排版（真跑 `formatStatusText`），含「当前会话看得见」、**插件版本问得到、磁盘比内存新要告警、不传不多噪音（1.0.22）** |
 | `tests/session-picker.test.mjs` | 36 | **挑会话**：列表编号与纯文本、`isPickerFresh` 时效、`pickerAge`（区分"没有名单"与"名单太老"、时钟回拨不出现负数）、**1.0.24 的路由三分支（`/` 指令 / 引用 / 其余一律闲聊：裸数字、带 `@机器人` 的、奇怪的话都必须是 chat；老的三个开关传了也不许改道；有引用仍然回原会话）**、`formatPickAck` 四种结果、指针真的落盘（含老状态文件） |
 | `tests/screen.test.mjs` | 59 | 抓屏脚本内容（**不含 AMSI 触发构造**、**DPI 认领必须在读 VirtualScreen 之前**）、`parseRawOutput`、隐私清理、`/screen` 路由、图片上行形状、AMSI 报错翻译 |
@@ -1916,7 +1956,7 @@ dsh plugin --profile desktop add github:<owner>/dsh-remote-qqbot
 |---|---|
 | 用户配置从不生效 | 根因是「未注册就 `get`」+「把填满默认值的 config 合并到 settings 之上」，见 5.2 |
 | UI 显示「QQ 未连接」 | 让 UI 读 `liveConfig()`，不要让数据源迁就 UI，见 5.3 |
-| 询问卡片永远挂着 | QQ 优先 + 桌面延时兜底，**一开始就不创建桌面 pending**，见 3.7 |
+| 询问卡片永远挂着 | 0.7.7 起**一开始就不创建桌面 pending**（QQ 优先）；1.0.27 起改为「桌面与 QQ 同时问」+ **影子 signal**：QQ 答完就 abort 它，api-proxy 自己 `claimQuestion(…,'cancelled')` 收卡片。**两条都不要再改回 `Promise.race`**，见 3.7 |
 | 提问推送没有选项 | `userQuestions` 服务提供者 fiber 未 active 时 `ctx.get` 返回 `undefined`，靠三层补接（`inject` / `tools/pre-execute` 时刻 / 兜底文案） |
 | 链接被 QQ 拦 | host 全大写，手工拼字符串（不能用 setter），见 6.1 |
 | 收到确认后复述用户原话 | 回执只留一行，但**保留 `（会话名）`** |

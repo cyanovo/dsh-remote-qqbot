@@ -372,6 +372,21 @@ const DEFAULTS = {
    */
   qqSummaryChars: 150,
   /**
+   * **提问显示在哪**（默认 `both`）。2026-10-12 主人报「提问弹窗不会显示了，
+   * 目前只能通过 QQ 机器人会话」之后加的开关。
+   *
+   * - `both`（默认）：agent 一提问就在 DSH 界面上挂卡片，**同时**把问题发到 QQ。
+   *   人在电脑前就点卡片、在外面就回 QQ，**谁先答算谁**：QQ 先答 → 卡片自动作废收掉；
+   *   桌面先答 → QQ 那边收到一句「已经在电脑上答过了」。
+   * - `qq-first`：先只发 QQ，桌面**一开始不创建**卡片；只有发不出去、
+   *   或 {@link ASK_DESKTOP_FALLBACK_MS}（90 秒）没人答，才补一张桌面卡片。
+   *   适合"人在电脑前但不想被打断"的场景 —— 代价就是提问不会立刻弹出来。
+   *
+   * ⚠️ 两个模式都靠**影子 signal** 收卡片（QQ 先答 → 中止它 → api-proxy 自己清掉条目），
+   * 所以 both 模式不会退回 0.7.7 之前那种「QQ 答完了卡片还挂着」的残影。
+   */
+  qqAskDesktop: 'both',
+  /**
    * 闲聊会话是否强制切到**只读**权限（默认开）。
    *
    * 主人明确要求：在 QQ 里不引用任何消息地闲聊时，机器人「只能看各种状态，思考完直接在聊天框回答」，
@@ -564,6 +579,7 @@ export const Config = z.object({
   timeoutMs: z.number().default(DEFAULTS.timeoutMs).description('请求超时（毫秒）'),
   onTurnComplete: z.boolean().default(DEFAULTS.onTurnComplete).description('任务完成时推送'),
   onQuestion: z.boolean().default(DEFAULTS.onQuestion).description('需要提问时推送'),
+  qqAskDesktop: z.string().default(DEFAULTS.qqAskDesktop).description('提问显示在哪：both 同时显示在 DSH 界面和 QQ（默认，谁先答算谁）/ qq-first 先只发 QQ、桌面 90 秒兜底'),
   onError: z.boolean().default(DEFAULTS.onError).description('执行出错时推送'),
   notifySubagents: z.boolean().default(DEFAULTS.notifySubagents).description('子智能体（teammate/子任务）完成、提问、出错时是否也推送；默认 false，只推你自己的会话'),
   notifyChatSession: z.boolean().default(DEFAULTS.notifyChatSession).description('QQ「闲聊会话」完成时是否推送；默认 false（你人就在 QQ 里等着回复）'),
@@ -2048,7 +2064,13 @@ export function apply(ctx, rawConfig = {}) {
     if (live.qqEnabled) {
       lines.push({
         label: 'QQ 提问中继',
-        value: !live.onQuestion ? '关闭（提问只走桌面）' : (qqQuestionRelay ? '已接上（提问带编号选项发到 QQ）' : '暂未接上'),
+        value: !live.onQuestion
+          ? '关闭（提问只走桌面）'
+          : (qqQuestionRelay
+            ? (live.qqAskDesktop === 'qq-first'
+              ? '已接上（先发 QQ，桌面 90 秒兜底）'
+              : '已接上（桌面和 QQ 同时弹，谁先答算谁）')
+            : '暂未接上'),
         warn: live.onQuestion === true && !qqQuestionRelay,
       })
     }

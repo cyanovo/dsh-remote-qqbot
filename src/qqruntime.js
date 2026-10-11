@@ -11,10 +11,9 @@
  *
  * 1. **不抢 userQuestions 的 provider。**
  *    该服务的 provider 全局只能有一个（重复注册抛 DUPLICATE_PROVIDER），
- *    桌面 UI 已经占住了。所以这里**包装 `ask()`**：问题**先发到 QQ**，
- *    只有发不出去、或 QQ 那边迟迟没答（`ASK_DESKTOP_FALLBACK_MS`），
- *    才把桌面提问接上来兜底（见 `relayAsk`）。QQ 那条路**永不 reject**，
- *    否则会把桌面 UI 一起拖崩。
+ *    桌面 UI 已经占住了。所以这里**包装 `ask()`**：提问**同时**走桌面卡片和 QQ
+ *    （`qqAskDesktop` 默认 `both`，谁先答算谁；`qq-first` 才是"先 QQ、桌面兜底"），
+ *    见 `relayAsk`。QQ 那条路**永不 reject**，否则会把桌面 UI 一起拖崩。
  *
  * 2. **反向链路不依赖任何穿透。**
  *    插件就跑在 DSH 进程里，注入会话直接打 `127.0.0.1:19387/api`（HMAC cookie）。
@@ -1504,10 +1503,12 @@ export function createQqRuntime({
     pendingAsks.delete(item.askId)
     item.resolve({ answers: built.answers })
     l(`已用 QQ 的回答解决了提问 ${item.askId}`)
-    // 若提问**已经**显示到了 DSH 界面（QQ 迟迟没人答 → 走了兜底），那张卡片是
-    // api-proxy 自己的，插件清不掉 —— 顺手告诉主人怎么把它收起来，别以为是卡住了。
+    // 提问**已经**显示到了 DSH 界面（both 模式的正常路径，或 qq-first 走过了兜底）→ 那张卡片
+    // 由 api-proxy 自己持有，但插件能借**影子 signal** 让它作废（relayAsk 里的 hideDesktopCard()：
+    // 中止 → api-proxy 自己 claimQuestion(…,'cancelled') → 卡片在所有客户端上消失）。
+    // 万一某个客户端没收掉，就顺手告诉主人怎么手动收起来，别以为是卡住了。
     const tail = item.desktopShown
-      ? '\n（另外，DSH 窗口里那张提问卡片已经作废了 —— 点它一下选个选项，或者按取消就能收掉）'
+      ? '\n（另外，DSH 窗口里那张提问卡片已经作废、会自动收掉；要是还看得见，点它一下或者按取消即可）'
       : ''
     await replyPassive(data, `✅ 收到，已经把你的回答带过去了${tail}`, {
       sessionId: item.sessionId, session: item.session,
@@ -1591,25 +1592,35 @@ export function createQqRuntime({
       return relayAsk(request, original)
     }
     svc.__dshQqWrapped = true
-    l('已接上提问中继：以后 agent 的提问会先发到 QQ，桌面只作兜底')
+    l('已接上提问中继：agent 的提问会同时出现在 DSH 界面和 QQ（谁先答算谁）；'
+      + '设置里把「提问显示在哪」改成 qq-first 就回到「先 QQ、桌面兜底」')
     return true
   }
 
   /**
-   * QQ 优先的提问中继。
+   * 提问中继：让提问**同时**走 DSH 界面和 QQ（`qqAskDesktop === 'both'`，1.0.27 起的默认），
+   * 或者**先 QQ、桌面兜底**（`'qq-first'`，2026-10-02 起的老行为）。
    *
-   * ⚠️ 为什么不能像 0.7.6 及以前那样 `Promise.race([viaQq, original(request)])`：
+   * ⚠️ 两种模式都不能像 0.7.6 及以前那样 `Promise.race([viaQq, original(request)])`：
    * 桌面那张提问卡片是 api-proxy 自己持有的 `pendingQuestions` 条目，
    * **只有它自己的 `respond()`（浏览器里作答）和 abort 回调**能摘掉条目并广播
    * `question/resolved`（DSH 源码 `packages/host/apiproxy/src/api-proxy.ts` 的 `claimQuestion`）。
    * 插件这边 resolve 掉 `ask()` 的返回值，只能让 agent 继续跑，**清不掉那张卡片** ——
    * 现象就是「QQ 里明明答过了，DSH 窗口里那张提问还一直挂着」（还会被重连的客户端重放一遍）。
+   * 所以两种模式都靠**影子 signal**（见下）来收卡片，而不是靠"答完再去清"。
    *
-   * 现在的策略：**先把问题发到 QQ；发得出去就先不给桌面显示卡片**。
-   * 正常路径（在 QQ 里作答）下桌面上从头到尾没有卡片，自然不会有残留。
-   * 只有两种情况才把桌面提问接上来（那时卡片由桌面自己管生命周期，同样不会残留）：
-   *   ① 问题**没能**发到 QQ（没连上 / 没有 open_id / 发送报错）；
-   *   ② 发出去了，但 {@link ASK_DESKTOP_FALLBACK_MS} 内没人答。
+   * 两种模式的差别只在**什么时候把卡片显示到桌面**：
+   *
+   * - `both`（默认）：`ask()` 一进来就在桌面上挂卡片，同时把问题发到 QQ。
+   *   主人坐在电脑前就点卡片，在外面就回 QQ，**谁先答算谁**：
+   *   QQ 先答 → 中止影子 signal，卡片自动消失（`hideDesktopCard`）；
+   *   桌面先答 → 摘掉 QQ 那条待答条目，并给 QQ 回一句"已经在电脑上答过了"。
+   *   为什么改成默认：2026-10-12 主人报「提问弹窗不会显示了，只能通过 QQ 机器人会话」——
+   *   他随手就在手机上答了，于是 90 秒的兜底窗口永远等不到，桌面上一次都没出现过卡片。
+   *
+   * - `qq-first`：先把问题发到 QQ；发得出去就先不给桌面显示卡片（桌面从头到尾没有卡片，
+   *   自然没有残留）。只有①没能发到 QQ、或②{@link ASK_DESKTOP_FALLBACK_MS} 内没人答，
+   *   才把桌面提问接上来。适合"人不在电脑前、不想被打断"的场景。
    *
    * @param {object} request - `userQuestions.ask` 的原始入参。
    * @param {Function} original - 未包装的桌面提问（绑好 this）。
@@ -1619,6 +1630,13 @@ export function createQqRuntime({
       let desktop = null
       let settled = false
       let fallbackTimer = null
+
+      // ★ 桌面卡片什么时候给（`qqAskDesktop`，1.0.27）：
+      //   both（默认）—— 立刻挂卡片，同时发 QQ，谁先答算谁；
+      //   qq-first    —— 先 QQ，发不出去或兜底窗口内没人答才补卡片（老行为）。
+      // 只认 'qq-first' 这一个字面值，别的一律当 both：配置写坏时回到"能看见弹窗"那一档，
+      // 而不是让提问在桌面上彻底消失（主人 2026-10-12 报的就是这个现象）。
+      const desktopMode = liveConfig().qqAskDesktop === 'qq-first' ? 'qq-first' : 'both'
 
       // ★ 影子 signal：这是「QQ 里答完了，DSH 那张提问卡片自己收起来」的关键。
       //
@@ -1637,6 +1655,8 @@ export function createQqRuntime({
       let detachOuter = null
       /** QQ 那条线正在等哪个 askId（`delivered` 之后才有值）。 */
       let askIdInFlight = ''
+      /** 这个问题**真的发到 QQ 了**吗（发不出去时不该在 QQ 里留"已经在电脑上答过了"那种话）。 */
+      let deliveredToQq = false
 
       /**
        * 这一轮提问被取消了（主人按了停止 / 会话被关 / 进程要退）：把 QQ 那边的
@@ -1695,10 +1715,12 @@ export function createQqRuntime({
         try { shadow.abort() } catch { /* 已经中止过 */ }
       }
 
-      function showDesktop(askId, why) {
+      function showDesktop(askId, why, viaQqToo = false) {
         // settled：QQ 已经答完了，兜底闹钟不许再把这个问题显示到桌面（会留下残影）。
         if (settled || desktop) return
-        l(`提问没有走 QQ（${why}），改为在 DSH 界面里提问`)
+        l(viaQqToo
+          ? `提问同时挂到 DSH 界面和 QQ（${why}）`
+          : `提问没有走 QQ（${why}），改为在 DSH 界面里提问`)
         if (askId) {
           // 桌面接管后 QQ 这条线**保留**：主人若稍后才在 QQ 里作答，答案照样有效
           // （那张卡片会被 abort 掉，回执里会提醒他，见 handleAnswer）。
@@ -1719,22 +1741,58 @@ export function createQqRuntime({
           return
         }
         desktop = pending
-        const done = (fn) => (value) => {
-          // 桌面已经回答/取消 → 这个提问就结束了，QQ 那条等待作废、删掉条目，
-          // 免得它对着一份更长的 TTL（见 ASK_TTL_MS）把之后某条 QQ 回复误配到
-          // 一个已经结束的提问上。
+        // 桌面先落定 = 主人在电脑上答了（或按了取消）→ 这一轮提问就结束了：
+        // QQ 那条待答条目摘掉（否则它会对着一份更长的 TTL 把之后某条 QQ 回复误配成
+        // 这个已经结束的提问的答案），并在 QQ 里明说一句"已经在电脑上答过了" ——
+        // 手机那条提问不该看起来像个没人管的悬案。
+        const done = (fn, outcome) => (value) => {
+          // ⚠️ both 模式下卡片比 askViaQq 先出现，那时 askId 还不知道（askIdInFlight 才有值），
+          //    所以两个都删一遍。
           if (askId) pendingAsks.delete(askId)
+          if (askIdInFlight) pendingAsks.delete(askIdInFlight)
+          // settled 已经为 true = 这一轮不是桌面赢的（QQ 答的 / turn 被取消），不许再发那条 QQ 提醒。
+          if (!settled && deliveredToQq && outcome === 'answered') {
+            void sendProactive('✅ 刚才那个提问已经在电脑上的 DSH 界面里答过了，QQ 这条不用再回。')
+          }
           finish(fn, value)
         }
-        pending.then(done(resolve), done(reject))
+        pending.then(done(resolve, 'answered'), done(reject, 'cancelled'))
       }
+
+      // ★ both 模式：**不等兜底窗口** —— 提问一进来就把卡片挂到桌面上（主人坐在电脑前就该立刻看见），
+      //   同时照常把问题发到 QQ。两条线谁先答算谁：
+      //   QQ 先答  → hideDesktopCard() 中止影子 signal，卡片自动消失；
+      //   桌面先答 → done() 摘掉 QQ 那条待答条目，并在 QQ 里回一句"已经在电脑上答过了"。
+      //   这就是 2026-10-12 主人报的「提问弹窗不会显示了，只能通过 QQ 机器人会话」的修法：
+      //   老行为（qq-first）下他随手在手机上答了，90 秒的兜底窗口永远等不到，桌面上一次都没弹过。
+      if (desktopMode === 'both') showDesktop('', '配置为「桌面与 QQ 同时提问」', true)
 
       const viaQq = askViaQq(request, {
         onDelivered(delivered, askId) {
-          if (settled) return
+          if (settled) {
+            // 这一轮已经结束了（桌面那条先落定 / turn 被取消），QQ 里刚发出去的那条要立刻撤掉
+            // 待答条目 —— 否则主人稍后作答会被当成"还有人在等"，而 agent 其实早就走了。
+            if (askId && pendingAsks.delete(askId)) {
+              l(`提问 ${askId} 发出时这一轮已经结束，QQ 那边的待答条目已撤销`)
+            }
+            return
+          }
           // 记下"QQ 那边正在等哪个 askId"：上面的 cancelAsk() 靠它把条目摘干净。
           if (askId) askIdInFlight = askId
-          if (!delivered) { showDesktop(askId, '没能把问题发到 QQ'); return }
+          if (!delivered) {
+            // both 模式下卡片早就在桌面上了，这里只记一笔，别再 showDesktop（它会直接返回）。
+            if (desktop) l('提问没能发到 QQ（同时模式下桌面卡片已经在，照常作答就行）')
+            else showDesktop(askId, '没能把问题发到 QQ')
+            return
+          }
+          deliveredToQq = true
+          // 卡片已经在桌面上（both 模式）→ 只把 askId 挂到条目上：主人在 QQ 里作答时，
+          // 回执要能说清"桌面那张卡片已经作废"。这时**不用**再排兜底闹钟。
+          if (desktopMode === 'both') {
+            const shown = askId ? pendingAsks.get(askId) : null
+            if (shown) shown.desktopShown = true
+            return
+          }
           const seconds = Math.round(ASK_DESKTOP_FALLBACK_MS / 1000)
           fallbackTimer = setTimeout(
             () => showDesktop(askId, `QQ 那边 ${seconds} 秒没有回答`),
