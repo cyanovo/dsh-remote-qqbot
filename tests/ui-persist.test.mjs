@@ -636,13 +636,17 @@ await test('liveServerOrigin：从 webServer.listenedPort 读真实端口（0.2.
   assert.equal(liveServerOrigin({ listenedPort: 70000 }), null)
 })
 
-await test('★ 注入通道必须用实际端口：qqruntime 里有 localOrigin，index.js 把它接上了', () => {
+await test('★ 注入通道必须用实际端口：qqruntime 里有 localOrigin，index.js 现读端口接上了', () => {
   const rt = readFileSync(new URL('../src/qqruntime.js', import.meta.url), 'utf8')
   assert.match(rt, /localOrigin = null/, 'createQqRuntime 少了 localOrigin 参数')
   assert.match(rt, /origin\?\.url \|\| c\.dshApiUrl/, 'ensureApi 应优先用实际端口、再回退配置')
   const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8')
-  assert.match(src, /localOrigin:\s*\(\)\s*=>\s*liveOrigin/, 'index.js 没把 localOrigin 传进 createQqRuntime')
-  assert.match(src, /liveServerOrigin\(sctx\.webServer\)/, 'index.js 没从 webServer 读实际端口')
+  assert.match(src, /localOrigin:\s*currentOrigin/, 'index.js 没把 localOrigin 传进 createQqRuntime')
+  assert.match(src, /webServerRef = sctx\.webServer/, 'index.js 没从 webServer 服务拿引用')
+  // ⚠️ 关键：端口必须**用的时候现读**。webServer 服务在 listen 之前就存在，
+  //    `listenedPort` 那一刻还是空的；只在 inject 回调里读一次会永久拿到 null，
+  //    然后回退到写死的 19387（0.2.x 上那里没有服务），注入照样全断。
+  assert.match(src, /liveServerOrigin\(webServerRef\)/, '端口没有现读（又变成只在 inject 回调里读一次了）')
 })
 
 // ── 收尾 ───────────────────────────────────────────────────────────────────
