@@ -187,6 +187,16 @@ export function createQqRuntime({
    * 调用失败只记日志，绝不阻断投递 —— 闲聊的可达性比"只读"更重要。
    */
   beforeChatPrompt = null,
+  /**
+   * 读**本机 DSH 真实监听地址**的函数（`() => ({url, authority}) | null`）。
+   *
+   * 为什么要它：DSH 桌面版 0.2.x 起本机 API 端口不再固定（每次启动宿主自己分配，
+   * 实测见过 55443；配置里写死的 19387 上根本没有服务）。插件往本机 `/api`
+   * 注入消息必须用**实际**端口 —— 否则引用回复、`/task` 派活、`/sessions` 全部
+   * 连接被拒，而 QQ 出站推送却一切正常，很容易被误判成"插件坏了"。
+   * 有它就用它，没有（headless / 老宿主）才回退到配置里的 dshApiUrl。
+   */
+  localOrigin = null,
 }) {
   let bot = null
   let api = null
@@ -268,8 +278,20 @@ export function createQqRuntime({
    *   3. 补过之后把"重启一次桌面版"写进报错文案与 /status，绝不静默。
    */
   function ensureApi(cfg) {
-    if (api) return api
     const c = cfg ?? liveConfig()
+    // 本机真实端口优先（见 createQqRuntime 的 localOrigin）：配置里的
+    // dshApiUrl/dshApiAuthority 只是 headless / 老宿主时的回退值。
+    let origin = null
+    try {
+      origin = typeof localOrigin === 'function' ? localOrigin() : null
+    } catch {
+      origin = null
+    }
+    const baseUrl = origin?.url || c.dshApiUrl || 'http://127.0.0.1:19387'
+    const authority = origin?.authority || c.dshApiAuthority || '127.0.0.1:19387'
+    // 端口变了（宿主重启过）⇒ 旧的客户端带着旧 authority，必须重建。
+    if (api && (api.baseUrl !== baseUrl.replace(/\/+$/, '') || api.authority !== authority)) api = null
+    if (api) return api
     let secret = String(c.dshSecret ?? '').trim()
     if (!secret) {
       const got = readSecret(homeDir())
@@ -290,9 +312,12 @@ export function createQqRuntime({
         }
       }
     }
+    if (origin && (c.dshApiUrl !== origin.url || c.dshApiAuthority !== origin.authority)) {
+      l(`本机 API 按**实际**端口走：${origin.url}（配置里写的是 ${c.dshApiUrl || '默认'}）`)
+    }
     api = new DshLocalApi({
-      baseUrl: c.dshApiUrl || 'http://127.0.0.1:19387',
-      authority: c.dshApiAuthority || '127.0.0.1:19387',
+      baseUrl,
+      authority,
       secret,
       timeoutMs: c.timeoutMs || 20000,
     })

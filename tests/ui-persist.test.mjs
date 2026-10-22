@@ -39,7 +39,7 @@ const {
   writeOverrides,
 } = await import('../lib/overrides.js')
 
-const { mountConfigApi } = await import('../lib/config-api.js')
+const { mountConfigApi, liveServerOrigin } = await import('../lib/config-api.js')
 
 const NS = 'dsh-remote-qqbot'
 // 镜像 `src/index.js` 的 `configKeys = new Set(Object.keys(DEFAULTS))`：
@@ -556,6 +556,93 @@ await test('config-api 里 persist 生效时向外报 via，便于事后排障',
   const src = readFileSync(new URL('../src/config-api.js', import.meta.url), 'utf8')
   assert.match(src, /via/)
   assert.match(src, /typeof persist === 'function'/)
+})
+
+// ── [D] DSH 0.2.x 回归：配置路由不能依赖已被删除的 webRuntime ─────────────
+
+console.log('\n[D] DSH 0.2.1-rc.2：webRuntime 服务不存在时，配置路由仍必须挂上（2026-10-23 现场）')
+
+/**
+ * 复刻 DSH 0.2.1-rc.2 的宿主：**只有 `webServer`，没有 `webRuntime`**。
+ *
+ * 真实 cordis 里，`ctx.inject([...])` 的依赖只要有一个服务不存在，回调就
+ * **永远不会执行** —— 所以路由不挂载、客户端读配置拿 404，设置面板只剩
+ * 「正在读取插件配置…」、输入框旁两个开关整块不渲染。这里把这个语义
+ * 逐字复刻出来（缺服务 ⇒ 不回调），不是为了测 mock，是为了让"漏改回
+ * webRuntime"这种回归真的报红。
+ */
+function bootRouteOnNewerHost() {
+  let handler
+  const requested = []
+  const logs = []
+  const settings = { describe: () => [], update: async () => {} }
+  const ctx = {
+    inject(deps, cb) {
+      requested.push(deps)
+      const available = {
+        webServer: { register: (opts) => { handler = opts.handler } },
+        settings,
+      }
+      // 缺任何一个服务 ⇒ 永不回调（cordis 的 inject 语义）
+      if (deps.some((d) => !(d in available))) return
+      cb({ ...available, get: (name) => available[name] })
+    },
+    effect: (fn) => fn(),
+  }
+  const mounted = mountConfigApi(ctx, {
+    ns: NS,
+    log: (msg) => logs.push(msg),
+    getLiveConfig: () => ({ qqEnabled: true, collabEnabled: true }),
+  })
+  return { mounted, requested, logs, handler: () => handler }
+}
+
+await test('★ 只给 webServer（0.2.1 没有 webRuntime）时，配置路由仍要挂上', () => {
+  const boot = bootRouteOnNewerHost()
+  assert.equal(boot.mounted, true, 'mountConfigApi 应返回 true')
+  assert.ok(boot.requested.length > 0, 'mountConfigApi 根本没调用 ctx.inject')
+  assert.ok(
+    boot.handler(),
+    `路由没挂上 —— 它 inject 的依赖是 ${JSON.stringify(boot.requested)}；` +
+    '只要其中一个服务在宿主里不存在，回调就永远不执行。' +
+    'DSH 0.2.1-rc.2 删掉了 webRuntime，这就是「设置块只剩正在读取、输入框开关消失」的根因。',
+  )
+})
+
+await test('★ inject 的服务清单里不许再出现 webRuntime（逐字断言）', () => {
+  const boot = bootRouteOnNewerHost()
+  const flat = boot.requested.flat()
+  assert.ok(flat.includes('webServer'), 'webServer 必须在依赖里')
+  assert.ok(!flat.includes('webRuntime'), `依赖清单里还留着 webRuntime：${JSON.stringify(flat)}`)
+})
+
+await test('★ 0.2.1 宿主上 config.get 真能回 200（不只是"挂上了"）', async () => {
+  const boot = bootRouteOnNewerHost()
+  const res = await call(boot.handler(), 'GET', '/remote-qqbot/api/config.get')
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+})
+
+await test('liveServerOrigin：从 webServer.listenedPort 读真实端口（0.2.x 端口不再固定）', () => {
+  assert.deepEqual(liveServerOrigin({ listenedPort: 55443 }), {
+    url: 'http://127.0.0.1:55443',
+    authority: '127.0.0.1:55443',
+  })
+  // 读不到端口时返回 null，让调用方回退到配置（headless / 老宿主）
+  assert.equal(liveServerOrigin({}), null)
+  assert.equal(liveServerOrigin(null), null)
+  assert.equal(liveServerOrigin({ listenedPort: 0 }), null)
+  assert.equal(liveServerOrigin({ listenedPort: 'abc' }), null)
+  assert.equal(liveServerOrigin({ listenedPort: 70000 }), null)
+})
+
+await test('★ 注入通道必须用实际端口：qqruntime 里有 localOrigin，index.js 把它接上了', () => {
+  const rt = readFileSync(new URL('../src/qqruntime.js', import.meta.url), 'utf8')
+  assert.match(rt, /localOrigin = null/, 'createQqRuntime 少了 localOrigin 参数')
+  assert.match(rt, /origin\?\.url \|\| c\.dshApiUrl/, 'ensureApi 应优先用实际端口、再回退配置')
+  const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8')
+  assert.match(src, /localOrigin:\s*\(\)\s*=>\s*liveOrigin/, 'index.js 没把 localOrigin 传进 createQqRuntime')
+  assert.match(src, /liveServerOrigin\(sctx\.webServer\)/, 'index.js 没从 webServer 读实际端口')
 })
 
 // ── 收尾 ───────────────────────────────────────────────────────────────────

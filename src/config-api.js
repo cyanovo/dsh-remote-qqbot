@@ -424,12 +424,38 @@ export function configView(settings, ns, live, status) {
 }
 
 /**
+ * 从 `webServer` 服务读出**本机真实的**监听地址。
+ *
+ * 为什么要读而不是写死：DSH 桌面版 0.2.x 起，本机 API 端口不再是固定的 19387
+ * （每次启动由宿主自己分配，实测见过 55443，且启动参数里没有 `--port`）。
+ * 插件往本机 `/api` 注入消息时用的 baseUrl 与 cookie 的 authority 必须等于
+ * **实际**端口，否则一律连接被拒 —— 症状就是「引用回复/派活全都没反应」。
+ *
+ * @param {{listenedPort?: number}} [webServer] - webServer 服务（0.2.1 里字段叫 `listenedPort`）。
+ * @returns {{url: string, authority: string}|null} 读不到端口时返回 null（调用方回退到配置）。
+ */
+export function liveServerOrigin(webServer) {
+  const port = Number(webServer?.listenedPort)
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
+  return { url: `http://127.0.0.1:${port}`, authority: `127.0.0.1:${port}` }
+}
+
+/**
  * 挂载配置路由（随 fiber 释放）。
  *
- * ⚠️ 用 `ctx.inject(['webServer', 'webRuntime'])` 而**不是**写进模块级 inject 数组：
+ * ⚠️ 用 `ctx.inject([...])` 而**不是**写进模块级 inject 数组：
  * 本插件在 headless / CLI 环境同样要工作（agentmd、记忆、QQ），而那些环境没有
  * webServer。写进模块级 inject 会让插件在 CLI 里整个不加载。缺失时静默跳过：
  * 没有 web 界面，也就没有配置界面要服务。
+ *
+ * 🔴🔴 **只依赖 `webServer` 一个服务，绝不要再把 `webRuntime` 加回来**：
+ * DSH 0.2.1-rc.2 把 `webRuntime` 服务删掉了（0.1.x 有）。inject 一个不存在的
+ * 服务**永远不会回调**，于是这条配置路由根本不挂载 —— 症状是：
+ * 设置面板点开只有「正在读取插件配置…」、输入框旁边那两个开关整块消失
+ * （客户端读配置拿到 404 → 按设计不占位）。2026-10-23 主人的 DSH 升级到
+ * 0.2.1-rc.2 后报的「插件功能消失」就是这个，不是插件没加载。
+ * `webRuntime` 以前只用来取 `trustedHosts`，现在改成「有就用、没有就空数组」，
+ * 因为 `isTrustedApiRequest` 对 loopback 本来就直接放行。
  *
  * @param {object} ctx - 插件上下文。
  * @param {{ns: string, log: (msg: string) => void, getLiveConfig?: () => object, persist?: (patch: object, expectedRevision: unknown) => Promise<{via?: string, applied?: string[]}>, getStatus?: () => Array<{label: string, value: string, warn?: boolean}>}} options
@@ -448,12 +474,13 @@ export function configView(settings, ns, live, status) {
 export function mountConfigApi(ctx, { ns, log, getLiveConfig, persist, getStatus }) {
   if (typeof ctx.inject !== 'function') return false
   try {
-    ctx.inject(['webServer', 'webRuntime'], (sctx) => {
+    ctx.inject(['webServer'], (sctx) => {
       const webServer = sctx.webServer
       if (!webServer?.register) return
       const trustedHosts = () => {
         try {
-          return sctx.webRuntime?.trustedHosts ?? []
+          // `webRuntime` 在 DSH 0.2.x 里已经不存在了 —— 只能当成"有就用"的可选项。
+          return sctx.webRuntime?.trustedHosts ?? webServer.trustedHosts ?? []
         } catch {
           return []
         }
